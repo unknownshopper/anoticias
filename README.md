@@ -112,3 +112,4 @@ Si el RSS trae autor y coincide, dispara alerta "Autor seguido".
 - HTTPS + dominio propio en la NUC (Tailscale/Caddy)
 - Notificaciones push/WhatsApp al disparar alerta
 - Clasificación con Ollama: "¿esta nota es sobre seguridad? sí/no"
+# anoticias
