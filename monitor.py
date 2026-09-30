@@ -1233,8 +1233,14 @@ def servir_web(puerto: int):
     class Handler(BaseHTTPRequestHandler):
         def _base(self) -> str:
             """URL absoluta del server según el Host del request
-            (sirve igual por IP local que por dominio)."""
-            return "http://" + self.headers.get("Host", f"localhost:{puerto}")
+            (sirve igual por IP local, dominio o túnel https)."""
+            proto = self.headers.get("X-Forwarded-Proto", "")
+            if not proto:
+                # Cloudflare Tunnel manda el scheme en Cf-Visitor (JSON)
+                cfv = self.headers.get("Cf-Visitor", "")
+                proto = "https" if '"scheme":"https"' in cfv else "http"
+            return proto + "://" + self.headers.get(
+                "Host", f"localhost:{puerto}")
 
         def _html(self, contenido: bytes, code: int = 200):
             self.send_response(code)
