@@ -412,6 +412,17 @@ PAGINA = """<!DOCTYPE html>
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" type="image/png" href="/icon.png">
 <link rel="apple-touch-icon" href="/icon.png">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="@noticias">
+<meta property="og:title" content="@noticias — Síntesis de prensa con alertas">
+<meta property="og:description" content="Monitor de medios en tiempo real: destacadas, alertas por tema, noticias y estadísticas. Powered by Olmeca Code.">
+<meta property="og:image" content="{base}/icon.png">
+<meta property="og:image:width" content="192">
+<meta property="og:image:height" content="192">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="@noticias — Síntesis de prensa con alertas">
+<meta name="twitter:description" content="Monitor de medios en tiempo real. Powered by Olmeca Code.">
+<meta name="twitter:image" content="{base}/icon.png">
 <title>@noticias — Síntesis de prensa</title>
 <style>
   * {{ box-sizing: border-box; }}
@@ -1109,8 +1120,9 @@ Powered by <strong>Olmeca Code</strong>.</p>
 · {len(cfg.get('seguir_autores', []))} autores seguidos</p>"""
 
 
-def render_pagina(contenido: str, q: str = "") -> bytes:
-    return PAGINA.format(contenido=contenido, q=html.escape(q)).encode()
+def render_pagina(contenido: str, q: str = "", base: str = "") -> bytes:
+    return PAGINA.format(contenido=contenido, q=html.escape(q),
+                         base=base).encode()
 
 
 def aplicar_accion_fuentes(form: dict):
@@ -1219,6 +1231,11 @@ def aplicar_accion_config(form: dict) -> str:
 
 def servir_web(puerto: int):
     class Handler(BaseHTTPRequestHandler):
+        def _base(self) -> str:
+            """URL absoluta del server según el Host del request
+            (sirve igual por IP local que por dominio)."""
+            return "http://" + self.headers.get("Host", f"localhost:{puerto}")
+
         def _html(self, contenido: bytes, code: int = 200):
             self.send_response(code)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1228,26 +1245,28 @@ def servir_web(puerto: int):
         def do_GET(self):
             ruta = urlparse(self.path)
             params = parse_qs(ruta.query)
+            base = self._base()
             if ruta.path == "/":
-                self._html(render_pagina(vista_destacadas()))
+                self._html(render_pagina(vista_destacadas(), base=base))
             elif ruta.path == "/alertas":
-                self._html(render_pagina(vista_alertas()))
+                self._html(render_pagina(vista_alertas(), base=base))
             elif ruta.path == "/noticias":
-                self._html(render_pagina(vista_noticias()))
+                self._html(render_pagina(vista_noticias(), base=base))
             elif ruta.path == "/buscar":
                 q = params.get("q", [""])[0]
-                self._html(render_pagina(vista_buscar(q), q=q))
+                self._html(render_pagina(vista_buscar(q), q=q, base=base))
             elif ruta.path == "/config":
-                self._html(render_pagina(vista_config()))
+                self._html(render_pagina(vista_config(), base=base))
             elif ruta.path == "/fuentes":
-                self._html(render_pagina(vista_fuentes()))
+                self._html(render_pagina(vista_fuentes(), base=base))
             elif ruta.path == "/stats":
-                self._html(render_pagina(vista_stats()))
+                self._html(render_pagina(vista_stats(), base=base))
             elif ruta.path == "/acerca":
-                self._html(render_pagina(vista_acerca()))
+                self._html(render_pagina(vista_acerca(), base=base))
             elif ruta.path == "/nota":
                 u = params.get("u", [""])[0]
-                self._html(render_pagina(vista_nota(u) if u else "<h1>Sin URL</h1>"))
+                nota = vista_nota(u) if u else "<h1>Sin URL</h1>"
+                self._html(render_pagina(nota, base=base))
             elif ruta.path == "/exportar":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -1270,7 +1289,8 @@ def servir_web(puerto: int):
                 self.end_headers()
                 self.wfile.write(_ICONO)
             else:
-                self._html(render_pagina("<h1>404</h1><p>Ruta no existe.</p>"), 404)
+                self._html(render_pagina("<h1>404</h1><p>Ruta no existe.</p>",
+                                         base=base), 404)
 
         def do_POST(self):
             ruta = urlparse(self.path)
