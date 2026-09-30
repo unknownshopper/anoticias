@@ -1,0 +1,35 @@
+{
+  "fuentes": [
+    {
+      "nombre": "Tabasco HOY",
+      "url": "https://www.tabascohoy.com/feed/",
+      "categoria": "prensa"
+    },
+    {
+      "nombre": "Quadratín (nacional)",
+      "url": "https://quadratin.com.mx/feed/",
+      "categoria": "nacional",
+      "solo_si_menciona": ["tabasco", "villahermosa"]
+    }
+  ],
+  "alertas": [
+    {
+      "nombre": "Ejemplo: Olán en Suiza",
+      "requiere_todas": ["olán", "suiza"],
+      "color": "#1a237e"
+    }
+  ],
+  "seguir_autores": [],
+  "correo": {
+    "habilitado": false,
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 465,
+    "usuario": "tucorreo@gmail.com",
+    "password": "CONTRASENA_DE_APLICACION",
+    "destinatario": "cliente@correo.com"
+  },
+  "ollama": {
+    "modelo": "llama3.2",
+    "url": "http://127.0.0.1:11434/api/generate"
+  }
+}

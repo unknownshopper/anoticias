@@ -1,0 +1,13 @@
+# runtime / datos
+noticias.jsonl
+alertas.jsonl
+alertas.respaldo.jsonl
+vistos.json
+clusters.json
+fuentes_estado.json
+config.json
+
+# entorno
+.venv/
+__pycache__/
+*.pyc
