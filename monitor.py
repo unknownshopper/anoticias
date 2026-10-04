@@ -220,13 +220,11 @@ def iso_fecha(entrada) -> str:
 
 
 def fmt_fecha(iso: str) -> str:
-    """'2026-09-30T02:41:00' -> '30/09 02:41' — con año si no es el actual,
-    para que alertas viejas no parezcan desordenadas."""
+    """'2026-09-30T02:41:00' -> '30/09/2026 02:41' — año siempre visible,
+    evita confusiones con alertas de otros años."""
     try:
         d = datetime.fromisoformat(iso)
-        if d.year != datetime.now().year:
-            return d.strftime("%d/%m/%y %H:%M")
-        return d.strftime("%d/%m %H:%M")
+        return d.strftime("%d/%m/%Y %H:%M")
     except Exception:
         return iso[:16]
 
