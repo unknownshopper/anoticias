@@ -309,6 +309,26 @@ def url_https(url: str) -> str:
     return "https://" + url[7:] if url.startswith("http://") else url
 
 
+# ---- Rate limit por IP (login fuerza bruta + flood de requests) ----
+_RL_HITS: dict = {}
+
+
+def ratelimit_ok(ip: str, limite: int = 120, ventana: int = 60) -> bool:
+    """True si la IP sigue bajo el límite en la ventana (segundos)."""
+    ahora = time.time()
+    hits = [t for t in _RL_HITS.get(ip, []) if ahora - t < ventana]
+    if len(hits) >= limite:
+        _RL_HITS[ip] = hits
+        return False
+    hits.append(ahora)
+    _RL_HITS[ip] = hits
+    # poda: solo crece bajo ataque sostenido; normal = poquitas IPs
+    if len(_RL_HITS) > 5000:
+        for k in [k for k, v in _RL_HITS.items() if ahora - v[-1] > 300]:
+            del _RL_HITS[k]
+    return True
+
+
 def url_es_segura(link: str) -> bool:
     """Anti-SSRF: /nota y /captura son públicos y el servidor baja la URL
     que le pongan. Solo http(s) y hosts que resuelvan a IP GLOBAL —
@@ -3027,6 +3047,13 @@ def servir_web(puerto: int):
             params = parse_qs(ruta.query)
             base = self._base()
             email = self._usuario()
+            ip = self.headers.get("Cf-Connecting-Ip", "") or \
+                self.client_address[0]
+            if not ratelimit_ok(ip):
+                self._html("<h1 style='font-family:system-ui;padding:2rem'>"
+                           "Demasiadas solicitudes — espera un minuto.</h1>"
+                           .encode(), 429)
+                return
             if (ruta.path not in ("/icon.png", "/icon3.png", "/og.png",
                                   "/manifest.webmanifest", "/badge",
                                   "/captura.png")
@@ -3216,6 +3243,15 @@ def servir_web(puerto: int):
 
         def do_POST(self):
             ruta = urlparse(self.path)
+            ip = self.headers.get("Cf-Connecting-Ip", "") or \
+                self.client_address[0]
+            # auth: 10 intentos/min — frena fuerza bruta y farm de invitados
+            limite = 10 if ruta.path in ("/login", "/invitado") else 120
+            if not ratelimit_ok(ip, limite=limite):
+                self._html("<h1 style='font-family:system-ui;padding:2rem'>"
+                           "Demasiadas solicitudes — espera un minuto.</h1>",
+                           429)
+                return
             largo = int(self.headers.get("Content-Length", 0))
             form = parse_qs(self.rfile.read(largo).decode()) if largo else {}
             https = self._base().startswith("https")
@@ -3325,6 +3361,12 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.exit(main())
+    sys.exit(main())
+
+if __name__ == "__main__":
+    sys.exit(main())
+    sys.exit(main())
     sys.exit(main())
     sys.exit(main())
 
