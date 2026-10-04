@@ -9,17 +9,21 @@ cero framework web, datos en JSONL. Powered by Olmeca Code.
 
 ## Fuentes configuradas (`config.json`)
 
-58 fuentes agrupadas por `categoria` (se muestran como dropdowns
+85 fuentes agrupadas por `categoria` (se muestran como dropdowns
 plegables en `/fuentes`):
 
 | Categoría | # | Ejemplos |
 |---|---|---|
 | prensa | 20 | Tabasco HOY, El Heraldo, Novedades, Diario Presente… |
-| nacional | 18 | Milenio, La Jornada, El Universal, SDP… |
+| nacional | 18 | Milenio, La Jornada, El Universal, The Mexico News… |
+| quintana_roo | 25 | El Quequi (+secciones), Por Esto, Quadratín, La Verdad, Noticias Tulum, Web Tulum, Tulum Times, 24 Horas… |
 | deportes | 9 | ESPN, Récord, Mediotiempo, TUDN, Marca, AS… |
 | internacional | 5 | BBC, CNN Español, NYT, El País, El Mundo |
-| oficial | 4 | Periódico Oficial, Comunicados, Congreso, TSJ |
+| oficial | 5 | Periódico Oficial, Comunicados, Congreso, TSJ, Gobierno QRoo |
 | prensa_independiente | 2 | El Chapucero, López-Dóriga (filtrados) |
+
+QRoo lleva portadas **y secciones municipales** (Cancún, Tulum,
+municipios) como feeds separados `Medio · Sección`.
 
 Tipos de fuente: RSS directo, `html` (scraping de portada) y feeds de
 **Google News** (`news.google.com/rss/search` — los `site:` llevan el
