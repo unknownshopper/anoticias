@@ -220,9 +220,12 @@ def iso_fecha(entrada) -> str:
 
 
 def fmt_fecha(iso: str) -> str:
-    """'2026-09-30T02:41:00' -> '30/09 02:41' para mostrar en tarjetas."""
+    """'2026-09-30T02:41:00' -> '30/09 02:41' — con año si no es el actual,
+    para que alertas viejas no parezcan desordenadas."""
     try:
         d = datetime.fromisoformat(iso)
+        if d.year != datetime.now().year:
+            return d.strftime("%d/%m/%y %H:%M")
         return d.strftime("%d/%m %H:%M")
     except Exception:
         return iso[:16]
