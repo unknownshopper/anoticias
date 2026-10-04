@@ -14,8 +14,8 @@
   ],
   "alertas": [
     {
-      "nombre": "Ejemplo: Olán en Suiza",
-      "requiere_todas": ["olán", "suiza"],
+      "nombre": "Ejemplo: inundaciones",
+      "requiere_todas": ["tabasco", "inundación"],
       "color": "#1a237e"
     }
   ],

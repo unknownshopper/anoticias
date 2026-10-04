@@ -9,20 +9,28 @@ cero framework web, datos en JSONL. Powered by Olmeca Code.
 
 ## Fuentes configuradas (`config.json`)
 
-| Medio | Feed RSS | Categoría |
+58 fuentes agrupadas por `categoria` (se muestran como dropdowns
+plegables en `/fuentes`):
+
+| Categoría | # | Ejemplos |
 |---|---|---|
-| Tabasco HOY | `tabascohoy.com/feed/` | prensa |
-| El Heraldo de Tabasco | `oem.com.mx/elheraldodetabasco/rss.xml` | prensa |
-| Novedades de Tabasco | `novedadesdetabasco.com.mx/feed/` | prensa |
-| El Momento Tabasco | `elmomentotabasco.mx/feed/` | prensa |
-| El Chapucero | `elchapucero.com/feed/` | prensa_independiente (filtrado) |
-| López-Dóriga | `lopezdoriga.com/feed/` | prensa_independiente (filtrado) |
-| Quadratín | `quadratin.com.mx/feed/` | nacional (filtrado) |
+| prensa | 20 | Tabasco HOY, El Heraldo, Novedades, Diario Presente… |
+| nacional | 18 | Milenio, La Jornada, El Universal, SDP… |
+| deportes | 9 | ESPN, Récord, Mediotiempo, TUDN, Marca, AS… |
+| internacional | 5 | BBC, CNN Español, NYT, El País, El Mundo |
+| oficial | 4 | Periódico Oficial, Comunicados, Congreso, TSJ |
+| prensa_independiente | 2 | El Chapucero, López-Dóriga (filtrados) |
+
+Tipos de fuente: RSS directo, `html` (scraping de portada) y feeds de
+**Google News** (`news.google.com/rss/search` — los `site:` llevan el
+nombre del medio; la nota se atribuye al medio real vía `entry.source`
+y queda `via` = el feed que la trajo).
 
 Notas:
 - Quadratín **no tiene edición Tabasco** (sus ediciones son Michoacán,
   Guerrero, Morelos, etc.) — se usa el feed nacional filtrado.
-- XEVT, xeva.com.mx y tabasco.gob.mx no exponen RSS público.
+- Medios sin RSS público entran vía búsqueda `site:` en Google News
+  (xevt, diariopresente, tabasco.gob.mx, tsj-tabasco…).
 - La Saga (`lasaga.news`) no responde (bloqueo tipo Cloudflare).
 
 ## Filtro `solo_si_menciona` (por fuente)
@@ -37,18 +45,18 @@ Los locales no la necesitan — todo su contenido es de Tabasco.
 ```
 
 Ojo: matchea subcadenas normalizadas — "Cárdenas" también detecta el
-municipio tabasqueño y al político Lázaro Cárdenas; afina la lista
+municipio tabasqueño y al político homónimo; afina la lista
 según ruido real.
 
 ## Cómo funcionan las alertas
 
 Cada regla tiene `requiere_todas` (mínimo 2 palabras/frases — una sola
 genera ruido). La nota dispara si contiene **todas**. La comparación
-ignora mayúsculas y acentos (`"Olán"` matchea `olan`, `OLÁN`...).
+ignora mayúsculas y acentos (`"Cárdenas"` matchea `cardenas`, `CÁRDENAS`...).
 Las reglas llevan `color` para el badge (opcional, auto si falta).
 
 ```json
-{ "nombre": "Olán en Suiza", "requiere_todas": ["olán", "suiza"] }
+{ "nombre": "Inundaciones", "requiere_todas": ["tabasco", "inundación"] }
 ```
 
 - `["inundación"]` → cualquier nota que mencione inundaciones (muy amplio)
@@ -71,17 +79,24 @@ Las reglas llevan `color` para el badge (opcional, auto si falta).
   agrupada por similitud de titular (Jaccard), con versiones por medio
 - `/alertas` **Alertas** — agrupadas por regla con badge de color,
   match directo + "cobertura relacionada" (mismo tema, sin match)
-- `/noticias` (logo **@noticias**) — feed de todas las notas capturadas
-- `/fuentes` — CRUD de feeds RSS desde la web
+- `/noticias` (logo **@noticias**) — feed paginado (100 por página)
+- `/fuentes` — checkboxes por usuario agrupados en dropdowns por
+  categoría (todas/solo esta); CRUD de feeds y usuarios solo admin,
+  con dot de salud por fuente
 - `/stats` — notas por medio/día, salud de feeds, exportar reporte .txt
 - `/config` (botón en Alertas) — reglas de alerta: nombre, palabras
   (mínimo 2), color del badge; backfill sobre notas ya guardadas
-- `/nota?u=` — lector interno: la nota se abre dentro de la app
+- `/nota?u=` — lector interno: la nota se abre dentro de la app;
+  si la página original trae video, el botón lo anuncia
+  ("Ver nota y video en el sitio original")
 - `/acerca` — versión, arquitectura y estado de la base de datos
 - Buscador en el navbar sobre noticias y alertas
 
-Retención: noticias/alertas 7 días, dedup 30 días.
-Sin login: cualquiera en la red puede entrar — para uso privado o red local.
+Retención: noticias/alertas **sin límite** (`RETENCION_DIAS=0`),
+dedup 30 días. Login con cookie firmada: usuarios con reglas propias
++ invitados demo (24h, solo lectura — no pueden tocar reglas).
+En producción: `https://noticias.unknownshoppers.com` vía cloudflared
+(systemd `monitor.service` + `cloudflared.service` en la NUC).
 
 ## Alertas por correo (SMTP)
 
@@ -98,9 +113,9 @@ Si el RSS trae autor y coincide, dispara alerta "Autor seguido".
 
 ## Datos
 
-- `noticias.jsonl` — todas las notas (7 días de retención)
-- `alertas.jsonl` — historial de alertas (7 días; el de reglas borradas
-  se oculta en la vista pero queda para `/exportar`)
+- `noticias.jsonl` — todas las notas (retención sin límite)
+- `alertas.jsonl` — historial de alertas (sin límite; el de reglas
+  borradas se oculta en la vista pero queda para `/exportar`)
 - `vistos.json` — dedup con timestamps (30 días)
 - `clusters.json` — estado de "noticia en desarrollo"
 - `fuentes_estado.json` — salud por feed

@@ -1,0 +1,16 @@
+[Unit]
+Description=@noticias — monitor de prensa
+After=network-online.target cloudflared.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=t800
+WorkingDirectory=/home/t800/Desktop/SISTA/monitor_noticias
+ExecStart=/home/t800/Desktop/SISTA/monitor_noticias/.venv/bin/python -u monitor.py --web 8080 --loop 15
+Restart=always
+RestartSec=5
+# logs en journalctl -u monitor -f
+
+[Install]
+WantedBy=multi-user.target

@@ -6,6 +6,11 @@ vistos.json
 clusters.json
 fuentes_estado.json
 config.json
+usuarios.json
+actividad.jsonl
+*.jsonl.bak
+secret.txt
+monitor.log
 
 # entorno
 .venv/
