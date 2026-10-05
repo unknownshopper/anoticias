@@ -1052,6 +1052,7 @@ def capturar_portadas(cfg: dict):
         try:
             # 1) kiosko/FB: JPG directo (portada impresa real, sin screenshot)
             data = None
+            tiene_impresa = False
             if m.get("kiosko"):
                 data = _bajar_portada_kiosko(m)
             elif m.get("fb"):
@@ -1059,25 +1060,37 @@ def capturar_portadas(cfg: dict):
             if data:
                 base.with_suffix(".png").unlink(missing_ok=True)
                 base.with_suffix(".jpg").write_bytes(data)
-                continue
-            # 2) PDF del ejemplar completo → página 1
-            png = base.with_suffix(".png")
-            url_tiro = m["url"]
-            if m.get("pdf"):
-                ok, fallback = _portada_pdf(m, png)
+                tiene_impresa = True
+            else:
+                # 2) PDF del ejemplar completo → página 1
+                png = base.with_suffix(".png")
+                ok, fallback = (_portada_pdf(m, png)
+                                if m.get("pdf") else (False, ""))
                 if ok:
-                    continue
-                url_tiro = fallback or m["url"]  # post "edición impresa"
-            # 3) screenshot playwright (espera + mata overlays)
-            try:
-                _shot_playwright(url_tiro, png)
-            except Exception:
-                subprocess.run(
-                    ["chromium", "--headless", "--no-sandbox", "--disable-gpu",
-                     "--hide-scrollbars", "--window-size=1280,1800",
-                     f"--screenshot={png}", m["url"]],
-                    timeout=45, capture_output=True)
-            if not png.exists() or png.stat().st_size < 10000:
+                    tiene_impresa = True
+                else:
+                    url_tiro = fallback or m["url"]
+                    # 3) screenshot playwright (espera + mata overlays)
+                    try:
+                        _shot_playwright(url_tiro, png)
+                    except Exception:
+                        subprocess.run(
+                            ["chromium", "--headless", "--no-sandbox",
+                             "--disable-gpu", "--hide-scrollbars",
+                             "--window-size=1280,1800",
+                             f"--screenshot={png}", m["url"]],
+                            timeout=45, capture_output=True)
+            # doble portada: con impresa (jpg/pdf) también portada web
+            if tiene_impresa:
+                web = base.with_name(base.name + "-web.png")
+                try:
+                    _shot_playwright(m["url"], web)
+                    if not web.exists() or web.stat().st_size < 40000:
+                        web.unlink(missing_ok=True)
+                except Exception:
+                    web.unlink(missing_ok=True)
+            img_final = _portada_img(base.name)
+            if not img_final.exists() or img_final.stat().st_size < 10000:
                 fallos.append(m["nombre"])
         except Exception:
             fallos.append(m["nombre"])
@@ -1087,12 +1100,15 @@ def capturar_portadas(cfg: dict):
         for m in medios:
             if m.get("seccion") != sec:
                 continue
-            img = _portada_img(_slug_portada(m["nombre"]))
-            if img.exists():
-                try:
-                    imgs.append(Image.open(img).convert("RGB"))
-                except Exception:
-                    pass
+            slug = _slug_portada(m["nombre"])
+            img = _portada_img(slug)
+            # impresa primero, portada web después — ambas al PDF
+            for cand in (img, PORTADAS_DIR / f"{slug}-web.png"):
+                if cand.exists():
+                    try:
+                        imgs.append(Image.open(cand).convert("RGB"))
+                    except Exception:
+                        pass
         if imgs:
             pdf = PORTADAS_DIR / f"portadas_{sec}_{hoy}.pdf"
             imgs[0].save(pdf, save_all=True, append_images=imgs[1:])
@@ -1171,8 +1187,13 @@ def vista_portadas(sec: str) -> str:
     for m in medios:
         slug = _slug_portada(m["nombre"])
         img_f = _portada_img(slug)
-        img = (f"<img src='/portadas/{img_f.name}?v={ultima}' loading='lazy' "
-               "style='width:100%;border-radius:6px;margin-top:.4rem'>"
+        web_f = PORTADAS_DIR / f"{slug}-web.png"
+        tag = lambda p, rotulo: (
+            f"<span class='meta'>{rotulo}</span>"
+            f"<img src='/portadas/{p.name}?v={ultima}' loading='lazy' "
+            "style='width:100%;border-radius:6px;margin:.15rem 0 .4rem'>"
+            if p.exists() else "")
+        img = (tag(img_f, "Impresa") + tag(web_f, "Web")
                if img_f.exists()
                else "<p class='meta'>Sin captura todavía — "
                     "se genera cada mañana.</p>")
