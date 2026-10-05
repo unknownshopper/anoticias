@@ -9,32 +9,30 @@ cero framework web, datos en JSONL. Powered by Olmeca Code.
 
 ## Fuentes configuradas (`config.json`)
 
-85 fuentes agrupadas por `categoria` (se muestran como dropdowns
-plegables en `/fuentes`):
+63 fuentes agrupadas por `categoria` (se muestran como dropdowns
+plegables en `/fuentes`) — **todas RSS/HTML directo, cero agregadores**:
 
 | Categoría | # | Ejemplos |
 |---|---|---|
-| prensa | 20 | Tabasco HOY, El Heraldo, Novedades, Diario Presente… |
-| nacional | 18 | Milenio, La Jornada, El Universal, The Mexico News… |
-| quintana_roo | 25 | El Quequi (+secciones), Por Esto, Quadratín, La Verdad, Noticias Tulum, Web Tulum, Tulum Times, 24 Horas… |
-| deportes | 9 | ESPN, Récord, Mediotiempo, TUDN, Marca, AS… |
-| internacional | 5 | BBC, CNN Español, NYT, El País, El Mundo |
-| oficial | 5 | Periódico Oficial, Comunicados, Congreso, TSJ, Gobierno QRoo |
-| prensa_independiente | 2 | El Chapucero, López-Dóriga (filtrados) |
+| quintana_roo | 21 | El Quequi (+secciones), Por Esto, Quadratín, La Verdad, Noticias Tulum, Web Tulum, Tulum Times, 24 Horas… |
+| prensa | 16 | Tabasco HOY, El Heraldo, Novedades, Diario Presente… |
+| nacional | 12 | La Jornada, Proceso, Reforma, The Mexico News… |
+| deportes | 7 | ESPN, Récord, Marca, AS… |
+| internacional | 4 | BBC, NYT, El País, El Mundo |
+| oficial | 2 | Congreso Tabasco, Gobierno QRoo |
+| prensa_independiente | 1 | López-Dóriga (filtrado) |
 
 QRoo lleva portadas **y secciones municipales** (Cancún, Tulum,
 municipios) como feeds separados `Medio · Sección`.
 
-Tipos de fuente: RSS directo, `html` (scraping de portada) y feeds de
-**Google News** (`news.google.com/rss/search` — los `site:` llevan el
-nombre del medio; la nota se atribuye al medio real vía `entry.source`
-y queda `via` = el feed que la trajo).
+Tipos de fuente: RSS directo y `html` (scraping de portada).
+**Sin Google News**: sus links son redirects JS que el servidor no
+puede seguir — la nota nunca se abre en el lector. Solo entran
+medios con feed propio; si un medio cierra su RSS, sale del catálogo.
 
 Notas:
 - Quadratín **no tiene edición Tabasco** (sus ediciones son Michoacán,
   Guerrero, Morelos, etc.) — se usa el feed nacional filtrado.
-- Medios sin RSS público entran vía búsqueda `site:` en Google News
-  (xevt, diariopresente, tabasco.gob.mx, tsj-tabasco…).
 - La Saga (`lasaga.news`) no responde (bloqueo tipo Cloudflare).
 
 ## Filtro `solo_si_menciona` (por fuente)
