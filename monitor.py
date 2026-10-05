@@ -30,6 +30,8 @@ import time
 import unicodedata
 from collections import Counter
 from datetime import datetime, timedelta
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -53,6 +55,8 @@ USUARIOS = BASE / "usuarios.json"    # reglas + fuentes ocultas + expira, por em
 ACTIVIDAD = BASE / "actividad.jsonl"  # {ts, email, ruta} por cada página vista
 SECRET = BASE / "secret.txt"    # llave HMAC para firmar cookies de sesión
 OG_PNG = BASE / "og.png"        # tarjeta de preview para compartir links
+PORTADAS_DIR = BASE / "portadas"  # PNGs del día + PDFs por sección
+ESTADO_PORTADAS = BASE / "portadas_estado.json"  # {"fecha": YYYY-MM-DD}
 MAX_NOTICIAS = 2000
 RETENCION_DIAS = 0        # 0 = sin purga: conservamos todo el historial
 RETENCION_VISTOS_DIAS = 30  # dedupe de enlaces: 30 días evita re-alertas
@@ -866,6 +870,134 @@ def wp_scan_reglas(cfg: dict):
     print(f"[wp-scan] {len(nuevas)} notas por regla, {len(alertas_n)} alertas")
 
 
+def _slug_portada(nombre: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", normalizar(nombre)).strip("-")
+
+
+def capturar_portadas(cfg: dict):
+    """Screenshot chromium de la portada de cada diario → PNG → PDF por
+    sección → correo con ambos adjuntos. El historial vive en el buzón;
+    aquí solo queda el último PNG/PDF."""
+    medios = cfg.get("portadas", {}).get("medios", [])
+    if not medios:
+        return
+    PORTADAS_DIR.mkdir(exist_ok=True)
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    fallos = []
+    for m in medios:
+        png = PORTADAS_DIR / f"{_slug_portada(m['nombre'])}.png"
+        try:
+            subprocess.run(
+                ["chromium", "--headless", "--no-sandbox", "--disable-gpu",
+                 "--hide-scrollbars", "--window-size=1280,1800",
+                 f"--screenshot={png}", m["url"]],
+                timeout=45, capture_output=True)
+            if not png.exists() or png.stat().st_size < 10000:
+                fallos.append(m["nombre"])
+        except Exception:
+            fallos.append(m["nombre"])
+    pdfs = {}
+    for sec in ("nacional", "tabasco"):
+        imgs = []
+        for m in medios:
+            if m.get("seccion") != sec:
+                continue
+            png = PORTADAS_DIR / f"{_slug_portada(m['nombre'])}.png"
+            if png.exists():
+                try:
+                    imgs.append(Image.open(png).convert("RGB"))
+                except Exception:
+                    pass
+        if imgs:
+            pdf = PORTADAS_DIR / f"portadas_{sec}_{hoy}.pdf"
+            imgs[0].save(pdf, save_all=True, append_images=imgs[1:])
+            for i in imgs:
+                i.close()
+            pdfs[sec] = pdf
+    enviar_portadas(cfg, pdfs, fallos)
+    ESTADO_PORTADAS.write_text(json.dumps({"fecha": hoy}))
+    print(f"[portadas] {len(pdfs)} PDFs, fallos: {fallos or 'ninguno'}")
+
+
+def enviar_portadas(cfg: dict, pdfs: dict, fallos: list):
+    correo = cfg.get("correo", {})
+    if not correo.get("habilitado"):
+        return
+    dest = (cfg.get("portadas", {}).get("destinatario")
+            or correo.get("destinatario", ""))
+    if not dest or "@" not in dest:
+        return
+    hoy = datetime.now().strftime("%d/%m/%Y")
+    msg = MIMEMultipart()
+    msg["Subject"] = f"[Monitor] Portadas {hoy}"
+    msg["From"] = correo["usuario"]
+    msg["To"] = dest
+    cuerpo = (f"Primeras planas del {hoy}.\n\n"
+              + (f"No respondieron: {', '.join(fallos)}." if fallos else ""))
+    msg.attach(MIMEText(cuerpo, "plain", "utf-8"))
+    for sec, pdf in pdfs.items():
+        parte = MIMEApplication(pdf.read_bytes(), _subtype="pdf")
+        parte.add_header("Content-Disposition", "attachment",
+                         filename=pdf.name)
+        msg.attach(parte)
+    try:
+        with smtplib.SMTP_SSL(correo["smtp_host"],
+                              correo.get("smtp_port", 465), timeout=30) as s:
+            s.login(correo["usuario"], correo["password"])
+            s.send_message(msg)
+    except Exception as e:
+        print(f"[portadas] correo falló: {e}")
+
+
+def toca_captura_portadas(cfg: dict) -> bool:
+    """True si ya pasó la hora configurada y hoy no se han capturado."""
+    port = cfg.get("portadas", {})
+    if not port.get("medios"):
+        return False
+    try:
+        hh, mm = (int(x) for x in port.get("hora", "06:30").split(":"))
+    except Exception:
+        hh, mm = 6, 30
+    ahora = datetime.now()
+    hoy = ahora.strftime("%Y-%m-%d")
+    ultima = cargar_json(ESTADO_PORTADAS, {}).get("fecha", "")
+    return ultima != hoy and (ahora.hour, ahora.minute) >= (hh, mm)
+
+
+def vista_portadas(sec: str) -> str:
+    """Tab Portadas: grid de las capturas del día por sección."""
+    cfg = json.loads(CONFIG.read_text())
+    port = cfg.get("portadas", {})
+    medios = [m for m in port.get("medios", [])
+              if m.get("seccion", "nacional") == sec]
+    ultima = cargar_json(ESTADO_PORTADAS, {}).get("fecha", "")
+    tabs = ("<div class='tabs-cat'>"
+            + f"<a class='tab-cat{' on' if sec != 'tabasco' else ''}' "
+              "href='/portadas'>Nacional</a>"
+            + f"<a class='tab-cat{' on' if sec == 'tabasco' else ''}' "
+              "href='/portadas?sec=tabasco'>Tabasco</a></div>")
+    cards = ""
+    for m in medios:
+        slug = _slug_portada(m["nombre"])
+        png = PORTADAS_DIR / f"{slug}.png"
+        img = (f"<img src='/portadas/{slug}.png?v={ultima}' loading='lazy' "
+               "style='width:100%;border-radius:6px;margin-top:.4rem'>"
+               if png.exists()
+               else "<p class='meta'>Sin captura todavía — "
+                    "se genera cada mañana.</p>")
+        cards += (f"<div class='card' style='border-left-color:#7b1fa2'>"
+                  f"<b>{html.escape(m['nombre'])}</b>"
+                  f"<a href='{html.escape(m['url'])}' target='_blank' "
+                  "rel='noopener' class='meta' "
+                  "style='display:block;margin:.15rem 0'>abrir en el medio ↗</a>"
+                  f"{img}</div>")
+    return (f"<h1>Portadas — {sec.title()}</h1>{tabs}"
+            f"<p class='meta'>Capturas del {ultima or '—'} · se regeneran a "
+            f"las {html.escape(port.get('hora', '06:30'))} y se envían por "
+            f"correo a {html.escape(port.get('destinatario', ''))}.</p>"
+            + cards)
+
+
 def detectar_desarrollo(cfg: dict, resumir: bool) -> int:
     """Noticia en desarrollo: un cluster que CRECE entre ciclos dispara alerta.
 
@@ -1210,6 +1342,7 @@ PAGINA = """<!DOCTYPE html>
     <a href="/destacadas">Destacadas</a>
     <a href="/noticias">Noticias</a>
     <a href="/alertas">Alertas</a>
+    <a href="/portadas">Portadas</a>
     <a href="/fuentes">Fuentes</a>
     {admin_tabs}
   </div>
@@ -3459,6 +3592,21 @@ def servir_web(puerto: int):
                 msg = params.get("msg", [""])[0]
                 self._html(render_pagina(vista_fuentes(email, msg), base=base,
                                          usuario=email))
+            elif ruta.path == "/portadas":
+                sec = params.get("sec", ["nacional"])[0]
+                self._html(render_pagina(vista_portadas(sec), base=base,
+                                         usuario=email))
+            elif ruta.path.startswith("/portadas/"):
+                p = (PORTADAS_DIR / ruta.path.split("/", 2)[2]).resolve()
+                if p.parent == PORTADAS_DIR.resolve() and p.is_file() \
+                        and p.suffix == ".png":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Cache-Control", "max-age=300")
+                    self.end_headers()
+                    self.wfile.write(p.read_bytes())
+                else:
+                    self.send_error(404)
             elif ruta.path == "/stats" or ruta.path == "/analitica":
                 cfg_g = json.loads(CONFIG.read_text())
                 if not es_admin(email, cfg_g):
@@ -3696,6 +3844,9 @@ def main():
             cfg = json.loads(CONFIG.read_text())
             with _LOCK_REVISAR:
                 revisar(cfg, args.todo, args.resumir)
+                if toca_captura_portadas(cfg):
+                    threading.Thread(target=capturar_portadas, args=(cfg,),
+                                     daemon=True, name="portadas").start()
             print(f"\n--- durmiendo {args.loop} min ---")
             time.sleep(args.loop * 60)
     else:
