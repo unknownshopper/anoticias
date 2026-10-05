@@ -501,6 +501,10 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
     alertas = 0
     # salud por fuente para el tab de estadísticas
     estado = cargar_json(ESTADO_FUENTES, {})
+    # imagen que ya salió en ≥3 notas = logo/placeholder reciclado,
+    # no foto del artículo (ej. ícono de GN en "Latinus Diario")
+    frecuencia_img = Counter(n.get("imagen", "")
+                             for n in leer_jsonl(NOTICIAS, limite=300))
 
     now = time.time()
     delay = cfg.get("delay_fuentes", 1)
@@ -591,7 +595,8 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
             vistos[link] = time.time()
             nuevas += 1
 
-            titulo = entrada.get("title", "(sin título)")
+            titulo = re.sub(r"^\s*<!\[CDATA\[(.*)\]\]>\s*$", r"\1",
+                            entrada.get("title", "(sin título)"))
             resumen = re.sub(r"<[^>]+>", " ", entrada.get("summary", ""))
             autor = entrada.get("author", "")
             imagen = url_https(extraer_imagen(entrada))
@@ -614,6 +619,8 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
                 continue
             if not imagen:
                 imagen = url_https(extraer_og_image(link))
+            if imagen and frecuencia_img[imagen] >= 3:
+                imagen = ""
 
             # Guardar TODA nota que pasa el filtro → alimenta la sección
             # "Últimas noticias" del dashboard
@@ -1222,32 +1229,54 @@ def tokens_titulo(titulo: str) -> set:
             if len(p) > 3 and p not in STOPWORDS}
 
 
-def agrupar_noticias(noticias: list, umbral: float = 0.45) -> list:
+def agrupar_noticias(noticias: list, umbral: float = 0.45,
+                     ventana_dias: int = 5) -> list:
     """Agrupa notas con titulares similares (misma historia, varios medios).
 
     Compara pares por similitud de Jaccard sobre tokens del titular.
+    La ventana temporal evita falsos clusters: titulares periódicos tipo
+    "Latinus Diario: 22 de septiembre" son "la misma historia" por Jaccard
+    pero ocurrieron meses aparte — misma noticia = misma época.
     Devuelve clusters ordenados por número de notas (mayor cobertura = más
     destacada), con el titular más largo como representante.
     """
+
+    def _ts(n):
+        try:
+            return datetime.fromisoformat(n["fecha"]).timestamp()
+        except Exception:
+            return None
+
     # dedupe: misma fuente + mismo titular = la misma nota con URL distinta
     # (pasa cuando el medio republica la nota bajo otra URL/categoría)
+    def _norm_sin_dig(n):
+        return re.sub(r"\d+", "", normalizar(n["titulo"]))
+
     unicos, claves = [], set()
     for n in noticias:
         k = (n["fuente"], normalizar(n["titulo"]))
         if k not in claves:
             claves.add(k)
             unicos.append(n)
-    items = [(n, tokens_titulo(n["titulo"])) for n in unicos]
+    items = [(n, tokens_titulo(n["titulo"]), _ts(n),
+              normalizar(n["titulo"]), _norm_sin_dig(n)) for n in unicos]
     usado = [False] * len(items)
     grupos = []
-    for i, (ni, ti) in enumerate(items):
+    for i, (ni, ti, fi, norm_i, ndig_i) in enumerate(items):
         if usado[i] or not ti:
             continue
         cluster = [ni]
         usado[i] = True
         for j in range(i + 1, len(items)):
-            nj, tj = items[j]
+            nj, tj, fj, norm_j, ndig_j = items[j]
             if usado[j] or not tj:
+                continue
+            if (fi and fj and
+                    abs(fi - fj) > ventana_dias * 86400):
+                continue
+            # títulos que solo cambian en números = ediciones distintas
+            # ("Latinus Diario: 14" vs ": 22"), no la misma noticia
+            if ndig_i == ndig_j and norm_i != norm_j:
                 continue
             jaccard = len(ti & tj) / len(ti | tj)
             if jaccard >= umbral:
