@@ -73,6 +73,10 @@ Nota: records `mail`, `ftp`, `cpanel`, `webmail`, `webdisk`, `whm`, `cpcalendars
   (filtra solo textos <60 chars) — afinar si molesta
 - [ ] Cobertura relacionada: con corpus grande el token "raro" (≤5)
   escasea — evaluar modelo por peso si se pide más amplitud
+- [x] ~~Alertas sin orden cronológico~~ — sí estaban ordenadas; el
+  tema era que `fmt_fecha` oculta el año (alertas de 2024/2025
+  parecían fuera de lugar). Ahora muestra `dd/mm/yy` fuera del
+  año actual.
 
 ## Nice to have
 
