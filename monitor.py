@@ -626,6 +626,13 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
                     titulo = titulo[: -len(medio) - 3]
             texto = f"{titulo} {resumen} {autor}"
 
+            # algunas fuentes publican "páginas edición" (índice del día,
+            # no artículo): 'Latinus Diario: 30 de septiembre', 'EDICION
+            # DEL 2 DE JULIO' — se ignoran por regex en config
+            ign = fuente.get("ignorar_titulo")
+            if ign and re.search(ign, titulo, re.I):
+                continue
+
             # mismo titular DEL MISMO medio con link distinto = nota
             # repetida (GN la da más de una vez); si es de OTRO medio
             # es cobertura real y entra al cluster
