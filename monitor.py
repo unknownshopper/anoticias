@@ -874,6 +874,134 @@ def _slug_portada(nombre: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", normalizar(nombre)).strip("-")
 
 
+def _portada_img(slug: str) -> Path:
+    """La captura del diario puede ser .png (screenshot) o .jpg (kiosko/FB)."""
+    for ext in (".png", ".jpg", ".jpeg"):
+        p = PORTADAS_DIR / f"{slug}{ext}"
+        if p.exists():
+            return p
+    return PORTADAS_DIR / f"{slug}.png"
+
+
+def _bajar_portada_kiosko(m: dict):
+    """img.kiosko.net/YYYY/MM/DD/mx/{slug}.750.jpg — la portada impresa real
+    (resuelve a Reforma/Milenio/etc. que bloquean al bot)."""
+    hoy = datetime.now()
+    for d in (0, 1):  # hoy o ayer — algunos cierran de noche
+        f = hoy - timedelta(days=d)
+        url = (f"https://img.kiosko.net/{f:%Y/%m/%d}/mx/"
+               f"{m['kiosko']}.750.jpg")
+        try:
+            r = requests.get(url, timeout=15,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200 and len(r.content) > 20000:
+                return r.content
+        except Exception:
+            pass
+    return None
+
+
+def _bajar_portada_fb(m: dict):
+    """Share de FB (CORAT sube su portada ahí) → og:image → JPG directo."""
+    try:
+        r = requests.get(m["fb"], timeout=15, headers={
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 "
+                          "like Mac OS X) AppleWebKit/605.1.15"})
+        og = re.search(r'property="og:image"[^>]*content="([^"]+)"', r.text)
+        if not og:
+            return None
+        ir = requests.get(html.unescape(og.group(1)), timeout=15,
+                          headers={"User-Agent": "Mozilla/5.0"})
+        if ir.status_code == 200 and len(ir.content) > 20000:
+            return ir.content
+    except Exception:
+        pass
+    return None
+
+
+def _portada_pdf(m: dict, png: Path) -> bool:
+    """Medios que publican el ejemplar completo en PDF (El Día): busca el
+    link .pdf en su web, lo baja y renderiza la página 1 con pdftoppm."""
+    try:
+        r = requests.get(m["url"], timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        link_pdf = re.search(r'https?://[^"\'\s]+\.pdf', r.text)
+        if not link_pdf:
+            return False
+        tmp = PORTADAS_DIR / "_tmp.pdf"
+        rp = requests.get(link_pdf.group(0), timeout=40,
+                          headers={"User-Agent": "Mozilla/5.0"})
+        if rp.status_code != 200 or len(rp.content) < 50000:
+            return False
+        tmp.write_bytes(rp.content)
+        prefijo = str(png.with_suffix(""))
+        subprocess.run(["pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "110",
+                        str(tmp), prefijo], timeout=30, capture_output=True)
+        tmp.unlink(missing_ok=True)
+        # pdftoppm nombra prefijo-1.png o prefijo-01.png según el padding
+        salidas = sorted(PORTADAS_DIR.glob(f"{png.stem}-*.png"))
+        if salidas:
+            salidas[0].replace(png)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+_BLOQ_ADS = re.compile(
+    r"googlesyndication|doubleclick|adservice|adnxs|taboola|outbrain|"
+    r"amazon-adsystem|criteo|scorecardresearch|facebook\.net|connect\.facebook|"
+    r"googletagmanager|google-analytics|pubmatic|openx|smartadserver|"
+    r"teads|mgid|revcontent|contextual\.media\.net|ads\.|\.ad\.|tracker",
+    re.I)
+
+
+def _shot_playwright(url: str, png: Path):
+    """Screenshot con playwright: bloquea redes de ads a nivel red (nunca
+    pintan), espera DOM+lazy-load, cierra consentimientos y mata overlays
+    (modal de publicidad/paywall que cubre la portada)."""
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(
+            viewport={"width": 1280, "height": 1800},
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+        # el ad-block viaja en la capa de red: los banners ni cargan
+        page.route("**/*",
+                   lambda r: r.abort()
+                   if _BLOQ_ADS.search(r.request.url)
+                   else r.continue_())
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(4000)   # primer render + recursos
+        except Exception:
+            pass
+        for sel in ("button:has-text('Aceptar')", "button:has-text('Acepto')",
+                    "button:has-text('Accept')", "#didomi-notice-agree-btn"):
+            try:
+                page.click(sel, timeout=700)
+            except Exception:
+                pass
+        page.evaluate("""() => {
+            for (const el of document.querySelectorAll('*')) {
+                const s = getComputedStyle(el);
+                if ((s.position === 'fixed' || s.position === 'absolute') &&
+                    parseInt(s.zIndex || 0) > 50 &&
+                    el.clientWidth > innerWidth * .7 &&
+                    el.clientHeight > innerHeight * .5)
+                    el.remove();
+            }
+            document.body.style.overflow = 'auto';
+        }""")
+        page.mouse.wheel(0, 500)          # dispara lazy-load
+        page.wait_for_timeout(2500)
+        page.mouse.wheel(0, -500)         # de regreso arriba
+        page.wait_for_timeout(1000)
+        page.screenshot(path=str(png))
+        browser.close()
+
+
 def capturar_portadas(cfg: dict):
     """Screenshot chromium de la portada de cada diario → PNG → PDF por
     sección → correo con ambos adjuntos. El historial vive en el buzón;
@@ -885,13 +1013,31 @@ def capturar_portadas(cfg: dict):
     hoy = datetime.now().strftime("%Y-%m-%d")
     fallos = []
     for m in medios:
-        png = PORTADAS_DIR / f"{_slug_portada(m['nombre'])}.png"
+        base = PORTADAS_DIR / _slug_portada(m["nombre"])
         try:
-            subprocess.run(
-                ["chromium", "--headless", "--no-sandbox", "--disable-gpu",
-                 "--hide-scrollbars", "--window-size=1280,1800",
-                 f"--screenshot={png}", m["url"]],
-                timeout=45, capture_output=True)
+            # 1) kiosko/FB: JPG directo (portada impresa real, sin screenshot)
+            data = None
+            if m.get("kiosko"):
+                data = _bajar_portada_kiosko(m)
+            elif m.get("fb"):
+                data = _bajar_portada_fb(m)
+            if data:
+                base.with_suffix(".png").unlink(missing_ok=True)
+                base.with_suffix(".jpg").write_bytes(data)
+                continue
+            # 2) PDF del ejemplar completo → página 1
+            png = base.with_suffix(".png")
+            if m.get("pdf") and _portada_pdf(m, png):
+                continue
+            # 3) screenshot playwright (espera + mata overlays)
+            try:
+                _shot_playwright(m["url"], png)
+            except Exception:
+                subprocess.run(
+                    ["chromium", "--headless", "--no-sandbox", "--disable-gpu",
+                     "--hide-scrollbars", "--window-size=1280,1800",
+                     f"--screenshot={png}", m["url"]],
+                    timeout=45, capture_output=True)
             if not png.exists() or png.stat().st_size < 10000:
                 fallos.append(m["nombre"])
         except Exception:
@@ -902,10 +1048,10 @@ def capturar_portadas(cfg: dict):
         for m in medios:
             if m.get("seccion") != sec:
                 continue
-            png = PORTADAS_DIR / f"{_slug_portada(m['nombre'])}.png"
-            if png.exists():
+            img = _portada_img(_slug_portada(m["nombre"]))
+            if img.exists():
                 try:
-                    imgs.append(Image.open(png).convert("RGB"))
+                    imgs.append(Image.open(img).convert("RGB"))
                 except Exception:
                     pass
         if imgs:
@@ -985,10 +1131,10 @@ def vista_portadas(sec: str) -> str:
     cards = ""
     for m in medios:
         slug = _slug_portada(m["nombre"])
-        png = PORTADAS_DIR / f"{slug}.png"
-        img = (f"<img src='/portadas/{slug}.png?v={ultima}' loading='lazy' "
+        img_f = _portada_img(slug)
+        img = (f"<img src='/portadas/{img_f.name}?v={ultima}' loading='lazy' "
                "style='width:100%;border-radius:6px;margin-top:.4rem'>"
-               if png.exists()
+               if img_f.exists()
                else "<p class='meta'>Sin captura todavía — "
                     "se genera cada mañana.</p>")
         cards += (f"<div class='card' style='border-left-color:#7b1fa2'>"
@@ -3607,7 +3753,8 @@ def servir_web(puerto: int):
                                          usuario=email))
             elif ruta.path.startswith("/portadas/"):
                 p = (PORTADAS_DIR / ruta.path.split("/", 2)[2]).resolve()
-                tipos = {".png": "image/png", ".pdf": "application/pdf"}
+                tipos = {".png": "image/png", ".jpg": "image/jpeg",
+                         ".jpeg": "image/jpeg", ".pdf": "application/pdf"}
                 if p.parent == PORTADAS_DIR.resolve() and p.is_file() \
                         and p.suffix in tipos:
                     self.send_response(200)
