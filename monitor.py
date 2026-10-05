@@ -1611,6 +1611,53 @@ def vista_noticias(email: str, pagina: int = 1) -> str:
             else "<h1>Últimas noticias</h1><p>Sin noticias todavía.</p>")
 
 
+def busqueda_viva_wp(q: str, cfg: dict, ya: set) -> list:
+    """Consulta en vivo el archivo WordPress de cada medio del catálogo:
+    encuentra notas que el feed RSS no capturó (el cliente quiere TODO).
+    AND de palabras sobre el título, mismo criterio que la búsqueda local."""
+    import concurrent.futures
+    doms, vistos_d = [], set()
+    for f in cfg["fuentes"]:
+        m = re.search(r"https?://([^/]+)", f["url"])
+        if m and m.group(1) not in vistos_d:
+            vistos_d.add(m.group(1))
+            doms.append((m.group(1), f["nombre"]))
+    terms = normalizar(q).split()
+    if not terms:
+        return []
+
+    def probe(dom_nombre):
+        dom, nombre = dom_nombre
+        hosts = [dom] + ([] if dom.startswith("www.") else ["www." + dom])
+        for host in hosts:
+            try:
+                r = requests.get(
+                    f"https://{host}/wp-json/wp/v2/search",
+                    params={"search": q, "per_page": 10},
+                    timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                if not isinstance(data, list):
+                    continue
+                hits = [{"titulo": html.unescape(it.get("title", "")),
+                         "link": it.get("url", ""), "fuente": nombre}
+                        for it in data
+                        if it.get("url") and it.get("url") not in ya
+                        and all(t in normalizar(it.get("title", ""))
+                                for t in terms)]
+                return hits   # el endpoint respondió: no probar otro host
+            except Exception:
+                continue
+        return []
+
+    with concurrent.futures.ThreadPoolExecutor(30) as ex:
+        out = []
+        for hits in ex.map(probe, doms):
+            out.extend(hits)
+    return out[:60]
+
+
 def vista_buscar(q: str, email: str) -> str:
     terms = normalizar(q).split()          # AND de palabras, cualquier orden
     cfg = json.loads(CONFIG.read_text())
@@ -1628,6 +1675,14 @@ def vista_buscar(q: str, email: str) -> str:
     # si la alerta ya está como noticia en resultados, no duplicar
     links_n = {n["link"] for n in hits_n}
     hits_a = [a for a in hits_a if a["link"] not in links_n]
+    # archivo vivo de los medios (WP): pesca notas que el feed no trajo
+    vivos = busqueda_viva_wp(q, cfg, links_n | {a["link"] for a in hits_a}) \
+        if q.strip() else []
+    vivo_html = "".join(
+        f"<div class='card'><a href='/nota?u={quote(h['link'], safe='')}'>"
+        f"{html.escape(h['titulo'])}</a>"
+        f"<div class='meta'>{html.escape(h['fuente'])} · en el medio ↗</div>"
+        f"</div>" for h in vivos)
     colores = {r["nombre"]: r.get("color", "") for r in perfil_usuario(email, cfg).get("reglas", [])}
     chips = trending_chips(noticias)
     regresar = (f"<a class='chip-trend' href='/noticias' "
@@ -1639,7 +1694,9 @@ def vista_buscar(q: str, email: str) -> str:
             + "".join(tarjeta_alerta(a, colores) for a in
                       sorted(hits_a, key=lambda a: a["fecha"], reverse=True))
             + "".join(tarjeta_noticia(n) for n in
-                      sorted(hits_n, key=lambda n: n["fecha"], reverse=True)))
+                      sorted(hits_n, key=lambda n: n["fecha"], reverse=True))
+            + (f"<h2>En el archivo de los medios ({len(vivos)})</h2>"
+               + vivo_html if vivos else ""))
 
 
 def vista_config(email: str) -> str:
