@@ -919,20 +919,55 @@ def _bajar_portada_fb(m: dict):
     return None
 
 
-def _portada_pdf(m: dict, png: Path) -> bool:
+def _portada_pdf(m: dict, png: Path) -> tuple:
     """Medios que publican el ejemplar completo en PDF (El Día): busca el
-    link .pdf en su web, lo baja y renderiza la página 1 con pdftoppm."""
+    link .pdf en su web, lo baja y renderiza la página 1 con pdftoppm.
+    Devuelve (ok, fallback_url) — el post "edición impresa" sirve de
+    página alterna para el screenshot cuando el PDF ya no existe."""
+    fallback = ""
     try:
         r = requests.get(m["url"], timeout=15,
                          headers={"User-Agent": "Mozilla/5.0"})
-        link_pdf = re.search(r'https?://[^"\'\s]+\.pdf', r.text)
-        if not link_pdf:
-            return False
+        dom = re.search(r"https?://([^/]+)", m["url"]).group(1)
+        clave = _slug_portada(m["nombre"]).replace("-", "")[:8]  # "unomasun"
+        # preferir PDFs del mismo dominio con el nombre del medio en el
+        # archivo — evita el PDF del papel hermano del grupo editorial
+        cands = re.findall(r'https?://[^"\'\s<>]+\.pdf', r.text)
+        url_pdf = ""
+        for u in cands:
+            if dom in u and clave in normalizar(u):
+                url_pdf = u
+                break
+        if not url_pdf:
+            for u in cands:
+                if dom in u:
+                    url_pdf = u
+                    break
+        if not url_pdf:
+            # el home es SPA: busca el post "edición impresa" vía WP API
+            # (Unomásuno publica un post diario con el PDF del ejemplar)
+            rs = requests.get(f"https://{dom}/wp-json/wp/v2/posts",
+                              params={"search": "edicion impresa",
+                                      "per_page": 5}, timeout=15,
+                              headers={"User-Agent": "Mozilla/5.0"})
+            if rs.status_code == 200 and isinstance(rs.json(), list):
+                for post in rs.json():
+                    fallback = post.get("link", "") or fallback
+                    cand = re.findall(r'https?://[^"\'\s<>]+\.pdf',
+                                      json.dumps(post))
+                    for u in cand:
+                        if dom in u and clave in normalizar(u):
+                            url_pdf = u
+                            break
+                    if url_pdf:
+                        break
+        if not url_pdf:
+            return False, fallback
         tmp = PORTADAS_DIR / "_tmp.pdf"
-        rp = requests.get(link_pdf.group(0), timeout=40,
+        rp = requests.get(url_pdf, timeout=40,
                           headers={"User-Agent": "Mozilla/5.0"})
         if rp.status_code != 200 or len(rp.content) < 50000:
-            return False
+            return False, fallback
         tmp.write_bytes(rp.content)
         prefijo = str(png.with_suffix(""))
         subprocess.run(["pdftoppm", "-f", "1", "-l", "1", "-png", "-r", "110",
@@ -942,10 +977,10 @@ def _portada_pdf(m: dict, png: Path) -> bool:
         salidas = sorted(PORTADAS_DIR.glob(f"{png.stem}-*.png"))
         if salidas:
             salidas[0].replace(png)
-            return True
+            return True, fallback
     except Exception:
         pass
-    return False
+    return False, fallback
 
 
 _BLOQ_ADS = re.compile(
@@ -1027,11 +1062,15 @@ def capturar_portadas(cfg: dict):
                 continue
             # 2) PDF del ejemplar completo → página 1
             png = base.with_suffix(".png")
-            if m.get("pdf") and _portada_pdf(m, png):
-                continue
+            url_tiro = m["url"]
+            if m.get("pdf"):
+                ok, fallback = _portada_pdf(m, png)
+                if ok:
+                    continue
+                url_tiro = fallback or m["url"]  # post "edición impresa"
             # 3) screenshot playwright (espera + mata overlays)
             try:
-                _shot_playwright(m["url"], png)
+                _shot_playwright(url_tiro, png)
             except Exception:
                 subprocess.run(
                     ["chromium", "--headless", "--no-sandbox", "--disable-gpu",
