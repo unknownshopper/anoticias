@@ -1328,14 +1328,29 @@ def tarjeta_noticia(n: dict) -> str:
     )
 
 
-def vista_destacadas(email: str) -> str:
+def vista_destacadas(email: str, cat: str = "") -> str:
     cfg = json.loads(CONFIG.read_text())
     vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
-    noticias = [n for n in leer_jsonl(NOTICIAS, limite=300) if n["fuente"] in vis or n.get("via") in vis]
-    destacadas = agrupar_noticias(noticias)[:15]
+    noticias = [n for n in leer_jsonl(NOTICIAS)
+                if n["fuente"] in vis or n.get("via") in vis]
+    if cat:
+        noticias = [n for n in noticias if n.get("categoria") == cat]
+    # recorta DESPUÉS de filtrar: con categoría chica el limite
+    # anterior vaciaba el pool y no quedaba con qué clusterear
+    destacadas = agrupar_noticias(noticias[-2000:])[:15]
+
+    def tab(href, label, activo):
+        return (f"<a class='tab-cat{' on' if activo else ''}' "
+                f"href='{href}'>{label}</a>")
+
+    tabs = ("<div class='tabs-cat'>"
+            + tab("/destacadas", "Todas", not cat)
+            + tab("/destacadas?cat=prensa", "Tabasco", cat == "prensa")
+            + tab("/destacadas?cat=quintana_roo", "Quintana Roo",
+                  cat == "quintana_roo") + "</div>")
     cards = "".join(tarjeta_destacada(rep, c) for rep, c in destacadas)
-    return ("<h1>Lo más destacado</h1>" + cards if cards
-            else "<h1>Lo más destacado</h1>"
+    return ("<h1>Lo más destacado</h1>" + tabs + cards if cards
+            else "<h1>Lo más destacado</h1>" + tabs +
                  "<p>Aún no hay historias repetidas entre medios.</p>")
 
 
@@ -3116,8 +3131,9 @@ def servir_web(puerto: int):
                 self.send_header("Location", "/noticias")
                 self.end_headers()
             elif ruta.path == "/destacadas":
-                self._html(render_pagina(vista_destacadas(email), base=base,
-                                         usuario=email))
+                self._html(render_pagina(
+                    vista_destacadas(email, params.get("cat", [""])[0]),
+                    base=base, usuario=email))
             elif ruta.path == "/alertas":
                 msg = params.get("msg", [""])[0]
                 self._html(render_pagina(vista_alertas(email, msg),
@@ -3395,6 +3411,13 @@ if __name__ == "__main__":
     sys.exit(main())
 
 if __name__ == "__main__":
+    sys.exit(main())
+    sys.exit(main())
+    sys.exit(main())
+    sys.exit(main())
+
+if __name__ == "__main__":
+    sys.exit(main())
     sys.exit(main())
     sys.exit(main())
     sys.exit(main())
