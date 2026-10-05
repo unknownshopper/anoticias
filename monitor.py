@@ -1721,12 +1721,14 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
         t = nota.get("titulo", "")
         f = nota.get("fuente", "")
         img = nota.get("imagen", "")
+        res = nota.get("resumen", "")
         return ("<div class='lector'>"
                 "<a href='javascript:history.back()'>← Regresar</a>"
                 f"<h1>{html.escape(t or 'Nota vía Google News')}</h1>"
                 f"<div class='meta'>Fuente: {html.escape(f)} · vía Google News</div>"
                 + (f"<img class='hero' src='{html.escape(url_https(img))}' "
                    f"onerror='this.remove()'>" if img else "")
+                + (f"<p class='lede'>{html.escape(res[:600])}</p>" if res else "")
                 + "<p class='meta'>Indexada a través de Google News — al "
                   "abrirla, Google te lleva directo al artículo del medio.</p>"
                 + f"<a class='origen' href='{html.escape(link)}' "
