@@ -2483,7 +2483,7 @@ def vista_fuentes(email: str, msg: str = "") -> str:
   <label class="fuente-check"><input type="checkbox" name="ver"
       data-cat="{cat_attr}"
       value="{html.escape(f['nombre'], quote=True)}"
-      onchange="if(!this.checked)document.getElementById('sel-todo').checked=false"
+      onchange="syncUp()"
       {'' if f['nombre'] in ocultas else ' checked'}>
     {dot}{html.escape(f['nombre'])}
     <span class="meta"> · {html.escape(f.get('categoria', 'prensa'))}</span></label>
@@ -2501,7 +2501,7 @@ y Buscar.</p>
 <form method="post" action="/fuentes">
   <label class="fuente-check master"><input type="checkbox" id="sel-todo"
       {'checked' if not ocultas else ''}
-      onclick="document.querySelectorAll('.fuente-row .fuente-check input').forEach(c=>c.checked=this.checked)">
+      onclick="document.querySelectorAll('input[name=ver], .cat-check').forEach(c=>c.checked=this.checked)">
     <span class="meta">todas</span></label>
   {filas}
   <p><button name="accion" value="seleccion">Guardar mi selección</button></p>
@@ -2513,14 +2513,26 @@ function selCat(input) {
   document.querySelectorAll(
     'input[name=ver][data-cat="' + cat + '"]'
   ).forEach(function(c) { c.checked = input.checked; });
+  syncUp();
+}
+function syncUp() {
+  document.querySelectorAll('.cat-check').forEach(function(cat) {
+    var kids = document.querySelectorAll(
+      'input[name=ver][data-cat="' + cat.dataset.cat + '"]');
+    cat.checked = kids.length > 0 &&
+      Array.prototype.every.call(kids, function(c) { return c.checked; });
+  });
+  var all = document.querySelectorAll('input[name=ver]');
+  var master = document.getElementById('sel-todo');
+  if (master) master.checked = all.length > 0 &&
+    Array.prototype.every.call(all, function(c) { return c.checked; });
 }
 function soloCat(cat) {
   document.querySelectorAll('input[name=ver]').forEach(function(c) { c.checked = false; });
   document.querySelectorAll(
     'input[name=ver][data-cat="' + cat + '"]'
   ).forEach(function(c) { c.checked = true; });
-  var master = document.getElementById('sel-todo');
-  if (master) master.checked = false;
+  syncUp();
 }
 </script>"""
     if not admin:
