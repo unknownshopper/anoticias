@@ -719,7 +719,151 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
     alertas += detectar_desarrollo(cfg, resumir)
     purgar()
     purgar_usuarios()
+    # escaneo del archivo WP de los medios (1 vez al día, en hilo aparte):
+    # el RSS solo trae título+resumen — las reglas con menciones en el
+    # cuerpo de la nota nunca dispararían sin esto (el caso Efraín)
+    ultimo_scan = cargar_json(WP_SCAN, {}).get("ts", 0)
+    if time.time() - ultimo_scan > 86400:
+        threading.Thread(target=wp_scan_reglas, args=(cfg,), daemon=True,
+                         name="wp-scan").start()
     return alertas
+
+
+WP_SCAN = BASE / "wp_scan.json"   # {ts, hosts:[dominios con API WP viva]}
+
+
+def _limpia_html(h: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", " ", h or "")).strip()
+
+
+def wp_scan_reglas(cfg: dict):
+    """Una vez al día consulta /wp-json/wp/v2/posts?search= de cada medio:
+    encuentra notas cuyo CUERPO menciona las palabras de las reglas —
+    el feed RSS nunca las traería (título/resumen no las contienen).
+    Sin spam: escribe noticia+alerta directo, sin notify-send/correo."""
+    import concurrent.futures
+    usuarios = cargar_usuarios()
+    queries = set()
+    for perfil in usuarios.values():
+        for r in perfil.get("reglas", []):
+            # solo reglas de 2+ palabras: una sola palabra común ("efrain")
+            # en el CUERPO de la nota = ruido seguro (Efraín Juárez, Pumas)
+            if len(r.get("requiere_todas", [])) >= 2:
+                queries.add(" ".join(r["requiere_todas"]))
+    if not queries:
+        WP_SCAN.write_text(json.dumps({"ts": time.time(), "hosts": []}))
+        return
+
+    estado = cargar_json(WP_SCAN, {})
+    hosts = estado.get("hosts", [])
+    doms = {}
+    for f in cfg["fuentes"]:
+        m = re.search(r"https?://([^/]+)", f["url"])
+        if m:
+            doms.setdefault(re.sub(r"^www\.", "", m.group(1)), f)
+
+    def probar_host(dom):
+        """Descubre/verifica hosts con wp-json; devuelve la base o None."""
+        for h in (dom, f"www.{dom}"):
+            try:
+                r = requests.get(
+                    f"https://{h}/wp-json/wp/v2/posts",
+                    params={"per_page": 1, "search": "x"},
+                    timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code == 200 and isinstance(r.json(), list):
+                    return h
+            except Exception:
+                continue
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(16) as ex:
+        vivos = [h for h in ex.map(probar_host, doms) if h]
+    hosts = sorted(set(hosts) & set(vivos) | set(vivos))
+    print(f"[wp-scan] {len(hosts)} medios con API WP viva")
+
+    exist = {n.get("link") for n in leer_jsonl(NOTICIAS, limite=0)}
+    vistos = cargar_vistos()
+
+    def buscar(dom_q):
+        host_q, q = dom_q
+        try:
+            r = requests.get(
+                f"https://{host_q}/wp-json/wp/v2/posts",
+                params={"search": q, "per_page": 30, "_embed": ""},
+                timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200 or not isinstance(r.json(), list):
+                return []
+            return r.json()
+        except Exception:
+            return []
+
+    trabajo = [(h, q) for h in hosts for q in queries]
+    nuevas, alertas_n = [], []
+    with concurrent.futures.ThreadPoolExecutor(16) as ex:
+        for posts in ex.map(buscar, trabajo):
+            for p in posts:
+                link = p.get("link", "")
+                if not link or link in exist or link in vistos:
+                    continue
+                titulo = _limpia_html(p.get("title", {}).get("rendered", ""))
+                resumen = _limpia_html(
+                    p.get("excerpt", {}).get("rendered", ""))[:400]
+                cuerpo = _limpia_html(p.get("content", {}).get("rendered", ""))
+                texto = normalizar(titulo + " " + resumen + " " + cuerpo)
+                dom = re.sub(r"^www\.", "", urlparse(link).netloc)
+                base = doms.get(dom, {"nombre": dom, "categoria": "prensa"})
+                hits_usuario = []
+                for email, perfil in usuarios.items():
+                    if base["nombre"] in set(perfil.get("fuentes_ocultas", [])):
+                        continue
+                    hits = [r["nombre"] for r in perfil.get("reglas", [])
+                            if all(normalizar(w) in texto
+                                   for w in r.get("requiere_todas", []))]
+                    if hits:
+                        hits_usuario.append((email, ", ".join(hits)))
+                if not hits_usuario:
+                    continue
+                exist.add(link)
+                vistos[link] = time.time()
+                img = ""
+                try:
+                    img = p["_embedded"]["wp:featuredmedia"][0].get(
+                        "source_url", "")
+                except Exception:
+                    pass
+                nota = {
+                    "fecha": (p.get("date") or "")[:19],
+                    "fuente": base["nombre"], "via": "wp-archivo",
+                    "categoria": base.get("categoria", "prensa"),
+                    "autor": "", "titulo": titulo, "resumen": resumen,
+                    "link": link, "imagen": img,
+                }
+                nuevas.append(nota)
+                # alerta solo si la nota es reciente: el archivo WP trae
+                # historia completa y reglas genéricas inundarían la vista
+                try:
+                    fecha_ts = datetime.fromisoformat(nota["fecha"]).timestamp()
+                except Exception:
+                    fecha_ts = 0
+                if time.time() - fecha_ts > 14 * 86400:
+                    continue
+                for email, regs in hits_usuario:
+                    alertas_n.append({
+                        "fecha": nota["fecha"], "fuente": base["nombre"],
+                        "categoria": nota["categoria"], "autor": "",
+                        "reglas": regs, "titulo": titulo, "link": link,
+                        "imagen": img, "resumen_ia": "", "usuario": email})
+
+    for n in nuevas:
+        guardar_noticia(n)
+    if alertas_n:
+        with ALERTAS.open("a") as f:
+            for a in alertas_n:
+                f.write(json.dumps(a, ensure_ascii=False) + "\n")
+        guardar_vistos(vistos)
+    WP_SCAN.write_text(json.dumps(
+        {"ts": time.time(), "hosts": hosts}, indent=0))
+    print(f"[wp-scan] {len(nuevas)} notas por regla, {len(alertas_n)} alertas")
 
 
 def detectar_desarrollo(cfg: dict, resumir: bool) -> int:
