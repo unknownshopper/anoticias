@@ -839,6 +839,9 @@ PAGINA = """<!DOCTYPE html>
          border-radius: 8px; padding: 1rem 1.1rem; margin: .9rem 0;
          box-shadow: 0 1px 4px #0002; color: inherit; text-decoration: none; }}
   .card:active {{ background: #f0f4ff; }}
+  /* clearfix: sin esto el thumb flotante se sale por abajo/derecha
+     cuando el texto de la tarjeta es más corto que la imagen */
+  .card::after {{ content: ""; display: table; clear: both; }}
   .card img.thumb {{ width: 78px; height: 78px; object-fit: cover;
                    border-radius: 6px; float: right; margin: 0 0 .4rem .9rem; }}
   .card.top img.thumb {{ width: 110px; height: 84px; }}
