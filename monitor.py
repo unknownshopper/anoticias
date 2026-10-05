@@ -1400,8 +1400,12 @@ def vista_destacadas(email: str, cat: str = "") -> str:
     tabs = ("<div class='tabs-cat'>"
             + tab("/destacadas", "Todas", not cat)
             + tab("/destacadas?cat=prensa", "Tabasco", cat == "prensa")
-            + tab("/destacadas?cat=quintana_roo", "Quintana Roo",
-                  cat == "quintana_roo") + "</div>")
+            + tab("/destacadas?cat=quintana_roo", "Península",
+                  cat == "quintana_roo")
+            + tab("/destacadas?cat=nacional", "Nacional",
+                  cat == "nacional")
+            + tab("/destacadas?cat=regional", "Regional",
+                  cat == "regional") + "</div>")
     cards = "".join(tarjeta_destacada(rep, c) for rep, c in destacadas)
     return ("<h1>Lo más destacado</h1>" + tabs + cards if cards
             else "<h1>Lo más destacado</h1>" + tabs +
