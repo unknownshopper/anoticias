@@ -83,3 +83,13 @@ https://plazajuarez.mx/feed/
 https://imparcialoaxaca.mx/feed/
 https://www.debate.com.mx/rss/feed.xml
 https://mexicotoday.com/feed/
+https://eldeforma.com/feed/
+https://www.formato7.com/feed/
+https://elsureste.mx/feed/
+https://www.educa.org.mx/feed/
+https://tribunacampeche.com/feed/
+https://www.puntonoticias.mx/feed/
+https://www.yucatanalamano.com/feed/
+https://www.revistayucatan.com/feed/
+https://www.elheraldodechiapas.com.mx/rss.xml
+https://www.chiapasparalelo.com/feed/

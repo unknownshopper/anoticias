@@ -9,18 +9,18 @@ cero framework web, datos en JSONL. Powered by Olmeca Code.
 
 ## Fuentes configuradas (`config.json`)
 
-85 fuentes agrupadas por `categoria` (se muestran como dropdowns
+95 fuentes agrupadas por `categoria` (se muestran como dropdowns
 plegables en `/fuentes`) — **todas RSS/HTML directo, cero agregadores**:
 
 | Categoría | # | Ejemplos |
 |---|---|---|
-| quintana_roo | 25 | El Quequi (+secciones), Por Esto, Quadratín, Noticias Tulum, Luces, Riviera Maya News, Yucatán… |
+| quintana_roo | 27 | El Quequi (+secciones), Por Esto, Quadratín, Noticias Tulum, Luces, Riviera Maya News, Yucatán… |
 | prensa | 18 | Tabasco HOY, El Heraldo, Novedades, Diario Presente, Tabasco al Día, El Sureste… |
-| nacional | 25 | Jornada, Reforma, El Financiero, Expansión, 24H, Informador, Norte, Debate… |
+| nacional | 32 | Jornada, Reforma, Financiero, Expansión, 24H, Informador, Norte, Debate, Deforma… |
 | deportes | 7 | ESPN, Récord, Marca, AS… |
 | internacional | 4 | BBC, NYT, El País, El Mundo |
 | oficial | 2 | Congreso Tabasco, Gobierno QRoo |
-| prensa_independiente | 4 | López-Dóriga, Contralínea, Periodistas de a Pie, Reporteros en Movimiento |
+| prensa_independiente | 5 | López-Dóriga, Contralínea, Periodistas de a Pie, Reporteros en Movimiento, EDUCA |
 
 QRoo lleva portadas **y secciones municipales** (Cancún, Tulum,
 municipios) como feeds separados `Medio · Sección`.
