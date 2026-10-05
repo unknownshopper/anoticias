@@ -76,3 +76,10 @@ https://24-horas.mx/feed/
 https://www.yucatan.com.mx/feed
 https://theyucatantimes.com/feed/
 https://8columnas.com.mx/feed/
+https://www.elsiglodetorreon.com.mx/index.xml
+https://www.elnorte.com/rss/portada.xml
+https://www.informador.mx/rss/mexico.xml
+https://plazajuarez.mx/feed/
+https://imparcialoaxaca.mx/feed/
+https://www.debate.com.mx/rss/feed.xml
+https://mexicotoday.com/feed/
