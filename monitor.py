@@ -1712,6 +1712,27 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
     Devuelve (html, meta) — meta alimenta los OG de la vista pública
     (iframe no sirve: la mayoría de los sitios manda X-Frame-Options=DENY)."""
     dominio = urlparse(link).netloc
+    if "news.google.com" in dominio:
+        # link de agregador: el servidor no puede resolverlo al artículo
+        # real (GN redirige con JS) — pero el navegador del usuario sí.
+        # Mostramos tarjeta con datos de la nota almacenada + botón.
+        nota = next((n for n in leer_jsonl(NOTICIAS)
+                     if n["link"] == link), {})
+        t = nota.get("titulo", "")
+        f = nota.get("fuente", "")
+        img = nota.get("imagen", "")
+        return ("<div class='lector'>"
+                "<a href='javascript:history.back()'>← Regresar</a>"
+                f"<h1>{html.escape(t or 'Nota vía Google News')}</h1>"
+                f"<div class='meta'>Fuente: {html.escape(f)} · vía Google News</div>"
+                + (f"<img class='hero' src='{html.escape(url_https(img))}' "
+                   f"onerror='this.remove()'>" if img else "")
+                + "<p class='meta'>Indexada a través de Google News — al "
+                  "abrirla, Google te lleva directo al artículo del medio.</p>"
+                + f"<a class='origen' href='{html.escape(link)}' "
+                  f"target='_blank' rel='noopener'>Abrir la nota en el medio ↗</a></div>",
+                {"titulo": t, "imagen": img,
+                 "desc": "Nota vía Google News", "dominio": dominio})
     try:
         r = requests.get(link, timeout=12,
                          headers={"User-Agent": "Mozilla/5.0"})
