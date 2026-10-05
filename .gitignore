@@ -16,3 +16,4 @@ monitor.log
 .venv/
 __pycache__/
 *.pyc
+noticias.jsonl.bak*

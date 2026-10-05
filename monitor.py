@@ -70,6 +70,15 @@ def normalizar(texto: str) -> str:
     )
 
 
+def _canon_medio(m: str) -> str:
+    """Nombre del medio canónico para dedup: 'LatinUS', 'latinus.us' y
+    'Latinus' son la misma casa editorial (GN no es consistente)."""
+    m = normalizar(m).strip()
+    if "." in m:
+        m = m.split(".")[0]          # dominio → primer label
+    return re.sub(r"[^a-z0-9]", "", m)
+
+
 def cargar_vistos() -> dict:
     """{link: timestamp}. El formato viejo era una lista de links: se migra."""
     datos = cargar_json(VISTOS, {})
@@ -505,6 +514,11 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
     # no foto del artículo (ej. ícono de GN en "Latinus Diario")
     frecuencia_img = Counter(n.get("imagen", "")
                              for n in leer_jsonl(NOTICIAS, limite=300))
+    # dedup por (título, medio): el agregador (GN) a veces devuelve la
+    # misma nota 2-3 veces con link distinto → triples falsos. El medio
+    # va en la clave para NO borrar cobertura real multi-medio.
+    titulos_vistos = {(normalizar(n["titulo"]), _canon_medio(n["fuente"]))
+                      for n in leer_jsonl(NOTICIAS, limite=800)}
 
     now = time.time()
     delay = cfg.get("delay_fuentes", 1)
@@ -611,6 +625,15 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
                 if medio and titulo.endswith(f" - {medio}"):
                     titulo = titulo[: -len(medio) - 3]
             texto = f"{titulo} {resumen} {autor}"
+
+            # mismo titular DEL MISMO medio con link distinto = nota
+            # repetida (GN la da más de una vez); si es de OTRO medio
+            # es cobertura real y entra al cluster
+            clave = (normalizar(titulo),
+                     _canon_medio(medio or fuente["nombre"]))
+            if clave in titulos_vistos:
+                continue
+            titulos_vistos.add(clave)
 
             # Filtro por fuente PRIMERO: solo gastamos la petición og:image
             # en notas que sí van a quedar
@@ -895,6 +918,13 @@ PAGINA = """<!DOCTYPE html>
   .chip-fuente {{ display: inline-block; background: #1a237e; color: #fff;
       font-size: .66rem; font-weight: 700; text-transform: uppercase;
       letter-spacing: .06em; padding: .22rem .55rem; border-radius: 10px; }}
+  .tabs-cat {{ display: flex; gap: .5rem; margin: .5rem 0 1rem;
+      flex-wrap: wrap; }}
+  .tab-cat {{ padding: .45rem .95rem; border-radius: 20px; font-size: .85rem;
+      font-weight: 600; text-decoration: none; color: #1a237e;
+      border: 1px solid #c5cae9; background: #fff; min-height: 36px;
+      display: inline-flex; align-items: center; }}
+  .tab-cat.on {{ background: #1a237e; color: #fff; border-color: #1a237e; }}
   .fuente-edit summary {{ font-size: .8rem; color: #1565c0;
       padding: .4rem 0 .7rem; }}
   .fuente-edit[open] summary {{ border-bottom: 1px solid #eee;
@@ -1249,34 +1279,51 @@ def agrupar_noticias(noticias: list, umbral: float = 0.45,
 
     # dedupe: misma fuente + mismo titular = la misma nota con URL distinta
     # (pasa cuando el medio republica la nota bajo otra URL/categoría)
-    def _norm_sin_dig(n):
-        return re.sub(r"\d+", "", normalizar(n["titulo"]))
+    MESES = ("enero febrero marzo abril mayo junio julio agosto "
+             "septiembre setiembre octubre noviembre diciembre").split()
+    RE_FECHA = re.compile(
+        r"\b\d{1,2}\s+de\s+(?:" + "|".join(MESES) + r")\b")
+
+    def _base_y_fechas(n):
+        """(titulo sin fechas ni dígitos, firmas de fecha del titulo).
+        Dos titulares con la misma base pero fecha distinta son EDICIONES
+        diferentes ('Latinus Diario: 30 de septiembre' vs '2 de octubre'),
+        no la misma historia."""
+        norm = normalizar(n["titulo"])
+        sigs = set(RE_FECHA.findall(norm))
+        base = RE_FECHA.sub("", norm)
+        sigs |= set(re.findall(r"\b\d{4}[- ]\d{1,2}[- ]\d{1,2}\b", base))
+        sigs |= set(re.findall(r"\b\d+\b", base))
+        base = re.sub(r"\d+|\b(?:" + "|".join(MESES) + r")\b", "", base)
+        return " ".join(base.split()), sigs
 
     unicos, claves = [], set()
     for n in noticias:
-        k = (n["fuente"], normalizar(n["titulo"]))
+        # medio canónico: 'LatinUS'/'latinus.us'/'Latinus' = 1 medio
+        k = (_canon_medio(n["fuente"]), normalizar(n["titulo"]))
         if k not in claves:
             claves.add(k)
             unicos.append(n)
-    items = [(n, tokens_titulo(n["titulo"]), _ts(n),
-              normalizar(n["titulo"]), _norm_sin_dig(n)) for n in unicos]
+    items = [(n, tokens_titulo(n["titulo"]), _ts(n), *_base_y_fechas(n))
+             for n in unicos]
     usado = [False] * len(items)
     grupos = []
-    for i, (ni, ti, fi, norm_i, ndig_i) in enumerate(items):
+    for i, (ni, ti, fi, base_i, sigs_i) in enumerate(items):
         if usado[i] or not ti:
             continue
         cluster = [ni]
         usado[i] = True
         for j in range(i + 1, len(items)):
-            nj, tj, fj, norm_j, ndig_j = items[j]
+            nj, tj, fj, base_j, sigs_j = items[j]
             if usado[j] or not tj:
                 continue
             if (fi and fj and
                     abs(fi - fj) > ventana_dias * 86400):
                 continue
-            # títulos que solo cambian en números = ediciones distintas
-            # ("Latinus Diario: 14" vs ": 22"), no la misma noticia
-            if ndig_i == ndig_j and norm_i != norm_j:
+            # misma base pero fecha/números distintos = ediciones
+            # diferentes ("Latinus Diario: 30 de septiembre" vs
+            # "2 de octubre", "3 muertos" vs "5 muertos")
+            if base_i == base_j and sigs_i != sigs_j:
                 continue
             jaccard = len(ti & tj) / len(ti | tj)
             if jaccard >= umbral:
@@ -3417,6 +3464,15 @@ if __name__ == "__main__":
     sys.exit(main())
 
 if __name__ == "__main__":
+    sys.exit(main())
+    sys.exit(main())
+    sys.exit(main())
+    sys.exit(main())
+    sys.exit(main())
+
+if __name__ == "__main__":
+    sys.exit(main())
+    sys.exit(main())
     sys.exit(main())
     sys.exit(main())
     sys.exit(main())
