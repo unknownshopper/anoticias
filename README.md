@@ -9,14 +9,14 @@ cero framework web, datos en JSONL. Powered by Olmeca Code.
 
 ## Fuentes configuradas (`config.json`)
 
-73 fuentes agrupadas por `categoria` (se muestran como dropdowns
+78 fuentes agrupadas por `categoria` (se muestran como dropdowns
 plegables en `/fuentes`) — **todas RSS/HTML directo, cero agregadores**:
 
 | Categoría | # | Ejemplos |
 |---|---|---|
-| quintana_roo | 24 | El Quequi (+secciones), Por Esto, Quadratín, Noticias Tulum, Luces, Riviera Maya News, El Quintanarroense… |
+| quintana_roo | 26 | El Quequi (+secciones), Por Esto, Quadratín, Noticias Tulum, Luces, Riviera Maya News, Yucatán… |
 | prensa | 18 | Tabasco HOY, El Heraldo, Novedades, Diario Presente, Tabasco al Día, El Sureste… |
-| nacional | 14 | La Jornada, Proceso, Reforma, El Financiero, Expansión… |
+| nacional | 18 | La Jornada, Proceso, Reforma, El Financiero, Expansión, 24 Horas, 8 Columnas… |
 | deportes | 7 | ESPN, Récord, Marca, AS… |
 | internacional | 4 | BBC, NYT, El País, El Mundo |
 | oficial | 2 | Congreso Tabasco, Gobierno QRoo |
