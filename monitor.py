@@ -971,6 +971,12 @@ def vista_portadas(sec: str) -> str:
     medios = [m for m in port.get("medios", [])
               if m.get("seccion", "nacional") == sec]
     ultima = cargar_json(ESTADO_PORTADAS, {}).get("fecha", "")
+    # PDFs locales por sección, el más nuevo primero — archivo visible
+    pdfs = sorted(PORTADAS_DIR.glob(f"portadas_{sec}_*.pdf"), reverse=True) \
+        if PORTADAS_DIR.exists() else []
+    links_pdf = "".join(
+        f"<a class='tab-cat' href='/portadas/{p.name}' target='_blank'>"
+        f"{p.stem.rsplit('_', 1)[-1]}</a>" for p in pdfs)
     tabs = ("<div class='tabs-cat'>"
             + f"<a class='tab-cat{' on' if sec != 'tabasco' else ''}' "
               "href='/portadas'>Nacional</a>"
@@ -991,11 +997,14 @@ def vista_portadas(sec: str) -> str:
                   "rel='noopener' class='meta' "
                   "style='display:block;margin:.15rem 0'>abrir en el medio ↗</a>"
                   f"{img}</div>")
+    pdf_block = (f"<p class='meta'>PDFs: {links_pdf}</p>"
+                 if links_pdf
+                 else "<p class='meta'>Sin PDFs todavía — "
+                      "se generan cada mañana.</p>")
     return (f"<h1>Portadas — {sec.title()}</h1>{tabs}"
             f"<p class='meta'>Capturas del {ultima or '—'} · se regeneran a "
-            f"las {html.escape(port.get('hora', '06:30'))} y se envían por "
-            f"correo a {html.escape(port.get('destinatario', ''))}.</p>"
-            + cards)
+            f"las {html.escape(port.get('hora', '06:30'))}.</p>"
+            + pdf_block + cards)
 
 
 def detectar_desarrollo(cfg: dict, resumir: bool) -> int:
@@ -3598,10 +3607,11 @@ def servir_web(puerto: int):
                                          usuario=email))
             elif ruta.path.startswith("/portadas/"):
                 p = (PORTADAS_DIR / ruta.path.split("/", 2)[2]).resolve()
+                tipos = {".png": "image/png", ".pdf": "application/pdf"}
                 if p.parent == PORTADAS_DIR.resolve() and p.is_file() \
-                        and p.suffix == ".png":
+                        and p.suffix in tipos:
                     self.send_response(200)
-                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Type", tipos[p.suffix])
                     self.send_header("Cache-Control", "max-age=300")
                     self.end_headers()
                     self.wfile.write(p.read_bytes())
