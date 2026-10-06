@@ -1251,93 +1251,117 @@ def _shot_img_mayor(url: str, png: Path):
         browser.close()
 
 
+def _medio_listo(base: Path) -> bool:
+    """¿Este medio ya tiene imagen (impresa o web) capturada HOY?"""
+    hoy_d = datetime.now().date()
+    for c in (base.with_suffix(".jpg"), base.with_suffix(".png"),
+              base.with_name(base.name + "-web.png")):
+        if c.exists() and c.stat().st_size > 10000 and \
+                datetime.fromtimestamp(c.stat().st_mtime).date() == hoy_d:
+            return True
+    return False
+
+
+def _captura_medio(m: dict, base: Path) -> bool:
+    """Intenta las estrategias del medio (impresa → web). True si logró
+    al menos una imagen del día."""
+    data = []
+    tiene_impresa = False
+    if m.get("kiosko"):
+        b = _bajar_portada_kiosko(m)
+        data = [b] if b else []
+    elif m.get("fb"):
+        data = _bajar_portada_fb(m)
+    elif m.get("issuu"):
+        b = _portada_issuu(m["issuu"])
+        data = [b] if b else []
+    elif m.get("pr"):
+        # pressreader: el <img> mayor de su visor es la portada
+        png_pr = base.with_suffix(".png")
+        try:
+            _shot_img_mayor(m["pr"], png_pr)
+            if png_pr.exists() and png_pr.stat().st_size > 40000:
+                tiene_impresa = True
+            else:
+                png_pr.unlink(missing_ok=True)
+        except Exception:
+            pass
+    if data:
+        base.with_suffix(".png").unlink(missing_ok=True)
+        for i, d in enumerate(data):
+            nom = base.name if i == 0 else f"{base.name}-{i + 1}"
+            (PORTADAS_DIR / f"{nom}.jpg").write_bytes(d)
+        tiene_impresa = True
+    elif tiene_impresa:
+        pass   # pr ya escribió su PNG arriba
+    else:
+        # 2) PDF del ejemplar completo → página 1
+        png = base.with_suffix(".png")
+        ok, fallback = (_portada_pdf(m, png)
+                        if m.get("pdf") else (False, ""))
+        if ok:
+            tiene_impresa = True
+        else:
+            url_tiro = fallback or m["url"]
+            # 3) screenshot playwright (espera + mata overlays)
+            try:
+                _shot_playwright(url_tiro, png)
+            except Exception:
+                subprocess.run(
+                    ["chromium", "--headless", "--no-sandbox",
+                     "--disable-gpu", "--hide-scrollbars",
+                     "--window-size=1280,2600",
+                     f"--screenshot={png}", url_tiro],
+                    timeout=45, capture_output=True)
+    # doble portada: con impresa (jpg/pdf) también portada web
+    # (o URL alterna tipo PressReader: url_web2 + img_portada)
+    if tiene_impresa:
+        web = base.with_name(base.name + "-web.png")
+        if not web.exists() or datetime.fromtimestamp(
+                web.stat().st_mtime).date() != datetime.now().date():
+            try:
+                url_web = m.get("url_web2") or m["url"]
+                if m.get("img_portada"):
+                    _shot_img_mayor(url_web, web)
+                else:
+                    _shot_playwright(url_web, web)
+                if not web.exists() or web.stat().st_size < 40000:
+                    web.unlink(missing_ok=True)
+            except Exception:
+                web.unlink(missing_ok=True)
+    img_final = _portada_img(base.name)
+    return img_final.exists() and img_final.stat().st_size >= 10000
+
+
 def capturar_portadas(cfg: dict):
-    """Screenshot chromium de la portada de cada diario → PNG → PDF por
-    sección → correo con ambos adjuntos. El historial vive en el buzón;
-    aquí solo queda el último PNG/PDF."""
+    """Recolector incremental 00:30→06:45: para cada medio sin imagen de
+    HOY intenta su estrategia; los que ya tienen se saltan. No arma PDF
+    ni manda correo — eso pasa a la hora_pdf con lo recolectado."""
     medios = cfg.get("portadas", {}).get("medios", [])
     if not medios:
         return
     PORTADAS_DIR.mkdir(exist_ok=True)
-    hoy = datetime.now().strftime("%Y-%m-%d")
     fallos = []
     for m in medios:
         base = PORTADAS_DIR / _slug_portada(m["nombre"])
-        # FB de madrugada ya capturó la portada de hoy → no repetir
-        jpg_hoy = base.with_suffix(".jpg")
-        if m.get("fb") and jpg_hoy.exists() and \
-                datetime.fromtimestamp(jpg_hoy.stat().st_mtime).date() == \
-                datetime.now().date():
-            continue
+        if _medio_listo(base):
+            continue   # ya tiene su imagen de hoy
         try:
-            # 1) kiosko/FB: JPG directo (portada impresa real, sin screenshot)
-            data = []
-            tiene_impresa = False
-            if m.get("kiosko"):
-                b = _bajar_portada_kiosko(m)
-                data = [b] if b else []
-            elif m.get("fb"):
-                data = _bajar_portada_fb(m)
-            elif m.get("issuu"):
-                b = _portada_issuu(m["issuu"])
-                data = [b] if b else []
-            elif m.get("pr"):
-                # pressreader: el <img> mayor de su visor es la portada
-                png_pr = base.with_suffix(".png")
-                try:
-                    _shot_img_mayor(m["pr"], png_pr)
-                    if png_pr.exists() and png_pr.stat().st_size > 40000:
-                        tiene_impresa = True
-                    else:
-                        png_pr.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            if data:
-                base.with_suffix(".png").unlink(missing_ok=True)
-                for i, d in enumerate(data):
-                    nom = base.name if i == 0 else f"{base.name}-{i + 1}"
-                    (PORTADAS_DIR / f"{nom}.jpg").write_bytes(d)
-                tiene_impresa = True
-            elif tiene_impresa:
-                pass   # pr ya escribió su PNG arriba
-            else:
-                # 2) PDF del ejemplar completo → página 1
-                png = base.with_suffix(".png")
-                ok, fallback = (_portada_pdf(m, png)
-                                if m.get("pdf") else (False, ""))
-                if ok:
-                    tiene_impresa = True
-                else:
-                    url_tiro = fallback or m["url"]
-                    # 3) screenshot playwright (espera + mata overlays)
-                    try:
-                        _shot_playwright(url_tiro, png)
-                    except Exception:
-                        subprocess.run(
-                            ["chromium", "--headless", "--no-sandbox",
-                             "--disable-gpu", "--hide-scrollbars",
-                             "--window-size=1280,2600",
-                             f"--screenshot={png}", url_tiro],
-                            timeout=45, capture_output=True)
-            # doble portada: con impresa (jpg/pdf) también portada web
-            # (o URL alterna tipo PressReader: url_web2 + img_portada)
-            if tiene_impresa:
-                web = base.with_name(base.name + "-web.png")
-                try:
-                    url_web = m.get("url_web2") or m["url"]
-                    if m.get("img_portada"):
-                        _shot_img_mayor(url_web, web)
-                    else:
-                        _shot_playwright(url_web, web)
-                    if not web.exists() or web.stat().st_size < 40000:
-                        web.unlink(missing_ok=True)
-                except Exception:
-                    web.unlink(missing_ok=True)
-            img_final = _portada_img(base.name)
-            if not img_final.exists() or img_final.stat().st_size < 10000:
+            if not _captura_medio(m, base):
                 fallos.append(m["nombre"])
         except Exception:
             fallos.append(m["nombre"])
+    print(f"[portadas] corrida, pendientes fallidos: "
+          f"{fallos or 'ninguno'}")
+
+
+def generar_pdfs_portadas(cfg: dict):
+    """Hora_pdf (06:45): arma los PDFs con lo recolectado en la ventana,
+    los manda por correo y lista los medios que nunca respondieron."""
+    medios = cfg.get("portadas", {}).get("medios", [])
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    hoy_d = datetime.now().date()
+    fallos = []
     pdfs = {}
     for sec in ("nacional", "tabasco"):
         imgs = []
@@ -1347,13 +1371,17 @@ def capturar_portadas(cfg: dict):
             slug = _slug_portada(m["nombre"])
             # impresa(s) primero — los posts FB traen portada-2, etc.
             extras = sorted(PORTADAS_DIR.glob(f"{slug}-[0-9].jpg"))
+            tiene = False
             for cand in ([_portada_img(slug)] + extras
                          + [PORTADAS_DIR / f"{slug}-web.png"]):
                 if cand.exists():
                     try:
                         imgs.append(Image.open(cand).convert("RGB"))
+                        tiene = True
                     except Exception:
                         pass
+            if not tiene:
+                fallos.append(m["nombre"])
         if imgs:
             pdf = PORTADAS_DIR / f"portadas_{sec}_{hoy}.pdf"
             imgs[0].save(pdf, save_all=True, append_images=imgs[1:])
@@ -1361,8 +1389,27 @@ def capturar_portadas(cfg: dict):
                 i.close()
             pdfs[sec] = pdf
     enviar_portadas(cfg, pdfs, fallos)
-    ESTADO_PORTADAS.write_text(json.dumps({"fecha": hoy}))
-    print(f"[portadas] {len(pdfs)} PDFs, fallos: {fallos or 'ninguno'}")
+    est = cargar_json(ESTADO_PORTADAS, {})
+    est["pdf_fecha"] = hoy
+    ESTADO_PORTADAS.write_text(json.dumps(est))
+    print(f"[portadas] {len(pdfs)} PDFs enviados, fallos: "
+          f"{fallos or 'ninguno'}")
+
+
+def limpiar_portadas():
+    """19:00 — borra las imágenes del día; los PDFs se quedan como
+    archivo local."""
+    if not PORTADAS_DIR.exists():
+        return
+    n = 0
+    for f in PORTADAS_DIR.glob("*.*"):
+        if f.suffix in (".jpg", ".jpeg", ".png"):
+            try:
+                f.unlink()
+                n += 1
+            except Exception:
+                pass
+    print(f"[portadas] limpieza: {n} imágenes borradas")
 
 
 def enviar_portadas(cfg: dict, pdfs: dict, fallos: list):
@@ -1395,85 +1442,72 @@ def enviar_portadas(cfg: dict, pdfs: dict, fallos: list):
         print(f"[portadas] correo falló: {e}")
 
 
-def capturar_portadas_fb(cfg: dict):
-    """Corrida de madrugada (12-1am): solo medios FB — su post de portada
-    salió a medianoche y al amanecer el plugin ya no lo muestra.
-    Se reintenta cada hora hasta las 06:30 para los que falten."""
-    medios = [m for m in cfg.get("portadas", {}).get("medios", [])
-              if m.get("fb")]
-    if not medios:
-        return
-    PORTADAS_DIR.mkdir(exist_ok=True)
-    hoy_d = datetime.now().date()
-    for m in medios:
-        jpg = PORTADAS_DIR / (_slug_portada(m["nombre"]) + ".jpg")
-        if jpg.exists() and \
-                datetime.fromtimestamp(jpg.stat().st_mtime).date() == hoy_d:
-            continue   # ya tiene la portada de hoy
-        base = PORTADAS_DIR / _slug_portada(m["nombre"])
-        try:
-            data = _bajar_portada_fb(m)
-            if data:
-                base.with_suffix(".png").unlink(missing_ok=True)
-                for i, d in enumerate(data):
-                    nom = base.name if i == 0 else f"{base.name}-{i + 1}"
-                    (PORTADAS_DIR / f"{nom}.jpg").write_bytes(d)
-        except Exception:
-            pass
-    print(f"[portadas-fb] madrugada: {len(medios)} medios")
-
-
-def toca_captura_portadas_fb(cfg: dict) -> bool:
-    """Ventana FB [hora_fb, hora): reintenta cada ~55 min para los medios
-    sin portada de hoy — si el post no está a las 12:35, sale más tarde."""
-    port = cfg.get("portadas", {})
-    fb_medios = [m for m in port.get("medios", []) if m.get("fb")]
-    if not fb_medios:
-        return False
+def _hhmm(port: dict, clave: str, default: str) -> int:
+    """'HH:MM' → minutos del día."""
     try:
-        hh1, mm1 = map(int, port.get("hora_fb", "00:35").split(":"))
-        hh2, mm2 = map(int, port.get("hora", "06:30").split(":"))
+        hh, mm = map(int, port.get(clave, default).split(":"))
+        return hh * 60 + mm
     except Exception:
-        hh1, mm1, hh2, mm2 = 0, 35, 6, 30
+        hh, mm = map(int, default.split(":"))
+        return hh * 60 + mm
+
+
+def toca_captura_portadas(cfg: dict) -> bool:
+    """Ventana de recolección [hora_desde, hora_pdf): corre cada ~55 min
+    mientras falte algún medio — kiosko sale de madrugada, FB a las
+    00:0x, issuu/pdf cuando lo suban."""
+    port = cfg.get("portadas", {})
+    medios = port.get("medios", [])
+    if not medios:
+        return False
     ahora = datetime.now()
-    if not (hh1 * 60 + mm1 <= ahora.hour * 60 + ahora.minute
-            < hh2 * 60 + mm2):
+    if not (_hhmm(port, "hora_desde", "00:30")
+            <= ahora.hour * 60 + ahora.minute
+            < _hhmm(port, "hora_pdf", "06:45")):
         return False
     est = cargar_json(ESTADO_PORTADAS, {})
     try:
-        ult = datetime.fromisoformat(est.get("fb_last", "2000-01-01"))
+        ult = datetime.fromisoformat(est.get("cap_last", "2000-01-01"))
     except Exception:
         ult = datetime(2000, 1, 1)
     if (ahora - ult).total_seconds() < 55 * 60:
         return False
-    hoy_d = ahora.date()
-    for m in fb_medios:
-        jpg = PORTADAS_DIR / (_slug_portada(m["nombre"]) + ".jpg")
-        if not jpg.exists() or \
-                datetime.fromtimestamp(jpg.stat().st_mtime).date() != hoy_d:
-            return True    # falta alguno → reintenta
+    for m in medios:
+        if not _medio_listo(PORTADAS_DIR / _slug_portada(m["nombre"])):
+            return True    # falta alguno → corre
     return False
 
 
-def marcar_portadas_fb():
+def marcar_captura_portadas():
     est = cargar_json(ESTADO_PORTADAS, {})
-    est["fb_last"] = datetime.now().isoformat()
+    est["cap_last"] = datetime.now().isoformat()
     ESTADO_PORTADAS.write_text(json.dumps(est))
 
 
-def toca_captura_portadas(cfg: dict) -> bool:
-    """True si ya pasó la hora configurada y hoy no se han capturado."""
+def toca_pdf_portadas(cfg: dict) -> bool:
+    """hora_pdf (06:45) → arma PDFs + envía una vez al día."""
     port = cfg.get("portadas", {})
     if not port.get("medios"):
         return False
-    try:
-        hh, mm = (int(x) for x in port.get("hora", "06:30").split(":"))
-    except Exception:
-        hh, mm = 6, 30
     ahora = datetime.now()
-    hoy = ahora.strftime("%Y-%m-%d")
-    ultima = cargar_json(ESTADO_PORTADAS, {}).get("fecha", "")
-    return ultima != hoy and (ahora.hour, ahora.minute) >= (hh, mm)
+    est = cargar_json(ESTADO_PORTADAS, {})
+    return est.get("pdf_fecha") != ahora.strftime("%Y-%m-%d") and \
+        ahora.hour * 60 + ahora.minute >= _hhmm(port, "hora_pdf", "06:45")
+
+
+def toca_limpia_portadas(cfg: dict) -> bool:
+    """hora_limpia (19:00) → depura las imágenes del día."""
+    port = cfg.get("portadas", {})
+    ahora = datetime.now()
+    est = cargar_json(ESTADO_PORTADAS, {})
+    return est.get("limpia_fecha") != ahora.strftime("%Y-%m-%d") and \
+        ahora.hour * 60 + ahora.minute >= _hhmm(port, "hora_limpia", "19:00")
+
+
+def marcar_limpia_portadas():
+    est = cargar_json(ESTADO_PORTADAS, {})
+    est["limpia_fecha"] = datetime.now().strftime("%Y-%m-%d")
+    ESTADO_PORTADAS.write_text(json.dumps(est))
 
 
 def vista_portadas(sec: str) -> str:
@@ -1482,7 +1516,7 @@ def vista_portadas(sec: str) -> str:
     port = cfg.get("portadas", {})
     medios = [m for m in port.get("medios", [])
               if m.get("seccion", "nacional") == sec]
-    ultima = cargar_json(ESTADO_PORTADAS, {}).get("fecha", "")
+    ultima = cargar_json(ESTADO_PORTADAS, {}).get("pdf_fecha", "")
     # PDFs locales por sección, el más nuevo primero — archivo visible
     pdfs = sorted(PORTADAS_DIR.glob(f"portadas_{sec}_*.pdf"), reverse=True) \
         if PORTADAS_DIR.exists() else []
@@ -4385,16 +4419,19 @@ def main():
             cfg = json.loads(CONFIG.read_text())
             with _LOCK_REVISAR:
                 revisar(cfg, args.todo, args.resumir)
-                # madrugada: portadas de FB salen ~00:00 y el plugin pierde
-                # el post al amanecer — captura a la 00:35 aparte
-                if toca_captura_portadas_fb(cfg):
-                    threading.Thread(target=capturar_portadas_fb,
-                                     args=(cfg,), daemon=True,
-                                     name="portadas-fb").start()
-                    marcar_portadas_fb()
+                # portadas: recolecta incremental 00:30→06:45, arma el
+                # PDF y lo envía a las 06:45, depura imágenes a las 19:00
                 if toca_captura_portadas(cfg):
                     threading.Thread(target=capturar_portadas, args=(cfg,),
                                      daemon=True, name="portadas").start()
+                    marcar_captura_portadas()
+                if toca_pdf_portadas(cfg):
+                    threading.Thread(target=generar_pdfs_portadas,
+                                     args=(cfg,), daemon=True,
+                                     name="portadas-pdf").start()
+                if toca_limpia_portadas(cfg):
+                    limpiar_portadas()
+                    marcar_limpia_portadas()
             print(f"\n--- durmiendo {args.loop} min ---")
             time.sleep(args.loop * 60)
     else:
