@@ -1137,6 +1137,18 @@ def _shot_playwright(url: str, png: Path):
         page.wait_for_timeout(2500)
         page.mouse.wheel(0, -500)         # de regreso arriba
         page.wait_for_timeout(1000)
+        # muros anti-bot: no guardar el "Algo ha salido mal" como portada
+        titulo = (page.title() or "").lower()
+        cuerpo_txt = page.evaluate("document.body ? "
+                                   "document.body.innerText.slice(0,400) "
+                                   ": ''").lower()
+        if re.search(r"algo ha salido mal|request blocked|access denied|"
+                     r"403 error|verify you|not authorized|"
+                     r"something went wrong|bloqueada por|"
+                     r"bluestack|cloudfront.*error",
+                     titulo + " " + cuerpo_txt):
+            browser.close()
+            raise RuntimeError("bloqueado por anti-bot")
         page.screenshot(path=str(png))
         browser.close()
 
