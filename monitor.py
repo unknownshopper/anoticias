@@ -904,6 +904,26 @@ def _bajar_portada_kiosko(m: dict):
 _OG_IMG = 'property="og:image"[^>]*content="([^"]+)"'
 
 
+def _portada_issuu(handle: str):
+    """Issuu: el atom del perfil trae los docs del día con la miniatura
+    page_1_thumb_large.jpg → page_1.jpg es la portada completa."""
+    try:
+        r = requests.get(f"https://issuu.com/{handle}/atom",
+                         timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        m = re.search(
+            r"https://image\.isu\.pub/[^\"'<> ]+/jpg/page_1_thumb_large\.jpg",
+            r.text)
+        if not m:
+            return None
+        ir = requests.get(m.group(0).replace("_thumb_large", ""),
+                          timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        if ir.status_code == 200 and len(ir.content) > 100000:
+            return ir.content
+    except Exception:
+        pass
+    return None
+
+
 def _imagenes_fb_post(url: str) -> list:
     """Post/share de FB → TODAS las fotos adjuntas (TAD mete las 2
     portadas en el mismo post). Dedup por id de foto; solo imágenes
@@ -1229,12 +1249,28 @@ def capturar_portadas(cfg: dict):
                 data = [b] if b else []
             elif m.get("fb"):
                 data = _bajar_portada_fb(m)
+            elif m.get("issuu"):
+                b = _portada_issuu(m["issuu"])
+                data = [b] if b else []
+            elif m.get("pr"):
+                # pressreader: el <img> mayor de su visor es la portada
+                png_pr = base.with_suffix(".png")
+                try:
+                    _shot_img_mayor(m["pr"], png_pr)
+                    if png_pr.exists() and png_pr.stat().st_size > 40000:
+                        tiene_impresa = True
+                    else:
+                        png_pr.unlink(missing_ok=True)
+                except Exception:
+                    pass
             if data:
                 base.with_suffix(".png").unlink(missing_ok=True)
                 for i, d in enumerate(data):
                     nom = base.name if i == 0 else f"{base.name}-{i + 1}"
                     (PORTADAS_DIR / f"{nom}.jpg").write_bytes(d)
                 tiene_impresa = True
+            elif tiene_impresa:
+                pass   # pr ya escribió su PNG arriba
             else:
                 # 2) PDF del ejemplar completo → página 1
                 png = base.with_suffix(".png")
