@@ -1055,9 +1055,32 @@ def _portada_pdf(m: dict, png: Path) -> tuple:
         cands = re.findall(r'https?://[^"\'\s<>]+\.pdf', r.text)
         url_pdf = ""
         for u in cands:
-            if dom in u and clave in normalizar(u):
+            # solo el nombre de archivo — el dominio siempre "contiene"
+            # la clave (elindependiente.mx) y ganaba el MEDIAKIT
+            if dom in u and clave in normalizar(u.split("/")[-1]):
                 url_pdf = u
                 break
+        if not url_pdf:
+            # archivo fechado: /edicion-impresa/AAAA/MM/DD/... (El
+            # Independiente) — el post de hoy lleva el PDF del ejemplar
+            hoy_dir = datetime.now().strftime("/%Y/%m/%d/")
+            posts = [u for u in
+                     re.findall(r'href="([^"]+)"', r.text)
+                     if hoy_dir in u]
+            if posts:
+                rp2 = requests.get(posts[0], timeout=15,
+                                   headers={"User-Agent": "Mozilla/5.0"})
+                fallback = posts[0]
+                cand = re.findall(r'https?://[^"\'\s<>]+\.pdf', rp2.text)
+                for u in cand:
+                    if dom in u and "edicion" in normalizar(u):
+                        url_pdf = u
+                        break
+                if not url_pdf:
+                    for u in cand:
+                        if dom in u:
+                            url_pdf = u
+                            break
         if not url_pdf:
             for u in cands:
                 if dom in u:
@@ -1080,9 +1103,15 @@ def _portada_pdf(m: dict, png: Path) -> tuple:
                     cand = re.findall(r'https?://[^"\'\s<>]+\.pdf',
                                       json.dumps(post))
                     for u in cand:
-                        if dom in u and clave in normalizar(u):
+                        if dom in u and clave in normalizar(
+                                u.split("/")[-1]):
                             url_pdf = u
                             break
+                    if not url_pdf:  # filename sin nombre del medio
+                        for u in cand:
+                            if dom in u:
+                                url_pdf = u
+                                break
                     if url_pdf:
                         break
         if not url_pdf:
