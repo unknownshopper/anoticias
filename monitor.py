@@ -904,8 +904,35 @@ def _bajar_portada_kiosko(m: dict):
 _OG_IMG = 'property="og:image"[^>]*content="([^"]+)"'
 
 
+def _imagenes_fb_post(url: str) -> list:
+    """Post/share de FB → TODAS las fotos adjuntas (TAD mete las 2
+    portadas en el mismo post). Dedup por id de foto; solo imágenes
+    grandes — sin avatares ni thumbnails."""
+    try:
+        r = requests.get(url, timeout=15, headers={
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 "
+                          "like Mac OS X) AppleWebKit/605.1.15"})
+        vistos, urls = set(), []
+        for u in re.findall(r'(https://scontent[^"\'\\ ]+)', r.text):
+            u = html.unescape(u)
+            fid = re.search(r'/(\d{8,}_\d{10,}_\d{10,})_n\.', u)
+            if not fid or fid.group(1) in vistos:
+                continue
+            vistos.add(fid.group(1))
+            urls.append(u)
+        imgs = []
+        for u in urls[:4]:
+            ir = requests.get(u, timeout=15,
+                              headers={"User-Agent": "Mozilla/5.0"})
+            if ir.status_code == 200 and len(ir.content) > 30000:
+                imgs.append(ir.content)
+        return imgs
+    except Exception:
+        return []
+
+
 def _og_imagen(url: str):
-    """og:image de una URL de FB → bytes JPG (la portada que comparten)."""
+    """og:image de una URL de FB → bytes JPG."""
     try:
         r = requests.get(url, timeout=15, headers={
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 "
@@ -922,21 +949,21 @@ def _og_imagen(url: str):
     return None
 
 
-def _bajar_portada_fb(m: dict):
-    """FB: si es share/post directo → og:image. Si es página → el plugin
-    timeline público (sin login) y se busca el post DE HOY cuyo texto diga
-    portada/edición/primera plana (TAD publica 'Portadas de hoy' ~00:00)."""
+def _bajar_portada_fb(m: dict) -> list:
+    """FB: share/post directo → TODAS sus fotos (lista de JPGs). Si es
+    página → plugin timeline público (sin login): post DE HOY cuyo texto
+    diga portada/edición/primera plana (TAD publica ~medianoche)."""
     fb = m["fb"]
-    if "/share/" in fb or "/posts/" in fb:
-        return _og_imagen(fb)
+    if "/share/" in fb or "/posts/" in fb or "/photo" in fb:
+        return _imagenes_fb_post(fb)
     # página → slug
     slug = re.search(r"facebook\.com/([^/?&]+)", fb)
     if not slug:
-        return None
+        return []
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        return None
+        return []
     hoy = datetime.now()
     meses = "enero febrero marzo abril mayo junio julio agosto " \
         "septiembre octubre noviembre diciembre".split()
@@ -988,8 +1015,8 @@ def _bajar_portada_fb(m: dict):
                 candidata = post["href"]
                 break
     except Exception:
-        return None
-    return _og_imagen(candidata) if candidata else None
+        return []
+    return _imagenes_fb_post(candidata) if candidata else []
 
 
 def _portada_pdf(m: dict, png: Path) -> tuple:
@@ -1126,17 +1153,26 @@ def capturar_portadas(cfg: dict):
     fallos = []
     for m in medios:
         base = PORTADAS_DIR / _slug_portada(m["nombre"])
+        # FB de madrugada ya capturó la portada de hoy → no repetir
+        jpg_hoy = base.with_suffix(".jpg")
+        if m.get("fb") and jpg_hoy.exists() and \
+                datetime.fromtimestamp(jpg_hoy.stat().st_mtime).date() == \
+                datetime.now().date():
+            continue
         try:
             # 1) kiosko/FB: JPG directo (portada impresa real, sin screenshot)
-            data = None
+            data = []
             tiene_impresa = False
             if m.get("kiosko"):
-                data = _bajar_portada_kiosko(m)
+                b = _bajar_portada_kiosko(m)
+                data = [b] if b else []
             elif m.get("fb"):
                 data = _bajar_portada_fb(m)
             if data:
                 base.with_suffix(".png").unlink(missing_ok=True)
-                base.with_suffix(".jpg").write_bytes(data)
+                for i, d in enumerate(data):
+                    nom = base.name if i == 0 else f"{base.name}-{i + 1}"
+                    (PORTADAS_DIR / f"{nom}.jpg").write_bytes(d)
                 tiene_impresa = True
             else:
                 # 2) PDF del ejemplar completo → página 1
@@ -1178,9 +1214,10 @@ def capturar_portadas(cfg: dict):
             if m.get("seccion") != sec:
                 continue
             slug = _slug_portada(m["nombre"])
-            img = _portada_img(slug)
-            # impresa primero, portada web después — ambas al PDF
-            for cand in (img, PORTADAS_DIR / f"{slug}-web.png"):
+            # impresa(s) primero — los posts FB traen portada-2, etc.
+            extras = sorted(PORTADAS_DIR.glob(f"{slug}-[0-9].jpg"))
+            for cand in ([_portada_img(slug)] + extras
+                         + [PORTADAS_DIR / f"{slug}-web.png"]):
                 if cand.exists():
                     try:
                         imgs.append(Image.open(cand).convert("RGB"))
@@ -1225,6 +1262,45 @@ def enviar_portadas(cfg: dict, pdfs: dict, fallos: list):
             s.send_message(msg)
     except Exception as e:
         print(f"[portadas] correo falló: {e}")
+
+
+def capturar_portadas_fb(cfg: dict):
+    """Corrida de madrugada (12-1am): solo medios FB — su post de portada
+    salió a medianoche y al amanecer el plugin ya no lo muestra."""
+    medios = [m for m in cfg.get("portadas", {}).get("medios", [])
+              if m.get("fb")]
+    if not medios:
+        return
+    PORTADAS_DIR.mkdir(exist_ok=True)
+    for m in medios:
+        base = PORTADAS_DIR / _slug_portada(m["nombre"])
+        try:
+            data = _bajar_portada_fb(m)
+            if data:
+                base.with_suffix(".png").unlink(missing_ok=True)
+                for i, d in enumerate(data):
+                    nom = base.name if i == 0 else f"{base.name}-{i + 1}"
+                    (PORTADAS_DIR / f"{nom}.jpg").write_bytes(d)
+        except Exception:
+            pass
+    print(f"[portadas-fb] madrugada: {len(medios)} medios")
+
+
+def toca_captura_portadas_fb(cfg: dict) -> bool:
+    """Hora_FB (00:35) → corre el barrido solo-FB una vez al día."""
+    port = cfg.get("portadas", {})
+    hh, mm = map(int, port.get("hora_fb", "00:35").split(":"))
+    est = cargar_json(ESTADO_PORTADAS, {})
+    ahora = datetime.now()
+    hoy = ahora.strftime("%Y-%m-%d")
+    return est.get("fb_fecha") != hoy and \
+        (ahora.hour, ahora.minute) >= (hh, mm)
+
+
+def marcar_portadas_fb():
+    est = cargar_json(ESTADO_PORTADAS, {})
+    est["fb_fecha"] = datetime.now().strftime("%Y-%m-%d")
+    ESTADO_PORTADAS.write_text(json.dumps(est))
 
 
 def toca_captura_portadas(cfg: dict) -> bool:
@@ -4151,6 +4227,13 @@ def main():
             cfg = json.loads(CONFIG.read_text())
             with _LOCK_REVISAR:
                 revisar(cfg, args.todo, args.resumir)
+                # madrugada: portadas de FB salen ~00:00 y el plugin pierde
+                # el post al amanecer — captura a la 00:35 aparte
+                if toca_captura_portadas_fb(cfg):
+                    threading.Thread(target=capturar_portadas_fb,
+                                     args=(cfg,), daemon=True,
+                                     name="portadas-fb").start()
+                    marcar_portadas_fb()
                 if toca_captura_portadas(cfg):
                     threading.Thread(target=capturar_portadas, args=(cfg,),
                                      daemon=True, name="portadas").start()
