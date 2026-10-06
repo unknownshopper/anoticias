@@ -901,13 +901,16 @@ def _bajar_portada_kiosko(m: dict):
     return None
 
 
-def _bajar_portada_fb(m: dict):
-    """Share de FB (CORAT sube su portada ahí) → og:image → JPG directo."""
+_OG_IMG = 'property="og:image"[^>]*content="([^"]+)"'
+
+
+def _og_imagen(url: str):
+    """og:image de una URL de FB → bytes JPG (la portada que comparten)."""
     try:
-        r = requests.get(m["fb"], timeout=15, headers={
+        r = requests.get(url, timeout=15, headers={
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 "
                           "like Mac OS X) AppleWebKit/605.1.15"})
-        og = re.search(r'property="og:image"[^>]*content="([^"]+)"', r.text)
+        og = re.search(_OG_IMG, r.text)
         if not og:
             return None
         ir = requests.get(html.unescape(og.group(1)), timeout=15,
@@ -917,6 +920,76 @@ def _bajar_portada_fb(m: dict):
     except Exception:
         pass
     return None
+
+
+def _bajar_portada_fb(m: dict):
+    """FB: si es share/post directo → og:image. Si es página → el plugin
+    timeline público (sin login) y se busca el post DE HOY cuyo texto diga
+    portada/edición/primera plana (TAD publica 'Portadas de hoy' ~00:00)."""
+    fb = m["fb"]
+    if "/share/" in fb or "/posts/" in fb:
+        return _og_imagen(fb)
+    # página → slug
+    slug = re.search(r"facebook\.com/([^/?&]+)", fb)
+    if not slug:
+        return None
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+    hoy = datetime.now()
+    meses = "enero febrero marzo abril mayo junio julio agosto " \
+        "septiembre octubre noviembre diciembre".split()
+    fecha_txt = f"{hoy.day} de {meses[hoy.month - 1]}"
+    plugin = ("https://www.facebook.com/plugins/page.php?href="
+              f"https%3A%2F%2Fwww.facebook.com%2F{slug.group(1)}"
+              "&tabs=timeline&width=500&height=900&hide_cover=true")
+    candidata = ""
+    try:
+        with sync_playwright() as p:
+            pg = p.chromium.launch().new_page()
+            pg.goto(plugin, wait_until="domcontentloaded", timeout=30000)
+            pg.wait_for_timeout(6000)
+            prev = -1
+            for _ in range(25):          # scroll interno del timeline
+                pg.evaluate(
+                    "for (const el of document.querySelectorAll('*')) "
+                    "if (el.scrollHeight > el.clientHeight + 50) "
+                    "el.scrollTop += 2500;")
+                pg.wait_for_timeout(1400)
+                n = pg.evaluate("document.querySelectorAll('img').length")
+                if n == prev:
+                    break
+                prev = n
+            posts = pg.evaluate("""() => {
+                const NL = String.fromCharCode(10), seen = new Set(), out = [];
+                for (const a of document.querySelectorAll('a[href*="/posts/"]')) {
+                    const k = a.href.split('?')[0];
+                    if (seen.has(k)) continue; seen.add(k);
+                    let n = a;
+                    for (let i = 0; i < 8 && n; i++) {
+                        n = n.parentElement;
+                        if (n && n.innerText && n.innerText.length > 40) break;
+                    }
+                    out.push({href: a.href,
+                              txt: (n ? n.innerText : '').split(NL).join(' ')
+                                     .slice(0, 200)});
+                }
+                return out;
+            }""")
+        for post in posts:
+            txt = normalizar(post["txt"])
+            reciente = "hace" in txt and "d\u00eda" not in txt  # hoy/horas
+            fechas = (normalizar(fecha_txt),              # 5 de octubre
+                      normalizar(fecha_txt.replace(
+                          str(hoy.day), f"{hoy.day:02d}")))  # 05 de octubre
+            if re.search(r"portada|primera plana|edici[oó]n", txt) and \
+                    (reciente or any(f in txt for f in fechas)):
+                candidata = post["href"]
+                break
+    except Exception:
+        return None
+    return _og_imagen(candidata) if candidata else None
 
 
 def _portada_pdf(m: dict, png: Path) -> tuple:
@@ -951,7 +1024,11 @@ def _portada_pdf(m: dict, png: Path) -> tuple:
                                       "per_page": 5}, timeout=15,
                               headers={"User-Agent": "Mozilla/5.0"})
             if rs.status_code == 200 and isinstance(rs.json(), list):
+                hoy_p = datetime.now().strftime("%Y-%m-%d")
                 for post in rs.json():
+                    # solo edición de hoy — la de ayer/3 sept NO sirve
+                    if not post.get("date", "").startswith(hoy_p):
+                        continue
                     fallback = post.get("link", "") or fallback
                     cand = re.findall(r'https?://[^"\'\s<>]+\.pdf',
                                       json.dumps(post))
@@ -3757,10 +3834,23 @@ def servir_web(puerto: int):
                 # anónimo en la raíz: la landing es la cara del producto
                 self._html(vista_landing(base))
                 return
+            if ruta.path == "/propuesta":
+                # propuesta de servicio TSJ — documento público con
+                # botón de descarga PDF (sin sesión)
+                doc = BASE / "propuesta_portadas.html"
+                if doc.exists():
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(doc.read_bytes())
+                else:
+                    self.send_error(404)
+                return
             if not email and not (
                     ruta.path in ("/icon.png", "/icon3.png", "/og.png",
                                   "/manifest.webmanifest", "/nota",
-                                  "/instructivo", "/captura")
+                                  "/instructivo", "/captura", "/propuesta")
                     or ruta.path.startswith("/shots/")):
                 # sin sesión: cualquier ruta muestra el login
                 self._html(vista_login(base))

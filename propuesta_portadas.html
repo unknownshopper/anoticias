@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Propuesta — Servicio de Portadas PDF · TSJ Tabasco</title>
+<style>
+  :root{--vino:#0077ff;--gris:#555;--linea:#e3e0e8;}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#f4f2f7;font-family:Georgia,'Times New Roman',serif;
+       color:#222;display:flex;flex-direction:column;align-items:center;
+       padding:2rem 1rem}
+  .hoja{background:#fff;width:21cm;max-width:100%;padding:2.2cm 2.4cm;
+        box-shadow:0 4px 24px rgba(0,0,0,.12);border-radius:2px}
+  .encabezado{display:flex;justify-content:space-between;align-items:flex-start;
+              border-bottom:3px solid var(--vino);padding-bottom:1rem;margin-bottom:1.4rem}
+  .marca{font-family:system-ui,sans-serif;font-weight:800;font-size:1.15rem;
+         letter-spacing:.06em;color:var(--vino)}
+  .marca small{display:block;font-weight:400;font-size:.68rem;color:var(--gris);
+               letter-spacing:.02em;margin-top:.2rem}
+  .fecha{font-size:.8rem;color:var(--gris);text-align:right}
+  h1{font-size:1.45rem;line-height:1.25;margin:.4rem 0 1rem}
+  .asunto{font-family:system-ui,sans-serif;font-size:.75rem;letter-spacing:.14em;
+          text-transform:uppercase;color:var(--vino);font-weight:700}
+  .destinatario{margin:1rem 0 1.3rem;padding:.85rem 1rem;background:#faf8fc;
+                border-left:3px solid var(--vino);font-size:.95rem;line-height:1.55}
+  .destinatario b{display:block;font-size:1.02rem}
+  h2{font-family:system-ui,sans-serif;font-size:.85rem;text-transform:uppercase;
+     letter-spacing:.1em;color:var(--vino);margin:1.5rem 0 .55rem;
+     border-bottom:1px solid var(--linea);padding-bottom:.25rem}
+  p{font-size:.92rem;line-height:1.65;margin-bottom:.75rem;text-align:justify}
+  ul{margin:.3rem 0 .9rem 1.2rem;font-size:.9rem;line-height:1.6}
+  li{margin-bottom:.28rem}
+  .tabla{width:100%;border-collapse:collapse;font-size:.85rem;margin:.4rem 0 1rem;
+         font-family:system-ui,sans-serif}
+  .tabla th{background:#f1ecf6;text-align:left;padding:.45rem .6rem;
+            font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;
+            color:#648be0;border:1px solid var(--linea)}
+  .tabla td{padding:.45rem .6rem;border:1px solid var(--linea);vertical-align:top}
+  .lista-medios{columns:3;font-size:.78rem;line-height:1.7;
+                font-family:system-ui,sans-serif;color:#333;margin:.4rem 0 .6rem}
+  .costo{display:flex;align-items:baseline;gap:.6rem;margin:.6rem 0;
+         font-family:system-ui,sans-serif}
+  .costo .monto{font-size:1.6rem;font-weight:800;color:var(--vino)}
+  .costo .monto[contenteditable]{outline:1px dashed #648be0;padding:0 .3rem;
+        border-radius:4px;min-width:6ch;display:inline-block}
+  .nota{font-size:.75rem;color:var(--gris);font-style:italic}
+  .firma{margin-top:2.6rem;display:flex;gap:3rem}
+  .firma div{flex:1;border-top:1px solid #999;padding-top:.5rem;
+             font-size:.8rem;text-align:center;color:#444}
+  .acciones{position:sticky;bottom:1.2rem;margin-top:1.4rem;display:flex;
+            gap:.6rem;justify-content:center}
+  .btn{font-family:system-ui,sans-serif;font-weight:700;font-size:.95rem;
+       padding:.75rem 1.6rem;border:none;border-radius:8px;cursor:pointer}
+  .btn-pri{background:var(--vino);color:#fff;box-shadow:0 3px 12px rgba(85, 151, 238, 0.4)}
+  .btn-sec{background:#fff;color:var(--vino);border:2px solid var(--vino)}
+  @media print{
+    body{background:#fff;padding:0}
+    .hoja{box-shadow:none;width:auto;padding:0;margin:0}
+    .acciones,.monto[contenteditable]{display:none}
+    @page{size:letter;margin:2cm}
+  }
+</style>
+</head>
+<body>
+<div class="hoja">
+  <div class="encabezado">
+    <div class="marca">MONITOR DE PRENSA
+      <small>Servicio de monitoreo y compilación de medios</small></div>
+    <div class="fecha">Villahermosa, Tabasco<br>__ de ______ de 2026</div>
+  </div>
+
+  <div class="asunto">Propuesta de servicio</div>
+  <h1>Captura y entrega diaria de primeras planas<br>Nacionales y del Estado de Tabasco</h1>
+
+  <div class="destinatario">
+    <b>Lic. Paolo Orrico Julien</b>
+    Director de Comunicación Social<br>
+    Tribunal Superior de Justicia del Estado de Tabasco<br>
+    <span class="nota">Presente</span>
+  </div>
+
+  <p>Por medio de la presente ponemos a su consideración el servicio de
+  <b>captura automatizada y entrega diaria de las primeras planas</b> de los
+  principales diarios nacionales y de los medios impresos y digitales del
+  estado de Tabasco, compiladas en formato PDF y enviadas por correo
+  electrónico cada mañana antes del inicio de la jornada laboral.</p>
+
+  <h2>Descripción del servicio</h2>
+  <p>El sistema realiza diariamente la captura de la portada de cada medio
+  por la vía que arroje mayor calidad y autenticidad:</p>
+  <ul>
+    <li><b>Portada impresa</b> — imagen oficial de la primera plana
+        (kiosko.net, PDF del ejemplar completo o publicación oficial del
+        medio en sus redes).</li>
+    <li><b>Portada web</b> — captura de la página de inicio del diario
+        mediante navegador automatizado con bloqueo de publicidad, para
+        documentar el tratamiento digital de la información.</li>
+  </ul>
+
+  <h2>Cobertura</h2>
+  <table class="tabla">
+    <tr><th>Sección</th><th>Medios</th><th>Entrega</th></tr>
+    <tr><td><b>Nacional</b> (22)</td>
+        <td><div class="lista-medios" style="columns:2">
+        Reforma · El Universal · Excélsior · La Jornada · 24 Horas ·
+        La Crónica · Diario Basta · Capital Edomex · Diario de México ·
+        Eje Central · El Economista · El Día · El Financiero · El Heraldo ·
+        El Independiente · El Sol de México · La Prensa · Milenio ·
+        Ovaciones · La Razón · Reporte Índigo · Uno Más Uno</div></td>
+        <td>PDF único:<br>primeras planas nacionales</td></tr>
+    <tr><td><b>Tabasco</b> (12)</td>
+        <td><div class="lista-medios" style="columns:2">
+        Tabasco Hoy · Tabasco al Día · En Cambio · Diario Ahora Noticias ·
+        Avance · Diario de Tabasco · El Sol de Tabasco · Novedades de
+        Tabasco · Presente · CORAT/TVT · XEVT · XHVX</div></td>
+        <td>PDF único:<br>primeras planas estatales</td></tr>
+  </table>
+
+  <h2>Dinámica del servicio</h2>
+  <ul>
+    <li><b>06:30 h</b> — el sistema captura automáticamente la portada de
+        cada medio. Los medios que publican de madrugada (p. ej. Tabasco al
+        Día y CORAT en sus redes oficiales) se toman de su edición del día
+        en curso.</li>
+    <li><b>07:00 h</b> — se envía por correo electrónico al destinatario
+        designado un mensaje con los dos PDF adjuntos:
+        <i>Portadas Nacional</i> y <i>Portadas Tabasco</i>. En diarios con
+        edición impresa y web se incluyen ambas portadas.</li>
+    <li>El correo funciona además como <b>archivo histórico</b>: cada
+        mensaje queda fechado y consultable en el buzón del cliente.</li>
+    <li>Panel web interno para consultar las capturas del día y los PDF
+        previos en cualquier momento.</li>
+    <li>Alerta automática si algún medio no pudo capturarse, con su
+        reposición manual cuando el sitio del medio lo permita.</li>
+  </ul>
+
+  <h2>Inversión</h2>
+  <div class="costo">
+    <span>Mensualidad del servicio:</span>
+    <span class="monto" contenteditable="true" title="Editar monto antes de descargar">$____ MXN</span>
+  </div>
+  <p class="nota">* Más IVA. Incluye mantenimiento del sistema, ajustes por
+  cambios de dominio o estructura de los medios, y soporte técnico.
+  Sin contratación mínima de tiempo.</p>
+
+  <p style="margin-top:1.2rem">Quedamos a sus órdenes para cualquier
+  aclaración o para ajustar la cobertura y horario de entrega a las
+  necesidades del Tribunal.</p>
+
+  <div class="firma">
+    <div>Atentamente<br><br><br>
+      <b>____________________________</b><br>Área de Desarrollo</div>
+    <div>De conformidad<br><br><br>
+      <b>____________________________</b><br>Titular de la dependencia</div>
+  </div>
+</div>
+
+<div class="acciones">
+  <button class="btn btn-pri" onclick="window.print()">Descargar PDF</button>
+  <button class="btn btn-sec"
+    onclick="document.title='Propuesta_Portadas_TSJ';window.print()">
+    Guardar como PDF</button>
+</div>
+<p class="nota" style="margin-top:.8rem;font-family:system-ui,sans-serif">
+Tip: al imprimir elige "Guardar como PDF" — el archivo se descarga.</p>
+</body>
+</html>
