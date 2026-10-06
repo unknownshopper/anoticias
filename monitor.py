@@ -1169,17 +1169,36 @@ def _shot_img_mayor(url: str, png: Path):
                    if _BLOQ_ADS.search(r.request.url)
                    else r.continue_())
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(9000)
-        els, best, bw = page.locator("img"), None, 0
-        for i in range(els.count()):
-            r = els.nth(i).bounding_box() or {}
-            if r.get("width", 0) > 300 and r.get("height", 0) > 400 \
-                    and r["width"] > bw:
-                bw, best = r["width"], els.nth(i)
-        if best:
-            best.screenshot(path=str(png))
-        else:
-            page.screenshot(path=str(png))
+        best_src = None
+        # poll: el <img> de la portada tarda en cargar (lazy) — hasta 30s
+        for _ in range(30):
+            page.wait_for_timeout(1000)
+            els = page.locator("img")
+            best_src, best_w = None, 0
+            for i in range(els.count()):
+                e = els.nth(i)
+                try:
+                    nw = e.evaluate("el => el.naturalWidth")
+                    if nw and nw > best_w:
+                        best_w, best_src = nw, e.get_attribute("src")
+                except Exception:
+                    pass
+            if best_w >= 500:
+                break
+        if best_src and not best_src.startswith("data:"):
+            # sube el scale del CDN (preview chico → alta resolución)
+            for u in (re.sub(r"scale=\d+", "scale=150", best_src),
+                      best_src):
+                try:
+                    r = page.request.get(
+                        u, headers={"Referer": url.rsplit("/", 1)[0] + "/"})
+                    if r.ok and len(r.body()) > 40000:
+                        png.write_bytes(r.body())
+                        browser.close()
+                        return
+                except Exception:
+                    pass
+        page.screenshot(path=str(png))   # último recurso
         browser.close()
 
 
