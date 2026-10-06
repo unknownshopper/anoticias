@@ -1397,13 +1397,19 @@ def enviar_portadas(cfg: dict, pdfs: dict, fallos: list):
 
 def capturar_portadas_fb(cfg: dict):
     """Corrida de madrugada (12-1am): solo medios FB — su post de portada
-    salió a medianoche y al amanecer el plugin ya no lo muestra."""
+    salió a medianoche y al amanecer el plugin ya no lo muestra.
+    Se reintenta cada hora hasta las 06:30 para los que falten."""
     medios = [m for m in cfg.get("portadas", {}).get("medios", [])
               if m.get("fb")]
     if not medios:
         return
     PORTADAS_DIR.mkdir(exist_ok=True)
+    hoy_d = datetime.now().date()
     for m in medios:
+        jpg = PORTADAS_DIR / (_slug_portada(m["nombre"]) + ".jpg")
+        if jpg.exists() and \
+                datetime.fromtimestamp(jpg.stat().st_mtime).date() == hoy_d:
+            continue   # ya tiene la portada de hoy
         base = PORTADAS_DIR / _slug_portada(m["nombre"])
         try:
             data = _bajar_portada_fb(m)
@@ -1418,19 +1424,40 @@ def capturar_portadas_fb(cfg: dict):
 
 
 def toca_captura_portadas_fb(cfg: dict) -> bool:
-    """Hora_FB (00:35) → corre el barrido solo-FB una vez al día."""
+    """Ventana FB [hora_fb, hora): reintenta cada ~55 min para los medios
+    sin portada de hoy — si el post no está a las 12:35, sale más tarde."""
     port = cfg.get("portadas", {})
-    hh, mm = map(int, port.get("hora_fb", "00:35").split(":"))
-    est = cargar_json(ESTADO_PORTADAS, {})
+    fb_medios = [m for m in port.get("medios", []) if m.get("fb")]
+    if not fb_medios:
+        return False
+    try:
+        hh1, mm1 = map(int, port.get("hora_fb", "00:35").split(":"))
+        hh2, mm2 = map(int, port.get("hora", "06:30").split(":"))
+    except Exception:
+        hh1, mm1, hh2, mm2 = 0, 35, 6, 30
     ahora = datetime.now()
-    hoy = ahora.strftime("%Y-%m-%d")
-    return est.get("fb_fecha") != hoy and \
-        (ahora.hour, ahora.minute) >= (hh, mm)
+    if not (hh1 * 60 + mm1 <= ahora.hour * 60 + ahora.minute
+            < hh2 * 60 + mm2):
+        return False
+    est = cargar_json(ESTADO_PORTADAS, {})
+    try:
+        ult = datetime.fromisoformat(est.get("fb_last", "2000-01-01"))
+    except Exception:
+        ult = datetime(2000, 1, 1)
+    if (ahora - ult).total_seconds() < 55 * 60:
+        return False
+    hoy_d = ahora.date()
+    for m in fb_medios:
+        jpg = PORTADAS_DIR / (_slug_portada(m["nombre"]) + ".jpg")
+        if not jpg.exists() or \
+                datetime.fromtimestamp(jpg.stat().st_mtime).date() != hoy_d:
+            return True    # falta alguno → reintenta
+    return False
 
 
 def marcar_portadas_fb():
     est = cargar_json(ESTADO_PORTADAS, {})
-    est["fb_fecha"] = datetime.now().strftime("%Y-%m-%d")
+    est["fb_last"] = datetime.now().isoformat()
     ESTADO_PORTADAS.write_text(json.dumps(est))
 
 
