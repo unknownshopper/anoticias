@@ -1103,7 +1103,7 @@ def _shot_playwright(url: str, png: Path):
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(
-            viewport={"width": 1280, "height": 1800},
+            viewport={"width": 1280, "height": 2600},
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
         # el ad-block viaja en la capa de red: los banners ni cargan
@@ -1133,9 +1133,10 @@ def _shot_playwright(url: str, png: Path):
             }
             document.body.style.overflow = 'auto';
         }""")
-        page.mouse.wheel(0, 500)          # dispara lazy-load
-        page.wait_for_timeout(2500)
-        page.mouse.wheel(0, -500)         # de regreso arriba
+        for _ in range(3):                # scroll profundo → lazy-load
+            page.mouse.wheel(0, 1600)
+            page.wait_for_timeout(1200)
+        page.mouse.wheel(0, -99999)       # de regreso arriba del todo
         page.wait_for_timeout(1000)
         # muros anti-bot: no guardar el "Algo ha salido mal" como portada
         titulo = (page.title() or "").lower()
