@@ -1154,6 +1154,35 @@ def _shot_playwright(url: str, png: Path):
         browser.close()
 
 
+def _shot_img_mayor(url: str, png: Path):
+    """Visores tipo PressReader: la portada es el <img> más grande del
+    canvas — screenshot del elemento solo, sin la UI del lector."""
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(
+            viewport={"width": 1280, "height": 1400},
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+        page.route("**/*",
+                   lambda r: r.abort()
+                   if _BLOQ_ADS.search(r.request.url)
+                   else r.continue_())
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(9000)
+        els, best, bw = page.locator("img"), None, 0
+        for i in range(els.count()):
+            r = els.nth(i).bounding_box() or {}
+            if r.get("width", 0) > 300 and r.get("height", 0) > 400 \
+                    and r["width"] > bw:
+                bw, best = r["width"], els.nth(i)
+        if best:
+            best.screenshot(path=str(png))
+        else:
+            page.screenshot(path=str(png))
+        browser.close()
+
+
 def capturar_portadas(cfg: dict):
     """Screenshot chromium de la portada de cada diario → PNG → PDF por
     sección → correo con ambos adjuntos. El historial vive en el buzón;
@@ -1203,14 +1232,19 @@ def capturar_portadas(cfg: dict):
                         subprocess.run(
                             ["chromium", "--headless", "--no-sandbox",
                              "--disable-gpu", "--hide-scrollbars",
-                             "--window-size=1280,1800",
-                             f"--screenshot={png}", m["url"]],
+                             "--window-size=1280,2600",
+                             f"--screenshot={png}", url_tiro],
                             timeout=45, capture_output=True)
             # doble portada: con impresa (jpg/pdf) también portada web
+            # (o URL alterna tipo PressReader: url_web2 + img_portada)
             if tiene_impresa:
                 web = base.with_name(base.name + "-web.png")
                 try:
-                    _shot_playwright(m["url"], web)
+                    url_web = m.get("url_web2") or m["url"]
+                    if m.get("img_portada"):
+                        _shot_img_mayor(url_web, web)
+                    else:
+                        _shot_playwright(url_web, web)
                     if not web.exists() or web.stat().st_size < 40000:
                         web.unlink(missing_ok=True)
                 except Exception:
