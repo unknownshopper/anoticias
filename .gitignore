@@ -17,3 +17,7 @@ monitor.log
 __pycache__/
 *.pyc
 noticias.jsonl.bak*
+fb_session.json
+portadas/
+portadas_estado.json
+*.bak*

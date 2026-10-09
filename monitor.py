@@ -325,10 +325,24 @@ def url_https(url: str) -> str:
 
 # ---- Rate limit por IP (login fuerza bruta + flood de requests) ----
 _RL_HITS: dict = {}
+_RL_SKIP_IPS: set = set()
+_RL_SKIP_MT: float = 0
 
 
 def ratelimit_ok(ip: str, limite: int = 120, ventana: int = 60) -> bool:
-    """True si la IP sigue bajo el límite en la ventana (segundos)."""
+    """True si la IP sigue bajo el límite en la ventana (segundos).
+    cfg.ratelimit_skip = ["1.2.3.4"] exenta IPs fijas (la del admin)."""
+    global _RL_SKIP_IPS, _RL_SKIP_MT
+    try:
+        mt = CONFIG.stat().st_mtime
+        if mt != _RL_SKIP_MT:
+            _RL_SKIP_MT = mt
+            _RL_SKIP_IPS = set(json.loads(CONFIG.read_text())
+                               .get("ratelimit_skip") or [])
+    except Exception:
+        pass
+    if ip in _RL_SKIP_IPS:
+        return True
     ahora = time.time()
     hits = [t for t in _RL_HITS.get(ip, []) if ahora - t < ventana]
     if len(hits) >= limite:
@@ -874,23 +888,38 @@ def _slug_portada(nombre: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", normalizar(nombre)).strip("-")
 
 
-def _portada_img(slug: str) -> Path:
+def _dir_dia(fecha=None) -> Path:
+    """portadas/oct/06/ — árbol mes/día: las capturas del día se
+    guardan ahí para cotejar contra días anteriores (y como fallback de
+    ayer)."""
+    f = fecha or datetime.now()
+    meses = ("ene", "feb", "mar", "abr", "may", "jun",
+             "jul", "ago", "sep", "oct", "nov", "dic")
+    return PORTADAS_DIR / meses[f.month - 1] / f"{f.day:02d}"
+
+
+def _portada_img(slug: str, dia: Path = None) -> Path:
     """La captura del diario puede ser .png (screenshot) o .jpg (kiosko/FB)."""
+    d = dia or _dir_dia()
     for ext in (".png", ".jpg", ".jpeg"):
-        p = PORTADAS_DIR / f"{slug}{ext}"
+        p = d / f"{slug}{ext}"
         if p.exists():
             return p
-    return PORTADAS_DIR / f"{slug}.png"
+    return d / f"{slug}.png"
 
 
 def _bajar_portada_kiosko(m: dict):
     """img.kiosko.net/YYYY/MM/DD/mx/{slug}.750.jpg — la portada impresa real
-    (resuelve a Reforma/Milenio/etc. que bloquean al bot)."""
-    hoy = datetime.now()
-    for d in (0, 1):  # hoy o ayer — algunos cierran de noche
-        f = hoy - timedelta(days=d)
-        url = (f"https://img.kiosko.net/{f:%Y/%m/%d}/mx/"
-               f"{m['kiosko']}.750.jpg")
+    (resuelve a Reforma/Milenio/etc. que bloquean al bot). Solo HOY: si
+    aún no publican, devuelve None y el medio queda pendiente — traer la
+    de ayer la guardaría como si fuera de hoy y bloquearía reintentos."""
+    f = datetime.now()
+    slug = str(m["kiosko"]).rstrip("/").rsplit("/", 1)[-1] \
+                                .removesuffix(".html")
+    # .jpg = imagen completa (~960px), .750.jpg = preview — probar ambos
+    urls = [f"https://img.kiosko.net/{f:%Y/%m/%d}/mx/{slug}{s}"
+            for s in (".jpg", ".750.jpg")]
+    for url in urls:
         try:
             r = requests.get(url, timeout=15,
                              headers={"User-Agent": "Mozilla/5.0"})
@@ -904,19 +933,73 @@ def _bajar_portada_kiosko(m: dict):
 _OG_IMG = 'property="og:image"[^>]*content="([^"]+)"'
 
 
-def _portada_issuu(handle: str):
-    """Issuu: el atom del perfil trae los docs del día con la miniatura
-    page_1_thumb_large.jpg → page_1.jpg es la portada completa."""
+def _portada_flip(url: str):
+    """Flipbook del impreso. Excélsior: la página del lector lista las
+    páginas en /large/ — _001A.jpg es la primera plana en alta res.
+    Presente: diariopresente.mx/edicionimpresa enlaza el fliphtml5 del
+    día (…/Presente-DD-MM-AAAA/) — files/large/<hash>.webp = portada."""
+    h = {"User-Agent": "Mozilla/5.0"}
     try:
-        r = requests.get(f"https://issuu.com/{handle}/atom",
-                         timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-        m = re.search(
-            r"https://image\.isu\.pub/[^\"'<> ]+/jpg/page_1_thumb_large\.jpg",
-            r.text)
-        if not m:
+        r = requests.get(url, timeout=15, headers=h)
+        pags = sorted(set(re.findall(
+            r'https?://[^"\' ]+/large/[^"\' ]+\.jpg', r.text)))
+        if pags:
+            ir = requests.get(pags[0], timeout=30, headers=h)
+            if ir.status_code == 200 and len(ir.content) > 100000:
+                return ir.content
             return None
-        ir = requests.get(m.group(0).replace("_thumb_large", ""),
-                          timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        # fliphtml5: link del libro de HOY en la página (fecha en slug)
+        hoy = datetime.now()
+        for link in re.findall(
+                r'https?://online\.fliphtml5\.com/[^"\' ]+', r.text):
+            if f"{hoy.day:02d}-{hoy.month:02d}-{hoy.year}" not in link:
+                continue
+            bk = requests.get(link, timeout=15, headers=h)
+            p1 = re.search(r'files/large/[^"\' ]+\.webp', bk.text)
+            if not p1:
+                continue
+            ir = requests.get(link.rstrip("/") + "/" + p1.group(0),
+                              timeout=30, headers=h)
+            if ir.status_code == 200 and len(ir.content) > 30000:
+                # webp → jpeg para que el archivo .jpg sea válido
+                im = Image.open(io.BytesIO(ir.content)).convert("RGB")
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=90)
+                return buf.getvalue()
+    except Exception:
+        pass
+    return None
+
+
+def _portada_issuu(handle: str):
+    """Issuu: handle de perfil → atom trae el doc del día con la miniatura
+    page_1_thumb_large.jpg. URL de doc directa (/u/docs/slug) → og:image
+    del doc (Contraréplica: slug fechado predecible, llega antes que el
+    índice del medio)."""
+    UA = {"User-Agent": "Mozilla/5.0"}
+    try:
+        if "/docs/" in handle:
+            url = handle if handle.startswith("http") else "https://" + handle
+            r = requests.get(url, timeout=15, headers=UA)
+            if r.status_code != 200:
+                return None
+            m = re.search(
+                r"https://image\.isu\.pub/[^\"'<> ]+/jpg/page_1(?:_thumb_large)?\.jpg",
+                r.text) or re.search(r'og:image[^>]+content="([^"]+)"', r.text)
+            if not m:
+                return None
+            url_img = m.group(1) if m.lastindex else m.group(0)
+        else:
+            r = requests.get(f"https://issuu.com/{handle}/atom",
+                             timeout=12, headers=UA)
+            m = re.search(
+                r"https://image\.isu\.pub/[^\"'<> ]+/jpg/page_1_thumb_large\.jpg",
+                r.text)
+            if not m:
+                return None
+            url_img = m.group(0)
+        ir = requests.get(url_img.replace("_thumb_large", ""),
+                          timeout=20, headers=UA)
         if ir.status_code == 200 and len(ir.content) > 100000:
             return ir.content
     except Exception:
@@ -924,11 +1007,113 @@ def _portada_issuu(handle: str):
     return None
 
 
+FB_SESSION = BASE / "fb_session.json"
+
+
+def _fb_sesion_caido(pg) -> bool:
+    """True si FB redirigió al login/checkpoint — la sesión caducó o
+    la cuenta cayó en revisión."""
+    try:
+        u = pg.url
+        return ("login" in u or "checkpoint" in u or
+                "two_factor" in u)
+    except Exception:
+        return False
+
+
+def _aviso_fb_sesion():
+    """Un aviso por día: flag en portadas_estado.json (visible en
+    /horarios), correo si el SMTP está habilitado, y log."""
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    est = cargar_json(ESTADO_PORTADAS, {})
+    if est.get("fb_sesion", {}).get("alertado") == hoy:
+        return
+    print("  [!] SESIÓN FB CAÍDA — checkpoint/login detectado; "
+          "las portadas FB saldrán en modo anónimo (600px)")
+    est["fb_sesion"] = {"estado": "caida", "alertado": hoy}
+    _guardar_portadas(est)
+    try:
+        cfg = cargar_json(CONFIG, {})
+        enviar_correo(cfg, {
+            "reglas": "FB sesión caduca",
+            "fuente": "portadas",
+            "fecha": hoy,
+            "titulo": "La sesión de Facebook caducó o cayó en checkpoint",
+            "link": "",
+            "resumen_ia": "Corre `.venv/bin/python fb_login.py` para "
+                          "renovar fb_session.json. Mientras, las "
+                          "capturas FB salen anónimas (~600px)."})
+    except Exception:
+        pass
+
+
+def _imagenes_fb_visores(pg, post_url: str) -> list:
+    """Con sesión: el post enlaza cada foto a su visor /photo/?fbid=&set=,
+    que sirve la imagen ~1050px (el feed anónimo topea en 600)."""
+    out = []
+    try:
+        pg.goto(post_url, wait_until="domcontentloaded", timeout=45000)
+        pg.wait_for_timeout(6000)
+        if _fb_sesion_caido(pg):
+            _aviso_fb_sesion()
+            return []
+        hrefs = pg.eval_on_selector_all(
+            'a[href*="/photo"]', "els => els.map(e => e.href)")
+        vistos = set()
+        for href in hrefs:
+            fid = re.search(r'fbid=(\d+)', href)
+            # set=a.* = avatar/portada de perfil, no del post
+            if not fid or fid.group(1) in vistos or "&set=a." in href:
+                continue
+            vistos.add(fid.group(1))
+            try:
+                pg.goto(href, wait_until="domcontentloaded",
+                        timeout=45000)
+                pg.wait_for_timeout(4500)
+                src = pg.evaluate("""() => {
+                    let best = null, area = 0;
+                    for (const i of document.querySelectorAll('img')) {
+                        const s = i.src || '';
+                        if (!/scontent/.test(s)) continue;
+                        const a = i.naturalWidth * i.naturalHeight;
+                        if (a > area) { area = a; best = s; }
+                    }
+                    return best;
+                }""")
+                if not src:
+                    continue
+                ir = requests.get(src, timeout=20,
+                                  headers={"User-Agent": "Mozilla/5.0"})
+                if ir.status_code == 200 and len(ir.content) > 40000:
+                    out.append(ir.content)
+            except Exception:
+                continue
+            if len(out) >= 4:
+                break
+    except Exception:
+        pass
+    return out
+
+
 def _imagenes_fb_post(url: str) -> list:
     """Post/share de FB → TODAS las fotos adjuntas (TAD mete las 2
-    portadas en el mismo post). Dedup por id de foto; solo imágenes
-    grandes — sin avatares ni thumbnails."""
+    portadas en el mismo post). Dedup por id de foto. Con sesión
+    (fb_session.json) abre el visor de cada foto en alta res; sin
+    sesión cae a la versión del feed (~600px)."""
     try:
+        if FB_SESSION.exists():
+            try:
+                from playwright.sync_api import sync_playwright
+                with sync_playwright() as p:
+                    br = _launch(p)
+                    pg = br.new_context(
+                        storage_state=str(FB_SESSION)).new_page()
+                    imgs = _imagenes_fb_visores(pg, url)
+                    br.close()
+                if imgs:
+                    return imgs
+            except Exception:
+                pass
         r = requests.get(url, timeout=15, headers={
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 "
                           "like Mac OS X) AppleWebKit/605.1.15"})
@@ -976,10 +1161,9 @@ def _bajar_portada_fb(m: dict) -> list:
     fb = m["fb"]
     if "/share/" in fb or "/posts/" in fb or "/photo" in fb:
         return _imagenes_fb_post(fb)
-    # página → slug
-    slug = re.search(r"facebook\.com/([^/?&]+)", fb)
-    if not slug:
-        return []
+    # página → plugin la carga por URL completa url-encoded (sirve tanto
+    # para facebook.com/slug como para profile.php?id=… del XHVX)
+    pagina_fb = quote(fb.split("#")[0], safe="")
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -989,13 +1173,29 @@ def _bajar_portada_fb(m: dict) -> list:
         "septiembre octubre noviembre diciembre".split()
     fecha_txt = f"{hoy.day} de {meses[hoy.month - 1]}"
     plugin = ("https://www.facebook.com/plugins/page.php?href="
-              f"https%3A%2F%2Fwww.facebook.com%2F{slug.group(1)}"
+              f"{pagina_fb}"
               "&tabs=timeline&width=500&height=900&hide_cover=true")
     candidata = ""
     try:
         with sync_playwright() as p:
-            pg = p.chromium.launch().new_page()
-            pg.goto(plugin, wait_until="domcontentloaded", timeout=30000)
+            br = _launch(p)
+            if FB_SESSION.exists():
+                # sesión guardada → timeline real de la página (todos
+                # los posts, no solo el último del plugin anónimo)
+                pg = br.new_context(
+                    storage_state=str(FB_SESSION)).new_page()
+                pg.goto(fb.split("#")[0], wait_until="domcontentloaded",
+                        timeout=45000)
+                if _fb_sesion_caido(pg):
+                    _aviso_fb_sesion()
+                    # cae al plugin anónimo
+                    pg = br.new_page()
+                    pg.goto(plugin, wait_until="domcontentloaded",
+                            timeout=30000)
+            else:
+                pg = br.new_page()
+                pg.goto(plugin, wait_until="domcontentloaded",
+                        timeout=30000)
             pg.wait_for_timeout(6000)
             prev = -1
             for _ in range(25):          # scroll interno del timeline
@@ -1010,33 +1210,348 @@ def _bajar_portada_fb(m: dict) -> list:
                 prev = n
             posts = pg.evaluate("""() => {
                 const NL = String.fromCharCode(10), seen = new Set(), out = [];
-                for (const a of document.querySelectorAll('a[href*="/posts/"]')) {
+                for (const a of document.querySelectorAll(
+                        'a[href*="/posts/"], a[href*="/photos/"], '
+                    + 'a[href*="/photo"], a[href*="story_fbid"]')) {
                     const k = a.href.split('?')[0];
                     if (seen.has(k)) continue; seen.add(k);
-                    let n = a;
-                    for (let i = 0; i < 8 && n; i++) {
+                    // el texto del post queda en un ancestro ancho;
+                    // el primer contenedor con >40 chars se cortaba
+                    // antes del body — subir hasta >250 (o 10 niveles)
+                    let n = a, txt = '';
+                    for (let i = 0; i < 10 && n; i++) {
                         n = n.parentElement;
-                        if (n && n.innerText && n.innerText.length > 40) break;
+                        if (!n) break;
+                        const t = n.innerText || '';
+                        if (t.length > txt.length) txt = t;
+                        if (t.length > 250) break;
                     }
                     out.push({href: a.href,
-                              txt: (n ? n.innerText : '').split(NL).join(' ')
-                                     .slice(0, 200)});
+                              txt: txt.split(NL).join(' ').slice(0, 300)});
                 }
                 return out;
             }""")
+        por_texto = False
         for post in posts:
             txt = normalizar(post["txt"])
-            reciente = "hace" in txt and "d\u00eda" not in txt  # hoy/horas
+            # el plugin renderiza en EN ó ES según locale del CDN —
+            # "3 hours ago"/"3h" vale igual que "hace 3 horas"
+            reciente = bool(re.search(
+                r"hace|\bago\b|\d+\s*(h|hr|hrs|hora|horas|min|minute)s?\b",
+                txt)) and not re.search(r"d[ií]a|day|yesterday|ayer", txt)
             fechas = (normalizar(fecha_txt),              # 5 de octubre
                       normalizar(fecha_txt.replace(
                           str(hoy.day), f"{hoy.day:02d}")))  # 05 de octubre
-            if re.search(r"portada|primera plana|edici[oó]n", txt) and \
-                    (reciente or any(f in txt for f in fechas)):
+            if re.search(r"portada|primera plana|edici[oó]n|bolet[ií]n",
+                         txt) and \
+                    (reciente or any(f in txt for f in fechas)
+                     or re.search(r'\bhoy\b', txt)):
                 candidata = post["href"]
+                por_texto = True
                 break
+            # fb_primero: la página sube la portada como PRIMER post con
+            # foto de la madrugada, sin texto identificable (XEVT)
+            if m.get("fb_primero") and not candidata and reciente:
+                candidata = post["href"]
     except Exception:
         return []
-    return _imagenes_fb_post(candidata) if candidata else []
+    imgs = _imagenes_fb_post(candidata) if candidata else []
+    if imgs and m.get("fb_primero") and not por_texto:
+        # fallback sin texto identificable: exigir formato angosto de
+        # primera plana — flyers verticales (donación ISSET 0.8) no son
+        # portada. Si el post dijo 'portada/boletín/edición + hoy',
+        # confiamos en el texto aunque la imagen sea 0.8
+        imgs = [b for b in imgs if _es_portada(b)]
+    return imgs
+
+
+_MESES_EN = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_MESES_PORTADA = ("enero", "febrero", "marzo", "abril", "mayo",
+                  "junio", "julio", "agosto", "septiembre", "octubre",
+                  "noviembre", "diciembre")
+_DIAS_PORTADA = ("lunes", "martes", "miercoles", "jueves",
+                 "viernes", "sabado", "domingo")
+
+
+def _sin_acentos(s: str) -> str:
+    return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode()
+
+
+def _tokens_fecha(hoy: datetime = None) -> set:
+    """Todas las formas en que los medios escriben la fecha de hoy en
+    URLs/filenames: 2026-10-07, 07-10-26, 07-octubre-2026,
+    martes-06-de-octubre-de-2026, 7-de-octubre-de-2026, …"""
+    h = hoy or datetime.now()
+    mes = _MESES_PORTADA[h.month - 1]
+    return {
+        f"{h.year}-{h.month:02d}-{h.day:02d}",            # 2026-10-07
+        f"{h.day:02d}-{h.month:02d}-{h.year}",            # 07-10-2026
+        f"{h.day:02d}-{h.month:02d}-{h.year % 100:02d}",  # 07-10-26
+        f"{h.day:02d}-{mes}-{h.year}",                    # 07-octubre-2026
+        f"{h.day:02d}-{mes[:3]}-{h.year}",                # 07-oct-2026
+        f"{h.day}-de-{mes}-de-{h.year}",                  # 7-de-octubre-de-2026
+        f"{h.day:02d}-de-{mes}-de-{h.year}",              # 07-de-octubre-de-2026
+        f"{mes}-{h.day}-de-{h.year}",                    # octubre-7-de-2026 (issuu)
+        f"{mes[:3]}-{h.day}-de-{h.year}",                 # oct-7-de-2026
+        f"{_DIAS_PORTADA[h.weekday()]}-{h.day:02d}-de-{mes}-de-{h.year}",
+        f"{_DIAS_PORTADA[h.weekday()]}-{h.day:02d}-de-{mes[:5]}",  # martes-06-de-octub (slug issuu trunca)
+        f"{h.day:02d}-de-{mes[:5]}",               # 06-de-octub
+        f"{h.year}/{h.month:02d}/{h.day:02d}",            # 2026/10/07
+        f"{h.year}/{h.month:02d}/{h.day}",                 # 2026/10/7 (Heraldo)
+        f"{h.day:02d}/{mes}/{h.year}",                    # 07/octubre/2026
+        f"{h.day:02d}/{mes[:3]}/{h.year}",                 # 07/oct/2026
+        f"{h.day} {_MESES_EN[h.month - 1]} {h.year}",     # 8 Oct 2026 (pressreader)
+        f"{h.day:02d} {_MESES_EN[h.month - 1]} {h.year}", # 08 Oct 2026
+    }
+
+
+def _con_fecha(txt: str, toks: set) -> bool:
+    # '_' y espacios cuentan como separador (cr_cdmx_octubre_7_de_2026)
+    t = re.sub(r'[_\s]+', '-', _sin_acentos(txt).lower())
+    # (?!\d): '2026/10/8' no debe matchear dentro de
+    # 'uploads/2026/10/839934717_…' (foto de nota, no portada)
+    return any(re.search(re.escape(k) + r'(?!\d)', t) for k in toks)
+
+
+def _imagen_portada_grande(imgs: list, toks: set,
+                           solo_fecha: bool = False) -> bytes:
+    """De una lista de URLs de imagen toma la de portada, pide la
+    original sin -WxH y la devuelve como bytes si es válida. Con
+    solo_fecha=True exige la fecha en el nombre (índices que reciclan
+    nombres PORTADA-* con fecha de AYER, como tabascohoy/basta); en un
+    post ya fechado basta que diga 'portada'."""
+    buenas = [u for u in imgs
+              if not re.search(r'logo|icon|banner|avatar|favicon|qr', u, re.I)]
+    por = [u for u in buenas if _con_fecha(u, toks)]
+    if not solo_fecha and not por:
+        por = [u for u in buenas if 'portada' in _sin_acentos(u).lower()]
+    for cand in (por or ([] if solo_fecha else buenas)):
+        for u in (re.sub(r'-\d+x\d+(?=\.(?:jpe?g|png|webp))', '', cand),
+                  cand):
+            try:
+                r = requests.get(u, timeout=20,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+            except Exception:
+                continue
+            if len(r.content) > 30000:
+                try:
+                    Image.open(io.BytesIO(r.content)).verify()
+                except Exception:
+                    continue
+                return r.content
+    return None
+
+
+def _portada_fecha(m: dict) -> list:
+    """'edicion': índice cuyos posts son la edición del día, con URL o
+    imagen fechada — Tabasco HOY (/edicion-digital/AAAA-MM-DD/), Diario
+    Basta (igual), Diario de México (/edicion-impresa-DD-MM-AA), Diario
+    de Tabasco (PORTADA-DD-MES-AAAA.jpg directo en la home)."""
+    try:
+        h = datetime.now()
+        toks = _tokens_fecha(h)
+        base = m["edicion"].rstrip("/")
+        UA = {"User-Agent": "Mozilla/5.0"}
+        cands = [f"{base}/{h.year}-{h.month:02d}-{h.day:02d}/"]
+        if "{" in m["edicion"]:
+            # plantilla con fecha: issuu.com/lajornadaonline/
+            # docs/diario{ddmmyyyy} → diario08102026
+            cands.insert(0, m["edicion"].format(
+                ddmmyyyy=f"{h.day:02d}{h.month:02d}{h.year}",
+                yyyymmdd=f"{h.year}{h.month:02d}{h.day:02d}",
+                ddmmaa=f"{h.day:02d}{h.month:02d}{h.year % 100:02d}"))
+        try:
+            url_idx = cands[0] if "{" in m["edicion"] else m["edicion"]
+            idx = requests.get(url_idx, timeout=15, headers=UA)
+        except Exception:
+            idx = None
+        if idx is not None and idx.status_code == 200:
+            # 1) imagen fechada ya en la página (caso Diario de Tabasco) —
+            #    aquí exigimos la fecha: el índice puede reciclar el
+            #    nombre PORTADA-… de ayer antes de publicar la nueva
+            imgs = re.findall(r'https?://[^"\' ]+\.(?:jpe?g|png|webp)',
+                              idx.text)
+            if b := _imagen_portada_grande(imgs, toks, solo_fecha=True):
+                return [b]
+            # 1b) tags <img> cuya alt/title lleven la fecha — Diario
+            #     Avance: title="07/OCTUBRE/2026" + srcset hasta 2048px
+            for tag in re.findall(r'<img[^>]+>', idx.text):
+                if not _con_fecha(tag, toks):
+                    continue
+                cands_img = re.findall(
+                    r'(?:src|srcset)="([^"]+)"', tag)
+                srcs = []
+                for c in cands_img:
+                    srcs += [s.strip().split(' ')[0]
+                             for s in c.split(',') if s.strip()]
+                # la variante más ancha del srcset primero
+                srcs = list(dict.fromkeys(srcs))
+                if b := _imagen_portada_grande(
+                        [re.sub(r'\?[^ ]*$', '', s) for s in srcs],
+                        toks, solo_fecha=False):
+                    return [b]
+            # links fechados del índice (DMx: edicion-impresa-DD-MM-AA;
+            # los embeds issuu van en src= de iframe — Contraréplica)
+            for u in re.findall(r'(?:href|src)="([^"]+)"',
+                                idx.text):
+                # solo links que huelan a edición — los posts sueltos
+                # /2026/10/08/nota llevan foto de nota, no portada
+                if _con_fecha(u, toks) and re.search(
+                        r'edicion|impresa|portada|issuu|flip|hemero'
+                        r'|epaper|tapas|diario-digital|pdf', u, re.I):
+                    cands.append(u if u.startswith("http")
+                                 else urljoin(m["edicion"], u))
+            # visores primero: el og:image de un ARTÍCULO fechado es
+            # la foto de la nota, no la portada (Heraldo mezcla ambos)
+            cands.sort(key=lambda u: 0 if re.search(
+                r'issuu|flipsnack|fliphtml5|anyflip|pubhtml5', u)
+                else 1)
+        # 2) posts del día — el path ISO directo corre aunque el índice
+        #    esté caído (Tabasco HOY, Basta: /edicion-digital/AAAA-MM-DD/)
+        for pag in cands[:5]:
+            try:
+                # embed issuu → página pública del doc, que sí trae el
+                # thumb en HTML (e.issuu.com/embed.html?d=D&u=U)
+                m_emb = re.search(
+                    r'issuu\.com/embed\.html\?d=([^&]+)&u=([^&\'" ]+)', pag)
+                if m_emb:
+                    pag = (f"https://issuu.com/{m_emb.group(2)}"
+                           f"/docs/{m_emb.group(1)}")
+                r = requests.get(pag, timeout=15, headers=UA)
+            except Exception:
+                continue
+            if r.status_code != 200:
+                continue
+            # flipsnack publica su cover en og:image sin extensión —
+            # en una página fechada el og:image ES la portada
+            og = re.search(_OG_IMG, r.text)
+            if og and re.search(
+                    r'issuu|flipsnack|fliphtml5|anyflip|pubhtml5', pag):
+                ir = requests.get(html.unescape(og.group(1)),
+                                  timeout=20, headers=UA)
+                if ir.status_code == 200 and len(ir.content) > 60000:
+                    try:
+                        Image.open(io.BytesIO(ir.content)).verify()
+                        return [ir.content]
+                    except Exception:
+                        pass
+            issuu_imgs = re.findall(
+                r'https://image\.isu\.pub/[^"\' ]+?\.jpg', r.text)
+            if issuu_imgs:
+                full = issuu_imgs[0].replace('_thumb_large', '')
+                ir = requests.get(full, timeout=20, headers=UA)
+                if ir.status_code == 200 and len(ir.content) > 60000:
+                    return [ir.content]
+            imgs = re.findall(r'https?://[^"\' ]+\.(?:jpe?g|png|webp)',
+                              r.text)
+            if b := _imagen_portada_grande(imgs, toks):
+                return [b]
+    except Exception:
+        pass
+    return []
+
+
+def _portada_calameo(m: dict) -> list:
+    """'calameo': página del medio que enlaza su doc Calaméo del día
+    (Ahora Noticias → calameo.com/read/<bkcode>). El JSONP de
+    d.calameo.com trae nombre fechado ('Jueves 08 De Octubre De 2026')
+    y url.poster = i.calameoassets.com/<key>/large.jpg — www y p.
+    calameoassets.com dan 403 desde aquí, d. e i. no."""
+    try:
+        UA = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(m["calameo"], timeout=20, headers=UA)
+        bk = re.search(r'calameo\.com/read/([a-z0-9]+)', r.text, re.I) \
+            or re.search(r'bkcode=([a-z0-9]+)', r.text, re.I)
+        if not bk:
+            return []
+        j = requests.get(
+            f"https://d.calameo.com/3.0.0/book.php?callback=eval"
+            f"&bkcode={bk.group(1)}", timeout=20, headers=UA)
+        mjs = re.search(r'eval\((.*)', j.text)
+        if not mjs:
+            return []
+        d = json.loads(mjs.group(1).rstrip(');'))
+        c = d.get("content", {})
+        # frescura: el nombre del doc lleva la fecha de la edición
+        if not _con_fecha(str(c.get("name", "")), _tokens_fecha()):
+            return []
+        poster = c.get("url", {}).get("poster") or \
+            c.get("url", {}).get("thumbnail") or ""
+        if poster.startswith("//"):
+            poster = "https:" + poster
+        if not poster:
+            return []
+        ir = requests.get(poster, timeout=20, headers=UA)
+        if ir.status_code == 200 and len(ir.content) > 30000:
+            return [ir.content]
+    except Exception:
+        pass
+    return []
+
+
+def _portada_json(m: dict) -> list:
+    """'json': endpoint JSON con la portada del día (Ovaciones publica
+    jsonportadaedicionimpresa.json con portada.imagen_original)."""
+    try:
+        UA = {"User-Agent": "Mozilla/5.0"}
+        data = requests.get(m["json"], timeout=15, headers=UA).json()
+        por = data.get("portada") or data
+        img = por.get("imagen_original") or por.get("imagen_thumb")
+        if not img:
+            return []
+        # frescura: si la URL de la imagen trae fecha propia
+        # (…/edicionimpresa/AAAA/MM/DD/uuid.jpg) debe ser HOY — un
+        # updated_at fresco con imagen de ayer = no publicaron
+        h = datetime.now()
+        if re.search(r"/\d{4}/\d{2}/\d{2}/", img):
+            if f"/{h:%Y/%m/%d}/" not in img:
+                return []
+        else:
+            toks = _tokens_fecha()
+            pista = " ".join(str(por.get(k) or data.get(k) or "")
+                             for k in ("fecha", "date", "updated_at"))
+            if not _con_fecha(pista + " " + img, toks):
+                return []
+        r = requests.get(img, timeout=20, headers=UA)
+        if len(r.content) > 30000:
+            return [r.content]
+    except Exception:
+        pass
+    return []
+
+
+def _portada_adobe(m: dict, png: Path) -> bool:
+    """Unomásuno: la home enlaza un PDF compartido en acrobat.adobe.com
+    (/id/urn:aaid:...). El visor WASM pide la página 0 como jpeg a
+    cdn-sharing.adobecc.com — interceptamos esa respuesta directo."""
+    try:
+        r = requests.get(m["url"], timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        mm = re.search(
+            r'https://acrobat\.adobe\.com/id/urn:[^"\'\s<>?]+', r.text)
+        if not mm:
+            return False
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            br = _launch(p)
+            pg = br.new_page()
+            try:
+                with pg.expect_response(
+                        lambda r:
+                        "cdn-sharing.adobecc.com/rendition/" in r.url
+                        and "page=0" in r.url, timeout=45000) as ri:
+                    pg.goto(mm.group(0), wait_until="commit",
+                            timeout=30000)
+                img = ri.value.body()
+            finally:
+                br.close()
+        if len(img) < 30000:
+            return False
+        Image.open(io.BytesIO(img)).convert("RGB").save(png, "PNG")
+        return _img_ok(png)
+    except Exception:
+        return False
 
 
 def _portada_pdf(m: dict, png: Path) -> tuple:
@@ -1081,7 +1596,9 @@ def _portada_pdf(m: dict, png: Path) -> tuple:
                         if dom in u:
                             url_pdf = u
                             break
-        if not url_pdf:
+        if not url_pdf and not m.get("pdf_estricto"):
+            # pdf_estricto (El Independiente): cualquier PDF del dominio
+            # puede ser MEDIAKIT/publicidad — solo vale el post fechado
             for u in cands:
                 if dom in u:
                     url_pdf = u
@@ -1115,8 +1632,18 @@ def _portada_pdf(m: dict, png: Path) -> tuple:
                     if url_pdf:
                         break
         if not url_pdf:
+            # PDF detrás del visor de Adobe (Unomásuno comparte su
+            # ejemplar vía acrobat.adobe.com, no hay .pdf directo)
+            if _portada_adobe(m, png):
+                return True, fallback
             return False, fallback
-        tmp = PORTADAS_DIR / "_tmp.pdf"
+        # URL fechada /AAAA/MM/DD/ pero de AYER = edición vieja (24 Horas
+        # sube el PDF ~7am): mejor reintentar en la siguiente corrida
+        d = re.search(r"/20\d\d/\d\d/\d\d/", url_pdf)
+        if d and d.group(0)[1:-1] != \
+                datetime.now().strftime("%Y/%m/%d"):
+            return False, fallback
+        tmp = png.parent / "_tmp.pdf"
         rp = requests.get(url_pdf, timeout=40,
                           headers={"User-Agent": "Mozilla/5.0"})
         if rp.status_code != 200 or len(rp.content) < 50000:
@@ -1127,7 +1654,7 @@ def _portada_pdf(m: dict, png: Path) -> tuple:
                         str(tmp), prefijo], timeout=30, capture_output=True)
         tmp.unlink(missing_ok=True)
         # pdftoppm nombra prefijo-1.png o prefijo-01.png según el padding
-        salidas = sorted(PORTADAS_DIR.glob(f"{png.stem}-*.png"))
+        salidas = sorted(png.parent.glob(f"{png.stem}-*.png"))
         if salidas:
             salidas[0].replace(png)
             return True, fallback
@@ -1150,9 +1677,10 @@ def _shot_playwright(url: str, png: Path):
     (modal de publicidad/paywall que cubre la portada)."""
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = _launch(p)
         page = browser.new_page(
             viewport={"width": 1280, "height": 2600},
+            device_scale_factor=2,   # screenshots 2× — texto legible en A4
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
         # el ad-block viaja en la capa de red: los banners ni cargan
@@ -1171,22 +1699,28 @@ def _shot_playwright(url: str, png: Path):
                 page.click(sel, timeout=700)
             except Exception:
                 pass
-        page.evaluate("""() => {
+        _KILL_POPUP = """() => {
             for (const el of document.querySelectorAll('*')) {
                 const s = getComputedStyle(el);
                 if ((s.position === 'fixed' || s.position === 'absolute') &&
                     parseInt(s.zIndex || 0) > 50 &&
-                    el.clientWidth > innerWidth * .7 &&
-                    el.clientHeight > innerHeight * .5)
+                    el.clientWidth > innerWidth * .45 &&
+                    el.clientHeight > innerHeight * .25)
                     el.remove();
             }
             document.body.style.overflow = 'auto';
-        }""")
+            document.documentElement.style.overflow = 'auto';
+        }"""
+        page.evaluate(_KILL_POPUP)
         for _ in range(3):                # scroll profundo → lazy-load
             page.mouse.wheel(0, 1600)
             page.wait_for_timeout(1200)
         page.mouse.wheel(0, -99999)       # de regreso arriba del todo
         page.wait_for_timeout(1000)
+        page.keyboard.press("Escape")     # cierra modal que reaparezca
+        page.wait_for_timeout(600)
+        page.evaluate(_KILL_POPUP)        # 2º pase: popups que salen tarde
+        page.wait_for_timeout(400)
         # muros anti-bot: no guardar el "Algo ha salido mal" como portada
         titulo = (page.title() or "").lower()
         cuerpo_txt = page.evaluate("document.body ? "
@@ -1195,6 +1729,7 @@ def _shot_playwright(url: str, png: Path):
         if re.search(r"algo ha salido mal|request blocked|access denied|"
                      r"403 error|verify you|not authorized|"
                      r"something went wrong|bloqueada por|"
+                     r"security verification|security service to protect|"
                      r"bluestack|cloudfront.*error",
                      titulo + " " + cuerpo_txt):
             browser.close()
@@ -1203,14 +1738,46 @@ def _shot_playwright(url: str, png: Path):
         browser.close()
 
 
-def _shot_img_mayor(url: str, png: Path):
+_PAT_BLOQ_HTTP = re.compile(
+    r"algo ha salido mal|request blocked|access denied|"
+    r"something went wrong|security verification|"
+    r"security service to protect|bluestack|cloudfront.*error", re.I)
+
+
+def _url_bloqueada(url: str) -> bool:
+    """Check anti-bot para el fallback chromium (que no inspecciona DOM):
+    trae el HTML con requests y busca firma de página de bloqueo."""
+    try:
+        r = requests.get(url, timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0 (X11; Linux "
+                                  "x86_64) AppleWebKit/537.36 (KHTML, like "
+                                  "Gecko) Chrome/126.0.0.0 Safari/537.36"})
+        return bool(_PAT_BLOQ_HTTP.search(r.text[:30000]))
+    except Exception:
+        return False
+
+
+def _launch(p):
+    """Playwright sin browsers propios → usa el google-chrome del
+    sistema; si existiera el bundle de playwright también sirve."""
+    try:
+        return p.chromium.launch()
+    except Exception:
+        return p.chromium.launch(channel="chrome")
+
+
+def _shot_img_mayor(url: str, png: Path, toks=None):
     """Visores tipo PressReader: la portada es el <img> más grande del
-    canvas — screenshot del elemento solo, sin la UI del lector."""
+    canvas — screenshot del elemento solo, sin la UI del lector.
+    Si se pasan `toks`, exige que el texto de la página lleve la
+    fecha de hoy — PR muestra '7 Oct 2026' hasta que sube la nueva
+    edición y sin esto capturaríamos la de ayer."""
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = _launch(p)
         page = browser.new_page(
             viewport={"width": 1280, "height": 1400},
+            device_scale_factor=2,   # screenshots 2× — texto legible en A4
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
         page.route("**/*",
@@ -1218,6 +1785,15 @@ def _shot_img_mayor(url: str, png: Path):
                    if _BLOQ_ADS.search(r.request.url)
                    else r.continue_())
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        if toks is not None:
+            page.wait_for_timeout(4000)
+            try:
+                txt = page.evaluate("document.body.innerText")
+                if not _con_fecha(txt, toks):
+                    browser.close()
+                    return   # edición vieja aún — no capturar
+            except Exception:
+                pass
         best_src = None
         # poll: el <img> de la portada tarda en cargar (lazy) — hasta 30s
         for _ in range(30):
@@ -1251,86 +1827,301 @@ def _shot_img_mayor(url: str, png: Path):
         browser.close()
 
 
-def _medio_listo(base: Path) -> bool:
-    """¿Este medio ya tiene imagen (impresa o web) capturada HOY?"""
-    hoy_d = datetime.now().date()
-    for c in (base.with_suffix(".jpg"), base.with_suffix(".png"),
-              base.with_name(base.name + "-web.png")):
-        if c.exists() and c.stat().st_size > 10000 and \
-                datetime.fromtimestamp(c.stat().st_mtime).date() == hoy_d:
-            return True
-    return False
+def _img_ok(path: Path) -> bool:
+    """Rechaza capturas en blanco/negras (bloqueo anti-bot renderizado,
+    placeholder de kiosko): si la imagen es casi monocromática no es
+    una portada."""
+    try:
+        if not path.exists() or path.stat().st_size < 10000:
+            return False
+        img = Image.open(path).convert("L").resize((96, 96))
+        lo, hi = img.getextrema()
+        px = list(img.get_flattened_data()
+                  if hasattr(img, "get_flattened_data")
+                  else img.getdata())
+        mean = sum(px) / len(px)
+        blanco = sum(1 for v in px if v > 240) / len(px)
+        # monocromática (placeholder), negra (video/fondo) o ~toda blanca
+        # (página de bloqueo/security-check son texto suelto sobre blanco)
+        return (hi - lo) > 25 and mean > 40 and blanco < 0.93
+    except Exception:
+        return False
 
 
-def _captura_medio(m: dict, base: Path) -> bool:
-    """Intenta las estrategias del medio (impresa → web). True si logró
-    al menos una imagen del día."""
+def _es_hoy(path: Path) -> bool:
+    return path.exists() and \
+        datetime.fromtimestamp(path.stat().st_mtime).date() == \
+        datetime.now().date()
+
+
+def _tiene_img_hoy(base: Path) -> bool:
+    """Impresa o shot principal del medio, de HOY y no blanco/negro."""
+    return any(_es_hoy(c) and _img_ok(c)
+               for c in (base.with_suffix(".jpg"),
+                         base.with_suffix(".png")))
+
+
+def _es_doble(m: dict) -> bool:
+    """Medios con portada impresa también llevan captura de su web —
+    salvo `solo_impresa` (Excélsior: su /impreso es una galería de
+    secciones, no portada; CORAT: su sitio murió, solo vale FB)."""
+    if m.get("solo_impresa"):
+        return False
+    return any(m.get(k) for k in ("kiosko", "fb", "issuu", "flip",
+                                  "pr", "pdf"))
+
+
+def _medio_listo(m: dict, base: Path, tardia: bool) -> bool:
+    """¿Este medio ya tiene todo lo de HOY? En pase tardío las dobles
+    también deben traer su -web.png."""
+    if not _tiene_img_hoy(base):
+        return False
+    # fotos_min: posts FB con N portadas (TAD publica 2) — si solo cayó
+    # 1, sigue pendiente para que el siguiente intento traiga el resto
+    n_min = int(m.get("fotos_min", 0))
+    if n_min > 1:
+        n_img = 1 + sum(1 for _ in base.parent.glob(f"{base.name}-[0-9].jpg"))
+        if n_img < n_min:
+            return False
+    web = base.with_name(base.name + "-web.png")
+    # los dobles (impresa+web) exigen las dos: la web se captura en
+    # cuanto aparece la impresa, a cualquier hora de la ventana
+    if _es_doble(m) and not (_es_hoy(web) and _img_ok(web)):
+        return False
+    return True
+
+
+def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
+    """Intenta las estrategias del medio. `tardia` = pase cercano al
+    cierre (≥ hora_web): recién ahí se tiran screenshots web — a las
+    00:30 la homepage todavía muestra la portada de ayer o popups de
+    madrugada."""
     data = []
     tiene_impresa = False
-    if m.get("kiosko"):
-        b = _bajar_portada_kiosko(m)
-        data = [b] if b else []
-    elif m.get("fb"):
-        data = _bajar_portada_fb(m)
-    elif m.get("issuu"):
-        b = _portada_issuu(m["issuu"])
-        data = [b] if b else []
-    elif m.get("pr"):
-        # pressreader: el <img> mayor de su visor es la portada
-        png_pr = base.with_suffix(".png")
-        try:
-            _shot_img_mayor(m["pr"], png_pr)
-            if png_pr.exists() and png_pr.stat().st_size > 40000:
-                tiene_impresa = True
-            else:
-                png_pr.unlink(missing_ok=True)
-        except Exception:
-            pass
-    if data:
-        base.with_suffix(".png").unlink(missing_ok=True)
-        for i, d in enumerate(data):
-            nom = base.name if i == 0 else f"{base.name}-{i + 1}"
-            (PORTADAS_DIR / f"{nom}.jpg").write_bytes(d)
-        tiene_impresa = True
-    elif tiene_impresa:
-        pass   # pr ya escribió su PNG arriba
-    else:
-        # 2) PDF del ejemplar completo → página 1
-        png = base.with_suffix(".png")
-        ok, fallback = (_portada_pdf(m, png)
-                        if m.get("pdf") else (False, ""))
-        if ok:
-            tiene_impresa = True
-        else:
-            url_tiro = fallback or m["url"]
-            # 3) screenshot playwright (espera + mata overlays)
+    img_ok = _tiene_img_hoy(base)
+    if not img_ok:
+        if m.get("kiosko") and not data:
+            b = _bajar_portada_kiosko(m)
+            data = [b] if b else []
+        if m.get("edicion") and not data:
+            data = _portada_fecha(m)
+        if m.get("json") and not data:
+            data = _portada_json(m)
+        if m.get("flowpaper") and not data:
+            b = _portada_flowpaper(m)
+            data = [b] if b else []
+        if m.get("fb") and not data:
+            data = _bajar_portada_fb(m)
+        if m.get("calameo") and not data:
+            data = _portada_calameo(m)
+        if m.get("issuu") and not data:
+            # la URL puede llevar plantilla de fecha:
+            # cr_cdmx_{mmmm}_{d}_de_{aaaa} → cr_cdmx_octubre_8_de_2026
+            hu = datetime.now()
+            slug_iss = str(m["issuu"]).format(
+                d=hu.day, dd=f"{hu.day:02d}",
+                mmmm=_MESES_PORTADA[hu.month - 1], aaaa=hu.year)
+            b = _portada_issuu(
+                slug_iss.rstrip("/").rsplit("/", 1)[-1])
+            data = [b] if b else []
+        if m.get("flip") and not data:
+            b = _portada_flip(m["flip"])
+            data = [b] if b else []
+        if m.get("pr") and not data:
+            # pressreader: el <img> mayor de su visor es la portada —
+            # pero PR muestra la edición de AYER hasta ~1am: si la
+            # imagen es la misma de ayer no vale, sigue pendiente
+            png_pr = base.with_suffix(".png")
             try:
-                _shot_playwright(url_tiro, png)
+                _shot_img_mayor(m["pr"], png_pr, _tokens_fecha())
+                if _img_ok(png_pr) and png_pr.stat().st_size > 40000 \
+                        and not _misma_img_ayer(png_pr, base.name):
+                    tiene_impresa = True
+                else:
+                    png_pr.unlink(missing_ok=True)
             except Exception:
-                subprocess.run(
-                    ["chromium", "--headless", "--no-sandbox",
-                     "--disable-gpu", "--hide-scrollbars",
-                     "--window-size=1280,2600",
-                     f"--screenshot={png}", url_tiro],
-                    timeout=45, capture_output=True)
-    # doble portada: con impresa (jpg/pdf) también portada web
-    # (o URL alterna tipo PressReader: url_web2 + img_portada)
-    if tiene_impresa:
+                pass
+        if data:
+            base.with_suffix(".png").unlink(missing_ok=True)
+            ayer_dir = _dir_dia(datetime.now() - timedelta(days=1))
+            n_ok = 0
+            for i, d in enumerate(data):
+                nom = base.name if i == 0 else f"{base.name}-{i + 1}"
+                f = base.parent / f"{nom}.jpg"
+                # kiosko a veces sirve la portada de AYER bajo la URL de
+                # hoy — bytes idénticos a la de ayer = no es edición nueva
+                ayer = ayer_dir / f.name
+                if ayer.exists() and ayer.read_bytes() == d:
+                    continue
+                f.write_bytes(d)
+                if _img_ok(f):   # kiosko a veces da placeholder negro
+                    n_ok += 1
+                else:
+                    f.unlink(missing_ok=True)
+            tiene_impresa = n_ok > 0
+        elif tiene_impresa:
+            pass   # pr ya escribió su PNG arriba
+        elif m.get("pdf"):
+            # PDF del ejemplar → página 1 (es del día, puede ir temprano)
+            png = base.with_suffix(".png")
+            ok, _ = _portada_pdf(m, png)
+            tiene_impresa = ok and _img_ok(png)
+        if not tiene_impresa and tardia and not m.get("solo_impresa"):
+            # último recurso: screenshot de la web — solo en el pase
+            # tardío, de madrugada la home muestra la edición de ayer
+            png = base.with_suffix(".png")
+            url_tiro = m["url"]
+            if m.get("pdf"):
+                _, fb2 = _portada_pdf(m, png)
+                if _img_ok(png):
+                    tiene_impresa = True
+                else:
+                    url_tiro = fb2 or url_tiro
+            if not tiene_impresa:
+                try:
+                    _shot_playwright(url_tiro, png)
+                except RuntimeError:
+                    pass   # anti-bot: no caer al chromium ciego que sí
+                           # guarda la página de bloqueo
+                except Exception:
+                    # chromium ciego: playwright falló (timeout/crash)
+                    # — verifica por HTTP que no sea página de bloqueo
+                    if not _url_bloqueada(url_tiro):
+                        subprocess.run(
+                            ["chromium", "--headless", "--no-sandbox",
+                             "--disable-gpu", "--hide-scrollbars",
+                             "--window-size=1280,2600",
+                             f"--screenshot={png}", url_tiro],
+                            timeout=45, capture_output=True)
+                if not _img_ok(png):
+                    png.unlink(missing_ok=True)
+    # doble portada: con impresa (jpg/pdf) también portada web — solo en
+    # el pase tardío, antes la home sigue mostrando la edición de ayer
+    tiene_impresa = tiene_impresa or _tiene_img_hoy(base)
+    if tiene_impresa and _es_doble(m):
+        # web apenas cayó la impresa: el sitio ya muestra la edición
+        # del día — no hay que esperar a hora_web
         web = base.with_name(base.name + "-web.png")
-        if not web.exists() or datetime.fromtimestamp(
-                web.stat().st_mtime).date() != datetime.now().date():
+        imp = _portada_img(slug)
+        web_vieja = (not _es_hoy(web)) or (
+            imp.exists() and web.exists()
+            and web.stat().st_mtime < imp.stat().st_mtime)
+        if web_vieja:
             try:
                 url_web = m.get("url_web2") or m["url"]
                 if m.get("img_portada"):
                     _shot_img_mayor(url_web, web)
                 else:
                     _shot_playwright(url_web, web)
-                if not web.exists() or web.stat().st_size < 40000:
+                if not _img_ok(web) or web.stat().st_size < 40000:
                     web.unlink(missing_ok=True)
             except Exception:
                 web.unlink(missing_ok=True)
-    img_final = _portada_img(base.name)
-    return img_final.exists() and img_final.stat().st_size >= 10000
+    return _tiene_img_hoy(base)
+
+
+def _portada_flowpaper(m: dict):
+    """Lectores FlowPaper tras Cloudflare (Capital Índigo): la edición es
+    un PDF fechado que el visor baja con pdf.js. requests no pasa el
+    challenge — Playwright entra al visor, espera CF y pide el PDF con
+    fetch dentro del mismo origen.
+    m['flowpaper']    = plantilla del PDF con {aaaa} {mm} {dd} {aaaammdd}
+    m['flowpaper_visor'] = página del lector (default: /…/index.html del
+                           directorio del PDF)"""
+    import base64, subprocess, tempfile
+    h = datetime.now()
+    url_pdf = m["flowpaper"].format(
+        aaaa=h.year, mm=f"{h.month:02d}", dd=f"{h.day:02d}",
+        aaaammdd=f"{h:%Y%m%d}")
+    visor = m.get("flowpaper_visor") or \
+        url_pdf.rsplit("/", 3)[0] + "/index.html"
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            br = _launch(p)
+            pg = br.new_page(
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/126.0.0.0 Safari/537.36")
+            pg.goto(visor, wait_until="domcontentloaded",
+                    timeout=45000)
+            pg.wait_for_timeout(9000)   # CF managed challenge auto-pasa
+            host = url_pdf.split("/")[2]
+            fr = next((f for f in pg.frames if host in f.url), pg)
+            b64 = fr.evaluate("""async (u) => {
+                const r = await fetch(u);
+                if (!r.ok) return 'ERR' + r.status;
+                const buf = await r.arrayBuffer();
+                let bin = ''; const b = new Uint8Array(buf);
+                for (let i = 0; i < b.length; i += 8192)
+                    bin += String.fromCharCode.apply(
+                        null, b.subarray(i, i + 8192));
+                return btoa(bin);
+            }""", url_pdf)
+            br.close()
+        if b64.startswith("ERR"):
+            return None
+        pdf = base64.b64decode(b64)
+        if len(pdf) < 200000 or not pdf.startswith(b"%PDF"):
+            return None
+        tmp_pdf = Path(tempfile.mktemp(suffix=".pdf"))
+        tmp_pdf.write_bytes(pdf)
+        tmp_out = str(tmp_pdf) + "_p1"
+        subprocess.run(["pdftoppm", "-f", "1", "-l", "1", "-jpeg",
+                        "-r", "110", str(tmp_pdf), tmp_out],
+                       timeout=60, capture_output=True)
+        tmp_pdf.unlink(missing_ok=True)
+        for gen in Path(tempfile.gettempdir()).glob(
+                Path(tmp_out).name + "*"):
+            data = gen.read_bytes()
+            gen.unlink(missing_ok=True)
+            if len(data) > 60000:
+                return data
+    except Exception:
+        pass
+    return None
+
+
+def _es_vertical(b: bytes) -> bool:
+    try:
+        im = Image.open(io.BytesIO(b))
+        return im.height > im.width
+    except Exception:
+        return False
+
+
+def _es_portada(b: bytes) -> bool:
+    """Vertical Y angosta — proporción de primera plana (~0.55–0.77 w/h).
+    Un flyer vertical 4:5 o cuadrado (600x750 = 0.8, posts de evento)
+    NO es portada aunque sea alto."""
+    try:
+        im = Image.open(io.BytesIO(b))
+        return im.height >= im.width * 1.3
+    except Exception:
+        return False
+
+
+def _misma_img_ayer(nuevo: Path, nombre_base: str) -> bool:
+    """True si la imagen recién capturada es visualmente la misma que
+    la de AYER — PressReader muestra la edición de ayer hasta la 1am:
+    comparar píxeles a 64x64 grises (los PNG/JPG nunca son
+    byte-idénticos entre estrategias)."""
+    ayer_dir = _dir_dia(datetime.now() - timedelta(days=1))
+    ayer = None
+    for ext in (".jpg", ".png"):
+        f = ayer_dir / f"{nombre_base}{ext}"
+        if f.exists():
+            ayer = f
+            break
+    if ayer is None or not nuevo.exists():
+        return False
+    try:
+        a = Image.open(nuevo).convert("L").resize((64, 64))
+        b = Image.open(ayer).convert("L").resize((64, 64))
+        diff = sum(abs(p - q) for p, q in zip(a.getdata(), b.getdata()))
+        return diff / (64 * 64) < 8   # <8/255 por píxel = misma edición
+    except Exception:
+        return False
 
 
 def capturar_portadas(cfg: dict):
@@ -1340,25 +2131,150 @@ def capturar_portadas(cfg: dict):
     medios = cfg.get("portadas", {}).get("medios", [])
     if not medios:
         return
-    PORTADAS_DIR.mkdir(exist_ok=True)
+    dia = _dir_dia()
+    dia.mkdir(parents=True, exist_ok=True)
+    ahora = datetime.now()
+    tardia = ahora.hour * 60 + ahora.minute >= \
+        _hhmm(cfg.get("portadas", {}), "hora_web", "05:45")
     fallos = []
+    port = cfg.get("portadas", {})
+    ahora_m = ahora.hour * 60 + ahora.minute
+    # reconciliación: un evento ok de hoy sin archivo en disco es una
+    # captura descartada a mano (borrada por mala) — el timeline no
+    # debe contarla ni presumir que el medio ya cayó
+    hoy_s = ahora.strftime("%Y-%m-%d")
+    slugs = {m["nombre"]: _slug_portada(m["nombre"]) for m in medios}
+    est0 = cargar_json(ESTADO_PORTADAS, {})
+    sucio = False
+    for e in est0.get("eventos", []):
+        if e.get("d") == hoy_s and e.get("ok") \
+                and e.get("m") in slugs \
+                and not _tiene_img_hoy(dia / slugs[e["m"]]):
+            e["ok"] = False
+            e["borrada"] = True
+            sucio = True
+    if sucio:
+        _guardar_portadas(est0)
     for m in medios:
-        base = PORTADAS_DIR / _slug_portada(m["nombre"])
-        if _medio_listo(base):
+        if not _en_ventana(m, port, ahora_m):
+            continue   # fuera de su ventana propia
+        base = dia / _slug_portada(m["nombre"])
+        if _medio_listo(m, base, tardia):
             continue   # ya tiene su imagen de hoy
+        est = cargar_json(ESTADO_PORTADAS, {})
+        stamps = est.setdefault("cap_medios", {})
         try:
-            if not _captura_medio(m, base):
-                fallos.append(m["nombre"])
+            ult = datetime.fromisoformat(stamps.get(base.name,
+                                                  "2000-01-01"))
         except Exception:
+            ult = datetime(2000, 1, 1)
+        if (ahora - ult).total_seconds() < \
+                _cada_efectivo(m, port, ahora) * 60:
+            continue   # le toca más tarde — cada_min por medio (rampa)
+        stamps[base.name] = ahora.isoformat()
+        hoy = ahora.strftime("%Y-%m-%d")
+        # conserva ~7 días de eventos — histórico para ver patrones de
+        # publicación de cada medio
+        limite = (ahora - timedelta(days=7)).strftime("%Y-%m-%d")
+        evs = [e for e in est.get("eventos", []) if e.get("d") >= limite]
+        try:
+            ok = bool(_captura_medio(m, base, tardia))
+        except Exception:
+            ok = False
+        evs.append({"d": hoy, "t": ahora.strftime("%H:%M"),
+                    "m": m["nombre"], "ok": ok})
+        est["eventos"] = evs[-3000:]
+        _guardar_portadas(est)
+        if not ok:
             fallos.append(m["nombre"])
-    print(f"[portadas] corrida, pendientes fallidos: "
-          f"{fallos or 'ninguno'}")
+    print(f"[portadas] corrida{' tardía' if tardia else ''}, "
+          f"pendientes fallidos: {fallos or 'ninguno'}")
+    escribir_schedule_portadas(cfg)   # refresca línea de tiempo
+
+
+def _cada_efectivo(m: dict, port: dict, ahora: datetime = None) -> int:
+    """cada_min del medio comprimido cerca del cierre: ≤90 min al
+    hora_pdf toca cada 20, a ≤45 min cada 10 — los medios lentos de
+    publicar (kiosko 404, FB tardío) tienen más oportunidades."""
+    cada = int(m.get("cada_min", 55))
+    ahora = ahora or datetime.now()
+    restan = _hhmm(port, "hora_pdf", "06:45") - \
+        (ahora.hour * 60 + ahora.minute)
+    if restan <= 45:
+        return min(cada, 10)
+    if restan <= 90:
+        return min(cada, 20)
+    return cada
+
+
+def _merge_eventos(a: list, b: list) -> list:
+    """Unión de eventos sin duplicados — el timeline no pierde pins
+    aunque el servicio tenga en RAM un estado más viejo que el disco."""
+    seen, out = set(), []
+    for e in a + b:
+        k = (e.get('d'), e.get('t'), e.get('m'), e.get('ok'))
+        if k not in seen:
+            seen.add(k)
+            out.append(e)
+    return out
+
+
+def _guardar_portadas(est: dict):
+    """Escritura atómica (tmp + rename) con merge contra disco: fusiona
+    eventos y conserva el timestamp más reciente por medio en
+    cap_medios — evita que un proceso con estado viejo pise registros
+    nuevos (el write-race que borró pins del timeline)."""
+    en_disco = cargar_json(ESTADO_PORTADAS, {})
+    en_disco['eventos'] = _merge_eventos(
+        en_disco.get('eventos', []), est.get('eventos', []))[-3000:]
+    cap = en_disco.setdefault('cap_medios', {})
+    for k, v in est.get('cap_medios', {}).items():
+        if v > cap.get(k, ''):
+            cap[k] = v
+    for k, v in est.items():
+        if k not in ('eventos', 'cap_medios'):
+            en_disco[k] = v
+    tmp = ESTADO_PORTADAS.with_suffix('.tmp')
+    tmp.write_text(json.dumps(en_disco))
+    tmp.replace(ESTADO_PORTADAS)
+
+
+def _pagina_portada_pdf(sec: str, n_medios: int):
+    """Página de portada del PDF — institucional, sin marca: solo
+    servicio, sección, fecha y conteo de medios."""
+    from PIL import ImageDraw, ImageFont
+    W, H = 1240, 1754   # proporción carta/vertical como las portadas
+    img = Image.new("RGB", (W, H), (250, 250, 250))
+    dr = ImageDraw.Draw(img)
+    try:
+        fb = ImageFont.truetype("DejaVuSans-Bold.ttf", 96)
+        fm = ImageFont.truetype("DejaVuSans.ttf", 44)
+        fs = ImageFont.truetype("DejaVuSans.ttf", 30)
+    except Exception:
+        fb = fm = fs = ImageFont.load_default()
+    hoy = datetime.now()
+    fecha = f"{hoy.day} de {_MESES_PORTADA[hoy.month - 1]} de {hoy.year}"
+    dia_sem = _DIAS_PORTADA[hoy.weekday()].capitalize()
+    titulo = "PORTADAS NACIONAL" if sec == "nacional" \
+        else "PORTADAS TABASCO"
+    negro, gris, esm = (9, 9, 11), (82, 82, 91), (52, 211, 153)
+    def centro(txt, y, fnt, fill=negro):
+        dr.text((W / 2, y), txt, font=fnt, fill=fill, anchor="mm")
+    centro("SERVICIO DE MONITOR DE PRENSA", H * 0.36, fm, gris)
+    centro(titulo, H * 0.46, fb)
+    dr.line((W * 0.28, H * 0.505, W * 0.72, H * 0.505),
+            fill=esm, width=6)
+    centro(dia_sem, H * 0.56, fm, gris)
+    centro(fecha, H * 0.61, fm)
+    centro(f"{n_medios} medios", H * 0.68, fs, gris)
+    return img
 
 
 def generar_pdfs_portadas(cfg: dict):
     """Hora_pdf (06:45): arma los PDFs con lo recolectado en la ventana,
     los manda por correo y lista los medios que nunca respondieron."""
     medios = cfg.get("portadas", {}).get("medios", [])
+    escribir_schedule_portadas(cfg)   # schedule.html siempre al día
     hoy = datetime.now().strftime("%Y-%m-%d")
     hoy_d = datetime.now().date()
     fallos = []
@@ -1369,12 +2285,14 @@ def generar_pdfs_portadas(cfg: dict):
             if m.get("seccion") != sec:
                 continue
             slug = _slug_portada(m["nombre"])
+            dia = _dir_dia()
             # impresa(s) primero — los posts FB traen portada-2, etc.
-            extras = sorted(PORTADAS_DIR.glob(f"{slug}-[0-9].jpg"))
+            extras = sorted(dia.glob(f"{slug}-[0-9].jpg"))
             tiene = False
-            for cand in ([_portada_img(slug)] + extras
-                         + [PORTADAS_DIR / f"{slug}-web.png"]):
-                if cand.exists():
+            web = [] if m.get("solo_impresa") else \
+                [dia / f"{slug}-web.png"]
+            for cand in ([_portada_img(slug)] + extras + web):
+                if cand.exists() and _img_ok(cand):
                     try:
                         imgs.append(Image.open(cand).convert("RGB"))
                         tiene = True
@@ -1383,33 +2301,53 @@ def generar_pdfs_portadas(cfg: dict):
             if not tiene:
                 fallos.append(m["nombre"])
         if imgs:
-            pdf = PORTADAS_DIR / f"portadas_{sec}_{hoy}.pdf"
-            imgs[0].save(pdf, save_all=True, append_images=imgs[1:])
+            dia.mkdir(parents=True, exist_ok=True)
+            pdf = dia / f"portadas_{sec}_{hoy}.pdf"
+            portada = _pagina_portada_pdf(sec, len(imgs))
+            imgs = [portada] + imgs
+            imgs[0].save(
+                pdf, save_all=True, append_images=imgs[1:],
+                title=f"Portadas {sec.capitalize()} — "
+                      f"{hoy_d.strftime('%d/%m/%Y')}",
+                author="@noticias",
+                subject="Portadas de medios impresos",
+                keywords="portadas, prensa, Tabasco, "
+                         "monitoreo de medios",
+                creator="Olmeca Code")
             for i in imgs:
                 i.close()
             pdfs[sec] = pdf
     enviar_portadas(cfg, pdfs, fallos)
     est = cargar_json(ESTADO_PORTADAS, {})
     est["pdf_fecha"] = hoy
-    ESTADO_PORTADAS.write_text(json.dumps(est))
+    _guardar_portadas(est)
     print(f"[portadas] {len(pdfs)} PDFs enviados, fallos: "
           f"{fallos or 'ninguno'}")
 
 
 def limpiar_portadas():
-    """19:00 — borra las imágenes del día; los PDFs se quedan como
-    archivo local."""
+    """19:00 — conserva solo los últimos 7 días de subcarpetas; las
+    imágenes de cada día se quedan para cotejar contra ayer."""
     if not PORTADAS_DIR.exists():
         return
+    import shutil
+    # día dirs = portadas/<mes>/<dd> — retiene los 7 más recientes
+    dias = sorted((d for d in PORTADAS_DIR.glob("*/*")
+                   if d.is_dir()),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
     n = 0
+    for d in dias[7:]:   # >7 días → fuera
+        shutil.rmtree(d, ignore_errors=True)
+        n += 1
+    for mes in PORTADAS_DIR.iterdir():   # carpeta de mes vacía → fuera
+        if mes.is_dir() and not any(mes.iterdir()):
+            mes.rmdir()
+    # legado: imágenes sueltas en la raíz de corridas anteriores
     for f in PORTADAS_DIR.glob("*.*"):
         if f.suffix in (".jpg", ".jpeg", ".png"):
-            try:
-                f.unlink()
-                n += 1
-            except Exception:
-                pass
-    print(f"[portadas] limpieza: {n} imágenes borradas")
+            f.unlink(missing_ok=True)
+    print(f"[portadas] limpieza: {n} carpetas viejas fuera, "
+          f"{len(dias[:7])} días conservados")
 
 
 def enviar_portadas(cfg: dict, pdfs: dict, fallos: list):
@@ -1442,6 +2380,364 @@ def enviar_portadas(cfg: dict, pdfs: dict, fallos: list):
         print(f"[portadas] correo falló: {e}")
 
 
+def _min(s: str) -> int:
+    """'HH:MM' → minutos del día (valor directo, no de config)."""
+    h, mm = map(int, s.split(":"))
+    return h * 60 + mm
+
+
+def _ventana_medio(m: dict, port: dict) -> tuple:
+    """(desde, hasta) en minutos para este medio. cap_desde/cap_hasta
+    sobreescriben la ventana global; los medios solo-web no arrancan
+    antes de hora_web (de madrugada la home trae la edición vieja)."""
+    # edicion/json/calameo también validan fecha — pueden intentarse
+    # desde madrugada sin riesgo de agarrar la edición vieja
+    impresa = any(m.get(k) for k in
+                  ("kiosko", "fb", "issuu", "flip", "pr", "pdf",
+                   "edicion", "json", "calameo", "flowpaper"))
+    desde = _min(m.get("cap_desde") or port.get("hora_desde", "00:30"))
+    hasta = _min(m.get("cap_hasta") or port.get("hora_pdf", "06:45"))
+    if not impresa:
+        desde = max(desde, _hhmm(port, "hora_web", "05:45"))
+    return desde, hasta
+
+
+def _en_ventana(m: dict, port: dict, ahora_m: int) -> bool:
+    desde, hasta = _ventana_medio(m, port)
+    return desde <= ahora_m <= hasta
+
+
+def _reglas_medio(m: dict) -> str:
+    """Texto de reglas de captura — alimenta la columna Reglas de
+    schedule.html (se regenera en cada generar_pdfs_portadas)."""
+    r = []
+    if m.get("kiosko"):
+        r.append("JPG fechado de hoy/ayer en Kiosko")
+    if m.get("fb"):
+        r.append("Post de hoy con texto 'portada/edición'")
+    if m.get("issuu"):
+        r.append("Doc más reciente del perfil Issuu")
+    if m.get("flip"):
+        r.append("Página _001A del flipbook del día")
+    if m.get("pr"):
+        r.append("Imagen mayor del visor PressReader")
+    if m.get("pdf"):
+        r.append("PDF con fecha de hoy en la URL")
+        if m.get("pdf_estricto"):
+            r.append("solo PDF del post fechado")
+    if m.get("solo_impresa"):
+        r.append("sin captura web")
+    if not any(m.get(k) for k in
+               ("kiosko", "fb", "issuu", "flip", "pr", "pdf")):
+        r.append("Screenshot de la portada web")
+    r.append("blanco/negro/bloqueo → descarta y reintenta")
+    if m.get("cap_desde") or m.get("cap_hasta"):
+        r.append(f"ventana propia {m.get('cap_desde','—')}–"
+                 f"{m.get('cap_hasta','—')}")
+    if m.get("regla"):   # nota editable desde /horarios
+        r.insert(0, m["regla"])
+    return " · ".join(r)
+
+
+def escribir_schedule_portadas(cfg: dict):
+    """Regenera schedule.html con los horarios y reglas vigentes —
+    corre junto a generar_pdfs_portadas para que nunca se desactualice."""
+    port = cfg.get("portadas", {})
+    medios = port.get("medios", [])
+    if not medios:
+        return
+    desde = port.get("hora_desde", "00:30")
+    pdf = port.get("hora_pdf", "06:45")
+    limpia = port.get("hora_limpia", "19:00")
+
+    TIPOS = (("web", "Web (screenshot)"), ("kiosko", "Kiosko.net"),
+             ("edicion", "Edición digital"), ("json", "API/JSON"),
+             ("fb", "Facebook"), ("issuu", "Issuu"), ("flip", "Flipbook"),
+             ("calameo", "Calaméo"), ("pr", "PressReader"),
+             ("pdf", "PDF diario"))
+
+    def tipo_medio(m):
+        for k in ("kiosko", "edicion", "json", "fb", "issuu", "flip",
+                  "calameo", "pr", "pdf"):
+            if m.get(k):
+                return k
+        return "web"
+
+    def origen_medio(m):
+        for k in ("fb", "flip", "calameo", "pr", "issuu",
+                  "edicion", "json", "kiosko"):
+            if m.get(k):
+                return str(m[k])
+        return str(m.get("url", ""))
+
+    def url_origen(m):
+        """URL completa de dónde se baja — resuelve slugs a su sitio."""
+        if m.get("kiosko"):
+            return f"https://www.kiosko.net/mx/np/{m['kiosko']}.html"
+        if m.get("issuu"):
+            return f"https://issuu.com/{m['issuu']}"
+        return origen_medio(m)
+
+    def sel_tipo(actual):
+        return "".join(
+            f"<option value='{v}'{' selected' if v == actual else ''}>"
+            f"{et}</option>" for v, et in TIPOS)
+
+    def sel_sec(actual):
+        return "".join(
+            f"<option value='{v}'{' selected' if v == actual else ''}>"
+            f"{v}</option>" for v in ("nacional", "tabasco"))
+
+    # fila editable: nombre/sección/origen/horario/regla + checkbox borrar
+    def fila(i, m):
+        d, h = _ventana_medio(m, port)
+        cada = m.get("cada_min", "")
+        return (
+            f"<tr><td><input name='n{i}' "
+            f"value='{html.escape(m['nombre'], quote=True)}' "
+            "style='width:9rem'>"
+            f"<select name='s{i}'>{sel_sec(m.get('seccion','nacional'))}"
+            "</select></td>"
+            f"<td><select name='t{i}'>{sel_tipo(tipo_medio(m))}</select>"
+            f"<input name='o{i}' inputmode='url' "
+            f"value='{html.escape(url_origen(m), quote=True)}' "
+            f"title='{html.escape(url_origen(m), quote=True)}' "
+            "style='width:100%;min-width:15rem'></td>"
+            f"<td><input type='time' name='d{i}' "
+            f"value='{d//60:02d}:{d%60:02d}'>→"
+            f"<input type='time' name='h{i}' "
+            f"value='{h//60:02d}:{h%60:02d}'>"
+            f"<br><small>cada</small> <input type='number' name='c{i}' "
+            f"min='5' max='240' value='{cada}' placeholder='55' "
+            "style='width:3.5rem'> <small>min</small></td>"
+            f"<td><input name='r{i}' style='width:100%' "
+            f"value='{html.escape(m.get('regla',''), quote=True)}' "
+            f"placeholder='{_reglas_medio(m).split(' · ')[0] if not m.get('regla') else ''}'></td>"
+            f"<td><label><input type='checkbox' name='del{i}' "
+            "value='1'> borrar</label></td></tr>")
+
+    def tabla(sec, titulo):
+        rows = "".join(fila(i, m) for i, m in enumerate(medios)
+                       if m.get("seccion") == sec)
+        return (f"<h2>{titulo}</h2><table><thead><tr><th>Medio</th>"
+                f"<th>Origen</th><th>Horario</th><th>Regla</th>"
+                f"<th></th></tr></thead><tbody>{rows}</tbody></table>")
+
+    # línea de tiempo del ciclo nocturno: ticks cada 55 min desde la
+    # apertura hasta la hora del PDF; dots por evento (azul=capturado,
+    # rojo=fallo); tick ámbar = hora cumplida sin corrida registrada
+    ahora = datetime.now()
+    ahora_m = ahora.hour * 60 + ahora.minute
+    d0, d1 = _min(desde), _min(pdf)
+    span = max(d1 - d0, 1)
+    est_tl = cargar_json(ESTADO_PORTADAS, {})
+    hoy_s = ahora.strftime("%Y-%m-%d")
+    evs_tl = [e for e in est_tl.get("eventos", []) if e.get("d") == hoy_s]
+
+    def _pct(mm):
+        return max(0.0, min(100.0, (mm - d0) * 100.0 / span))
+
+    tl = ("<div style='position:relative;height:240px;margin:14px 0 2px'>"
+          "<div style='position:absolute;top:210px;left:0;right:0;"
+          "height:4px;background:#e5e5e5;border-radius:2px'></div>")
+    t = d0
+    while t <= d1 + 1:
+        paso = t <= ahora_m
+        hubo = any(_min(str(e.get("t", "00:00"))) >= t for e in evs_tl)
+        color = "#0a7a2f" if (paso and hubo) else \
+                ("#d97706" if paso else "#9ca3af")
+        tl += (
+            f"<div title='corrida {t//60:02d}:{t%60:02d}' style="
+            f"'position:absolute;left:{_pct(t):.2f}%;top:206px;width:12px;"
+            "height:12px;margin-left:-6px;border-radius:50%;"
+            f"background:{color}'></div>"
+            f"<span style='position:absolute;left:{_pct(t):.2f}%;top:228px;"
+            "transform:translateX(-50%);font-size:.68rem;color:#666'>"
+            f"{t//60:02d}:{t%60:02d}</span>")
+        t += 55
+    # tick final: hora del PDF (deadline de envío ~+5 min)
+    if t - 55 < d1:
+        paso = d1 <= ahora_m
+        pdf_ok = est_tl.get("pdf_fecha") == hoy_s
+        color = "#0a7a2f" if pdf_ok else \
+                ("#d97706" if paso else "#9ca3af")
+        tl += (
+            f"<div title='PDF {d1//60:02d}:{d1%60:02d} — envío ~"
+            f"{(d1+5)//60:02d}:{(d1+5)%60:02d}' style="
+            f"'position:absolute;left:{_pct(d1):.2f}%;top:202px;width:16px;"
+            "height:16px;margin-left:-8px;border-radius:50%;"
+            f"background:{color}'></div>"
+            f"<span style='position:absolute;left:{_pct(d1):.2f}%;top:228px;"
+            "transform:translateX(-50%);font-size:.68rem;color:#666'>"
+            f"{d1//60:02d}:{d1%60:02d} PDF</span>")
+    # pines: solo capturas logradas — eventos cercanos (≤10 min) se
+    # agrupan en UN cluster: etiqueta compacta HH:MM ×N (los nombres en
+    # el tooltip y en la leyenda desplegable de abajo) — sin clusters,
+    # la ola de las ~06:00 empalma 20 etiquetas diagonales ilegibles
+    oks = sorted(
+        (_min(str(e.get("t", "00:00"))), str(e.get("m", "")))
+        for e in evs_tl if e.get("ok")
+        and d0 <= _min(str(e.get("t", "00:00"))) <= d1 + 60)
+    clusters = []
+    for mm, nombre in oks:
+        if clusters and mm - clusters[-1][0] <= 10:
+            clusters[-1][1].append((mm, nombre))
+        else:
+            clusters.append((mm, [(mm, nombre)]))
+    grupos = []   # [(min_repr, [(mm, nombre), ...])]
+    for _mm0, items in clusters:
+        mms = sorted(m for m, _ in items)
+        grupos.append((mms[len(mms) // 2], items))
+    # niveles en escalera para clusters pegados (calculo de drcha→izqda)
+    niveles = [0] * len(grupos)
+    for i in range(len(grupos) - 2, -1, -1):
+        xi = _pct(grupos[i][0])
+        xn = _pct(grupos[i + 1][0])
+        if xn - xi < 9:
+            niveles[i] = niveles[i + 1] + 1
+    for (mm, nombres), nivel in zip(grupos, niveles):
+        x = _pct(mm)
+        polo_top = 206 - 34 - nivel * 30
+        polo_h = 34 + nivel * 30
+        solo = [n for _, n in nombres]
+        etq = (html.escape(solo[0]) if len(solo) == 1
+               else f"{mm // 60:02d}:{mm % 60:02d} ×{len(solo)}")
+        tl += (
+            f"<div title='{html.escape(' · '.join(solo))}' style="
+            f"'position:absolute;left:{x:.2f}%;top:206px;width:9px;"
+            "height:9px;margin-left:-4px;border-radius:50%;"
+            "background:#2563eb'></div>"
+            f"<div style='position:absolute;left:{x:.2f}%;"
+            f"top:{polo_top}px;width:1.5px;height:{polo_h}px;"
+            "background:#2563eb'></div>"
+            f"<span style='position:absolute;left:{x:.2f}%;"
+            f"top:{polo_top}px;transform-origin:left bottom;"
+            "transform:rotate(-55deg);width:120px;"
+            "font-size:.6rem;color:#2563eb;font-weight:600'>"
+            f"{etq}</span>")
+    # leyenda: cada captura con su hora real, agrupada por cluster
+    if grupos:
+        n_olas = sum(1 for _, items in grupos if len(items) > 1)
+        items_leg = "".join(
+            f"<li><b>{e_mm // 60:02d}:{e_mm % 60:02d}</b> "
+            f"{html.escape(e_n)}</li>"
+            for _mm, items in grupos for e_mm, e_n in sorted(items))
+        tl += ("</div><details open style='font-size:.75rem;color:#333;"
+               "margin:0 0 4px'><summary style='cursor:pointer'>"
+               f"Capturas de hoy — {sum(len(i) for _, i in grupos)} "
+               f"medios en {n_olas} olas</summary><ul style='margin:4px "
+               f"0 0;padding-left:18px;line-height:1.6'>"
+               f"{items_leg}</ul></details><div>")
+    # pendientes: medios sin su material de hoy completo
+    dia_tl = _dir_dia()
+    tardia_tl = ahora_m >= _hhmm(port, "hora_web", "05:45")
+    listos = {m["nombre"] for m in medios
+              if _tiene_img_hoy(dia_tl / _slug_portada(m["nombre"])
+                                ) or (dia_tl / f"{_slug_portada(m['nombre'])}-web.png").exists()}
+    pend = [m["nombre"] for m in medios
+            if _en_ventana(m, port, ahora_m)
+            and m["nombre"] not in listos]
+    n_tab = sum(1 for m in medios
+                if m.get("seccion") == "tabasco"
+                and m["nombre"] in listos)
+    n_nac = sum(1 for m in medios
+                if m.get("seccion") == "nacional"
+                and m["nombre"] in listos)
+    tl += ("<p style='font-size:.9rem;margin:6px 0 2px;font-weight:600'>"
+           f"<b style='color:#0a7a2f'>{len(listos)} de {len(medios)}</b> "
+           f"medios capturados — {n_nac} nacionales · {n_tab} tabasco"
+           "</p>")
+    tl += ("</div><p style='font-size:.75rem;color:#666;margin:0 0 12px'>"
+           "corrida <b style='color:#0a7a2f'>●</b> hecha · "
+           "<b style='color:#9ca3af'>●</b> pendiente · "
+           "<b style='color:#d97706'>●</b> sin eventos aún · "
+           "pin <b style='color:#2563eb'>●</b> portada capturada "
+           "(hora real)</p>")
+    if pend:
+        tl += ("<p style='font-size:.8rem;margin:0 0 12px'>"
+               "<b style='color:#dc2626'>Pendientes:</b> "
+               + ", ".join(html.escape(n) for n in pend) + "</p>")
+
+    html_doc = (
+        "<!DOCTYPE html>\n<html lang=\"es\"><head><meta charset=\"utf-8\">\n"
+        "<title>Horario de captura — Portadas</title>\n"
+        "<style>\n"
+        "body{font-family:system-ui,sans-serif;max-width:980px;margin:32px auto;"
+        "color:#1a1a1a;padding:0 16px}\n"
+        "h1{font-size:1.4rem;border-bottom:3px solid #b03a2e;padding-bottom:8px}\n"
+        "h2{font-size:1.05rem;margin:28px 0 8px;color:#b03a2e}\n"
+        "table{width:100%;border-collapse:collapse;font-size:.85rem}\n"
+        "th{background:#b03a2e;color:#fff;text-align:left;padding:6px 10px}\n"
+        "td{border-bottom:1px solid #e5e5e5;padding:6px 10px;vertical-align:top}\n"
+        "tr:nth-child(even){background:#faf7f6}\n"
+        ".nota{font-size:.8rem;color:#666;margin-top:24px;line-height:1.5}\n"
+        "</style></head><body>\n"
+        "<h1>Horario de captura de portadas</h1>\n"
+        "<div id='aviso'></div>"
+        "<script>var q=new URLSearchParams(location.search).get('msg');"
+        "if(q){document.getElementById('aviso').innerHTML='"
+        "<p style=color:#0a7a2f;font-weight:600>'+q+'</p>';}</script>"
+        f"<p>Ventana incremental <b>{desde} → {pdf}</b> con reintentos "
+        f"por medio. Las capturas web ocurren apenas se detecte la "
+        f"<b>portada</b>. El PDF se genera y envía a las <b>{pdf}</b> · "
+        f"limpieza de imágenes a las <b>{limpia}</b>.</p>\n"
+        + tl
+        # un solo form para ambas tablas: postea al dashboard. Servido
+        # desde /schedule el action es relativo; si se abre como file://
+        # o en otro puerto, el JS lo apunta al :8080
+        + "<form method='post' action='/horarios'>"
+        + tabla("nacional", "Nacionales") + tabla("tabasco", "Tabasco")
+        # alta de fuente nueva: mismos campos con prefijo n_
+        + "<h2>Agregar fuente</h2><table><tbody><tr>"
+        "<td><input name='n_nombre' placeholder='Nombre del medio' "
+        "style='width:9rem'><select name='n_sec'>"
+        "<option value='nacional'>nacional</option>"
+        "<option value='tabasco'>tabasco</option></select></td>"
+        f"<td><select name='n_tipo'>{sel_tipo('web')}</select>"
+        "<input name='n_origen' inputmode='url' style='width:100%' "
+        "placeholder='URL o slug — fb: fanpage · kiosko: mx_slug'></td>"
+        "<td><input type='time' name='n_desde'>→"
+        "<input type='time' name='n_hasta'>"
+        "<br><small>cada</small> <input type='number' name='n_cada' "
+        "min='5' max='240' placeholder='55' style='width:3.5rem'> "
+        "<small>min</small></td>"
+        "<td><input name='n_regla' style='width:100%' "
+        "placeholder='regla opcional'></td><td></td></tr>"
+        "</tbody></table>"
+        "<button style='margin:1rem 0;padding:.5rem 1.5rem;background:"
+        "#b03a2e;color:#fff;border:0;border-radius:6px;font-size:1rem'>"
+        "Agregar fuente</button></form>"
+        "<script>"
+        # el editor vive en el dashboard (:8080) — el archivo servido
+        # por otro puerto/file redirige ahí para que la cookie valga
+        "if(location.port&&location.port!=='8080'){"
+        "location.replace('http://'+location.hostname+':8080'"
+        "+location.pathname+location.search);}"
+        # auto-guardado: al salir del campo se manda solo ese campo
+        # (handler acepta forms parciales). n_* se guardan con el botón
+        "document.querySelectorAll('input[name],select[name]')"
+        ".forEach(function(el){"
+        "if(el.name.indexOf('n_')===0)return;"
+        "el.addEventListener('change',function(){"
+        "var fd=new FormData();"
+        "if(el.type==='checkbox'){if(!el.checked)return;"
+        "fd.append(el.name,'1');}else{fd.append(el.name,el.value);}"
+        "el.style.outline='2px solid #b03a2e';"
+        "fetch('/horarios',{method:'POST',body:fd,"
+        "headers:{'X-Requested-With':'fetch'}})"
+        ".then(function(r){"
+        "el.style.outline=r.ok?'2px solid #0a7a2f':'2px solid red';"
+        "if(r.ok&&el.name.indexOf('del')===0)location.reload();})"
+        ".catch(function(){el.style.outline='2px solid red';});});});"
+        "</script>"
+        "<p class=\"nota\">Aplica en el siguiente ciclo — sin reiniciar. "
+        "El fin de ventana lo marca el PDF de las 06:45. Las capturas "
+        "que salen en blanco, negro o página de bloqueo se descartan y "
+        "el medio queda pendiente para el siguiente reintento.</p>\n"
+        "</body></html>")
+    (BASE / "schedule.html").write_text(html_doc)
+
+
 def _hhmm(port: dict, clave: str, default: str) -> int:
     """'HH:MM' → minutos del día."""
     try:
@@ -1465,23 +2761,30 @@ def toca_captura_portadas(cfg: dict) -> bool:
             <= ahora.hour * 60 + ahora.minute
             < _hhmm(port, "hora_pdf", "06:45")):
         return False
+    ahora_m = ahora.hour * 60 + ahora.minute
+    tardia = ahora_m >= _hhmm(port, "hora_web", "05:45")
     est = cargar_json(ESTADO_PORTADAS, {})
-    try:
-        ult = datetime.fromisoformat(est.get("cap_last", "2000-01-01"))
-    except Exception:
-        ult = datetime(2000, 1, 1)
-    if (ahora - ult).total_seconds() < 55 * 60:
-        return False
+    stamps = est.get("cap_medios", {})
     for m in medios:
-        if not _medio_listo(PORTADAS_DIR / _slug_portada(m["nombre"])):
-            return True    # falta alguno → corre
+        if not _en_ventana(m, port, ahora_m):
+            continue   # ese medio no corre a esta hora
+        slug = _slug_portada(m["nombre"])
+        if _medio_listo(m, _dir_dia() / slug, tardia):
+            continue
+        try:
+            ult = datetime.fromisoformat(stamps.get(slug, "2000-01-01"))
+        except Exception:
+            ult = datetime(2000, 1, 1)
+        cada = _cada_efectivo(m, port, ahora)
+        if (ahora - ult).total_seconds() >= cada * 60:
+            return True    # falta alguno y ya le toca → corre
     return False
 
 
 def marcar_captura_portadas():
     est = cargar_json(ESTADO_PORTADAS, {})
     est["cap_last"] = datetime.now().isoformat()
-    ESTADO_PORTADAS.write_text(json.dumps(est))
+    _guardar_portadas(est)
 
 
 def toca_pdf_portadas(cfg: dict) -> bool:
@@ -1507,22 +2810,35 @@ def toca_limpia_portadas(cfg: dict) -> bool:
 def marcar_limpia_portadas():
     est = cargar_json(ESTADO_PORTADAS, {})
     est["limpia_fecha"] = datetime.now().strftime("%Y-%m-%d")
-    ESTADO_PORTADAS.write_text(json.dumps(est))
+    _guardar_portadas(est)
 
 
-def vista_portadas(sec: str) -> str:
-    """Tab Portadas: grid de las capturas del día por sección."""
+def vista_portadas(sec: str, dia: str = "") -> str:
+    """Tab Portadas: grid de las capturas por sección; ?dia=oct/06
+    navega subcarpetas para cotejar un día contra otro."""
     cfg = json.loads(CONFIG.read_text())
     port = cfg.get("portadas", {})
     medios = [m for m in port.get("medios", [])
               if m.get("seccion", "nacional") == sec]
     ultima = cargar_json(ESTADO_PORTADAS, {}).get("pdf_fecha", "")
-    # PDFs locales por sección, el más nuevo primero — archivo visible
-    pdfs = sorted(PORTADAS_DIR.glob(f"portadas_{sec}_*.pdf"), reverse=True) \
-        if PORTADAS_DIR.exists() else []
+    # día seleccionado (?dia=oct/06) — default hoy
+    dia_sel = dia if re.fullmatch(r"[a-z]{3}/\d{2}", dia) \
+        else str(_dir_dia().relative_to(PORTADAS_DIR))
+    dir_sel = PORTADAS_DIR / dia_sel
+    dias = sorted((f"{m.name}/{d.name}"
+                   for m in PORTADAS_DIR.iterdir() if m.is_dir()
+                   for d in m.iterdir() if d.is_dir()),
+                  key=lambda x: (PORTADAS_DIR / x).stat().st_mtime,
+                  reverse=True) if PORTADAS_DIR.exists() else []
+    tabs_dia = ("<div class='tabs-cat'>" + "".join(
+        f"<a class='tab-cat{' on' if d == dia_sel else ''}' "
+        f"href='/portadas?sec={sec}&dia={d}'>{d}</a>" for d in dias)
+        + "</div>") if dias else ""
+    pdfs = sorted(dir_sel.glob(f"portadas_{sec}_*.pdf"), reverse=True) \
+        if dir_sel.exists() else []
     links_pdf = "".join(
-        f"<a class='tab-cat' href='/portadas/{p.name}' target='_blank'>"
-        f"{p.stem.rsplit('_', 1)[-1]}</a>" for p in pdfs)
+        f"<a class='tab-cat' href='/portadas/{dia_sel}/{p.name}' "
+        f"target='_blank'>{p.stem.rsplit('_', 1)[-1]}</a>" for p in pdfs)
     tabs = ("<div class='tabs-cat'>"
             + f"<a class='tab-cat{' on' if sec != 'tabasco' else ''}' "
               "href='/portadas'>Nacional</a>"
@@ -1531,11 +2847,12 @@ def vista_portadas(sec: str) -> str:
     cards = ""
     for m in medios:
         slug = _slug_portada(m["nombre"])
-        img_f = _portada_img(slug)
-        web_f = PORTADAS_DIR / f"{slug}-web.png"
+        img_f = _portada_img(slug, dir_sel)
+        web_f = dir_sel / f"{slug}-web.png"
         tag = lambda p, rotulo: (
             f"<span class='meta'>{rotulo}</span>"
-            f"<img src='/portadas/{p.name}?v={ultima}' loading='lazy' "
+            f"<img src='/portadas/{dia_sel}/{p.name}?v={ultima}' "
+            "loading='lazy' "
             "style='width:100%;border-radius:6px;margin:.15rem 0 .4rem'>"
             if p.exists() else "")
         img = (tag(img_f, "Impresa") + tag(web_f, "Web")
@@ -1552,10 +2869,133 @@ def vista_portadas(sec: str) -> str:
                  if links_pdf
                  else "<p class='meta'>Sin PDFs todavía — "
                       "se generan cada mañana.</p>")
-    return (f"<h1>Portadas — {sec.title()}</h1>{tabs}"
+    return (f"<h1>Portadas — {sec.title()} — {dia_sel}</h1>"
+            f"{tabs}{tabs_dia}"
             f"<p class='meta'>Capturas del {ultima or '—'} · se regeneran a "
             f"las {html.escape(port.get('hora', '06:30'))}.</p>"
             + pdf_block + cards)
+
+
+def aplicar_accion_horarios(form: dict) -> str:
+    """POST /horarios: CRUD de medios de portadas — nombre, sección,
+    tipo de origen (web/kiosko/edicion/json/fb/issuu/flip/pr/pdf),
+    URL/slug, cap_desde/cap_hasta, cada_min, regla; alta con campos n_*
+    y baja con del{i}. Regenera schedule.html."""
+    cfg = json.loads(CONFIG.read_text())
+    medios = cfg.get("portadas", {}).get("medios", [])
+    hhmm = re.compile(r"^\d{1,2}:\d{2}$")
+    CLAVES_ORIGEN = ("kiosko", "edicion", "json", "fb", "issuu", "flip",
+                     "calameo", "pr", "flowpaper")
+
+    def pone_hora(m, campo, clave):
+        if campo not in form:
+            return
+        v = form[campo][0].strip()
+        if v and hhmm.match(v):
+            m[clave] = v
+        else:
+            m.pop(clave, None)
+
+    def pone_origen(m, tipo, valor):
+        """tipo select: web/pdf → url; el resto → su clave de estrategia.
+        Limpia las demás claves de origen para no mezclar métodos."""
+        valor = valor.strip()
+        for k in CLAVES_ORIGEN + ("pdf",):
+            if k != tipo:
+                m.pop(k, None)
+        if tipo == "web":
+            if valor:
+                m["url"] = valor
+        elif tipo == "pdf":
+            m["pdf"] = True
+            if valor:
+                m["url"] = valor
+        else:
+            # kiosko/issuu guardan slug — si pegan URL completa se
+            # extrae (kiosko: .../mx_reforma.html → mx_reforma;
+            # issuu: issuu.com/handle → handle). fb/flip/pr sí son
+            # URLs completas y se guardan tal cual.
+            if tipo in ("kiosko", "issuu") and "/" in valor:
+                valor = valor.rstrip("/").rsplit("/", 1)[-1]
+                valor = valor.removesuffix(".html")
+            if valor:
+                m[tipo] = valor
+            if tipo == "fb" and not m.get("url"):
+                # fb necesita url para el fallback/registro — usa la
+                # misma fanpage si no hay sitio
+                m["url"] = valor
+
+    nuevos, borrados = [], 0
+    for i, m in enumerate(medios):
+        if form.get(f"del{i}", [""])[0] == "1":
+            borrados += 1
+            continue   # no se agrega a nuevos = borrado
+        if f"n{i}" in form and form[f"n{i}"][0].strip():
+            m["nombre"] = form[f"n{i}"][0].strip()[:80]
+        if f"s{i}" in form and form[f"s{i}"][0] in ("nacional", "tabasco"):
+            m["seccion"] = form[f"s{i}"][0]
+        pone_hora(m, f"d{i}", "cap_desde")
+        pone_hora(m, f"h{i}", "cap_hasta")
+        if f"c{i}" in form:
+            # tolerante: "30", "30 min", "cada 30" → 30; solo un número
+            # válido 5–240 guarda, lo demás restaura el default
+            num = re.search(r"\d+", form[f"c{i}"][0])
+            if num and 5 <= int(num.group()) <= 240:
+                m["cada_min"] = int(num.group())
+            else:
+                m.pop("cada_min", None)
+        if f"t{i}" in form:
+            tipo = form[f"t{i}"][0]
+            if tipo in ("web", "pdf") + CLAVES_ORIGEN:
+                pone_origen(m, tipo, form.get(f"o{i}", [""])[0])
+        elif f"o{i}" in form:
+            # form sin select de tipo: actualiza el campo vivo
+            v = form[f"o{i}"][0].strip()
+            for k in CLAVES_ORIGEN:
+                if m.get(k):
+                    if v:
+                        m[k] = v
+                    else:
+                        m.pop(k, None)
+                    break
+            else:
+                if v:
+                    m["url"] = v
+        if f"r{i}" in form:
+            r = form[f"r{i}"][0].strip()
+            if r:
+                m["regla"] = r[:200]
+            else:
+                m.pop("regla", None)
+        nuevos.append(m)
+    medios[:] = nuevos
+
+    # alta: nueva fuente desde el form n_*
+    if form.get("n_nombre", [""])[0].strip():
+        tipo = form.get("n_tipo", ["web"])[0]
+        origen = form.get("n_origen", [""])[0].strip()
+        nuevo = {"nombre": form["n_nombre"][0].strip()[:80],
+                 "seccion": form.get("n_sec", ["nacional"])[0]
+                 if form.get("n_sec", [""])[0] in ("nacional", "tabasco")
+                 else "nacional",
+                 "url": origen}
+        pone_origen(nuevo, tipo, origen)
+        for campo, clave in (("n_desde", "cap_desde"),
+                             ("n_hasta", "cap_hasta")):
+            v = form.get(campo, [""])[0].strip()
+            if v and hhmm.match(v):
+                nuevo[clave] = v
+        c = re.search(r"\d+", form.get("n_cada", [""])[0])
+        if c and 5 <= int(c.group()) <= 240:
+            nuevo["cada_min"] = int(c.group())
+        r = form.get("n_regla", [""])[0].strip()
+        if r:
+            nuevo["regla"] = r[:200]
+        medios.append(nuevo)
+
+    CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+    escribir_schedule_portadas(cfg)
+    return f"Guardado ({borrados} borrados)"
 
 
 def detectar_desarrollo(cfg: dict, resumir: bool) -> int:
@@ -3846,7 +5286,8 @@ def vista_analitica() -> str:
 def render_pagina(contenido: str, q: str = "", base: str = "",
                   usuario: str = "") -> bytes:
     cfg = json.loads(CONFIG.read_text())
-    admin_tabs = ('<a href="/stats">Stats</a>'
+    admin_tabs = ('<a href="/horarios">Horarios</a>'
+                  '<a href="/stats">Stats</a>'
                   '<a href="/analitica">Analítica</a>'
                   if usuario and es_admin(usuario, cfg) else "")
     return PAGINA.format(contenido=contenido, q=html.escape(q),
@@ -4066,7 +5507,9 @@ def servir_web(puerto: int):
             return proto + "://" + self.headers.get(
                 "Host", f"localhost:{puerto}")
 
-        def _html(self, contenido: bytes, code: int = 200):
+        def _html(self, contenido, code: int = 200):
+            if isinstance(contenido, str):
+                contenido = contenido.encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -4084,7 +5527,10 @@ def servir_web(puerto: int):
             email = self._usuario()
             ip = self.headers.get("Cf-Connecting-Ip", "") or \
                 self.client_address[0]
-            if not ratelimit_ok(ip):
+            # autenticado = sesión firmada: el límite por IP es para
+            # anónimos/flood — un usuario logueado detrás de NAT
+            # compartido (oficina) no debe chocar con sus colegas
+            if not email and not ratelimit_ok(ip):
                 self._html("<h1 style='font-family:system-ui;padding:2rem'>"
                            "Demasiadas solicitudes — espera un minuto.</h1>"
                            .encode(), 429)
@@ -4165,16 +5611,49 @@ def servir_web(puerto: int):
                 msg = params.get("msg", [""])[0]
                 self._html(render_pagina(vista_fuentes(email, msg), base=base,
                                          usuario=email))
+            elif ruta.path in ("/schedule", "/schedule.html"):
+                doc = BASE / "schedule.html"
+                if doc.exists():
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "text/html; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(doc.read_bytes())
+                else:
+                    self.send_error(404)
+            elif ruta.path == "/horarios":
+                cfg_h = json.loads(CONFIG.read_text())
+                if not es_admin(email, cfg_h):
+                    self._html(render_pagina("<h1>Solo admin</h1>",
+                                             base=base, usuario=email),
+                               403)
+                else:
+                    # el editor es schedule.html — se regenera en cada
+                    # GET para que la línea de tiempo esté al momento
+                    escribir_schedule_portadas(cfg_h)
+                    doc = BASE / "schedule.html"
+                    if doc.exists():
+                        self.send_response(200)
+                        self.send_header("Content-Type",
+                                         "text/html; charset=utf-8")
+                        self.send_header("Cache-Control", "no-store")
+                        self.end_headers()
+                        self.wfile.write(doc.read_bytes())
+                    else:
+                        self.send_error(404)
             elif ruta.path == "/portadas":
                 sec = params.get("sec", ["nacional"])[0]
-                self._html(render_pagina(vista_portadas(sec), base=base,
-                                         usuario=email))
+                self._html(render_pagina(
+                    vista_portadas(sec, params.get("dia", [""])[0]),
+                    base=base, usuario=email))
             elif ruta.path.startswith("/portadas/"):
                 p = (PORTADAS_DIR / ruta.path.split("/", 2)[2]).resolve()
                 tipos = {".png": "image/png", ".jpg": "image/jpeg",
                          ".jpeg": "image/jpeg", ".pdf": "application/pdf"}
-                if p.parent == PORTADAS_DIR.resolve() and p.is_file() \
-                        and p.suffix in tipos:
+                raiz = PORTADAS_DIR.resolve()
+                if p.is_relative_to(raiz) and p != raiz \
+                        and p.is_file() and p.suffix in tipos:
                     self.send_response(200)
                     self.send_header("Content-Type", tipos[p.suffix])
                     self.send_header("Cache-Control", "max-age=300")
@@ -4353,6 +5832,26 @@ def servir_web(puerto: int):
                 self.end_headers()
                 return
 
+            if ruta.path == "/horarios":
+                email = self._usuario()
+                cfg_h = json.loads(CONFIG.read_text())
+                if not email or not es_admin(email, cfg_h):
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                msg = aplicar_accion_horarios(form)
+                if self.headers.get("X-Requested-With") == "fetch":
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "text/plain; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(msg.encode())
+                else:
+                    self.send_response(303)
+                    self.send_header("Location", "/schedule?msg="
+                                     + quote(msg))
+                    self.end_headers()
+                return
             if ruta.path in ("/config", "/fuentes", "/usuarios"):
                 email = self._usuario()
                 if not email:
@@ -4417,23 +5916,33 @@ def main():
             # recargar config cada ciclo: reglas editadas en el dashboard
             # aplican sin reiniciar
             cfg = json.loads(CONFIG.read_text())
+            # portadas primero: horas clavadas (00:30→06:45); revisar se
+            # atasca ~4 min barriendo 95 feeds y desfasaba el PDF
+            if toca_captura_portadas(cfg):
+                threading.Thread(target=capturar_portadas, args=(cfg,),
+                                 daemon=True, name="portadas").start()
+                marcar_captura_portadas()
+            if toca_pdf_portadas(cfg):
+                threading.Thread(target=generar_pdfs_portadas,
+                                 args=(cfg,), daemon=True,
+                                 name="portadas-pdf").start()
+            if toca_limpia_portadas(cfg):
+                limpiar_portadas()
+                marcar_limpia_portadas()
             with _LOCK_REVISAR:
                 revisar(cfg, args.todo, args.resumir)
-                # portadas: recolecta incremental 00:30→06:45, arma el
-                # PDF y lo envía a las 06:45, depura imágenes a las 19:00
-                if toca_captura_portadas(cfg):
-                    threading.Thread(target=capturar_portadas, args=(cfg,),
-                                     daemon=True, name="portadas").start()
-                    marcar_captura_portadas()
-                if toca_pdf_portadas(cfg):
-                    threading.Thread(target=generar_pdfs_portadas,
-                                     args=(cfg,), daemon=True,
-                                     name="portadas-pdf").start()
-                if toca_limpia_portadas(cfg):
-                    limpiar_portadas()
-                    marcar_limpia_portadas()
-            print(f"\n--- durmiendo {args.loop} min ---")
-            time.sleep(args.loop * 60)
+            # siesta adaptativa: en la ventana portadas (00:10→07:00)
+            # despierta cada 5 min — corridas, rampa de reintentos y el
+            # PDF de las 06:45 no se desfasan hasta 14 min con el loop
+            # fijo de 15; fuera de la zona conserva el ritmo normal
+            ahora_m = datetime.now().hour * 60 + datetime.now().minute
+            _p = cfg.get("portadas", {})
+            en_zona = (_hhmm(_p, "hora_desde", "00:30") - 20
+                       <= ahora_m
+                       < _hhmm(_p, "hora_pdf", "06:45") + 15)
+            siesta = 5 if en_zona else args.loop
+            print(f"\n--- durmiendo {siesta} min ---")
+            time.sleep(siesta * 60)
     else:
         n = revisar(cfg, args.todo, args.resumir)
         print(f"\nTotal alertas: {n}")
@@ -4441,30 +5950,7 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-    sys.exit(main())
-
 if __name__ == "__main__":
     sys.exit(main())
-    sys.exit(main())
-    sys.exit(main())
-    sys.exit(main())
-
 if __name__ == "__main__":
-    sys.exit(main())
-    sys.exit(main())
-    sys.exit(main())
-    sys.exit(main())
-    sys.exit(main())
-
-if __name__ == "__main__":
-    sys.exit(main())
-    sys.exit(main())
-    sys.exit(main())
-    sys.exit(main())
-    sys.exit(main())
-    sys.exit(main())
-    sys.exit(main())
-
-if __name__ == "__main__":
-    sys.exit(main())
     sys.exit(main())
