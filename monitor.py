@@ -556,24 +556,7 @@ def generar_sintesis(cfg: dict, franja: str) -> str:
         desde = ahora.replace(hour=15, minute=0, second=0)
     else:   # vespertina
         desde = ahora.replace(hour=9, minute=0, second=0)
-    noticias = [n for n in leer_jsonl(NOTICIAS, limite=0)
-                if n.get("fecha", "") >= desde.isoformat()]
-    noticias.sort(key=lambda n: n["fecha"])
-    # la síntesis resume SOLO lo de la lista de interés — interés y
-    # columnas dependen únicamente de las palabras clave (regla del
-    # usuario); una columna que mencione al TSJ entra por coincide
-    sel = _dedup_notas(
-        [n for n in noticias if coincide_interes(n)])[:60]
-    # franja pobre (<5 notas) → la ventana se extiende hasta 72 h para
-    # que la síntesis no salga vaga: cubre 'lo reciente de interés'
-    todas = noticias
-    while len(sel) < 5 and len(todas) < 5000:
-        desde = desde - timedelta(hours=12)
-        todas = [n for n in leer_jsonl(NOTICIAS, limite=0)
-                 if n.get("fecha", "") >= desde.isoformat()]
-        todas.sort(key=lambda n: n["fecha"])
-        sel = _dedup_notas(
-            [n for n in todas if coincide_interes(n)])[:60]
+    sel = _sel_interes_extendida(desde)
     if not sel:
         return ""
     lineas = "\n".join(
@@ -626,6 +609,81 @@ def generar_sintesis(cfg: dict, franja: str) -> str:
             "notas": [{"f": n.get("fuente", ""),
                        "t": n.get("titulo", ""),
                        "u": n.get("link", "")} for n in sel]},
+            ensure_ascii=False) + "\n")
+    return texto
+
+
+def _sel_interes_extendida(desde: datetime) -> list:
+    """Notas de la lista de interés desde 'desde', deduplicadas; si hay
+    <5 la ventana se extiende hacia atrás (72 h máx.) para no salir
+    vaga — misma regla para síntesis y monólogo."""
+    sel = _dedup_notas(
+        [n for n in leer_jsonl(NOTICIAS, limite=0)
+         if n.get("fecha", "") >= desde.isoformat()
+         and coincide_interes(n)])[:60]
+    intentos = 0
+    while len(sel) < 5 and intentos < 6:
+        intentos += 1
+        desde = desde - timedelta(hours=12)
+        sel = _dedup_notas(
+            [n for n in leer_jsonl(NOTICIAS, limite=0)
+             if n.get("fecha", "") >= desde.isoformat()
+             and coincide_interes(n)])[:60]
+    return sel
+
+
+def generar_cierre(cfg: dict) -> str:
+    """CIERRE DIARIO — solo on-demand (botón admin, /resumenes).
+    Monólogo de host repasando lo de interés del día; cada segmento
+    cierra con [N#] → misma trazabilidad que la síntesis."""
+    if _mem_disponible_gb() < 4:
+        return ""
+    ahora = datetime.now()
+    sel = _sel_interes_extendida(ahora.replace(hour=0, minute=0,
+                                             second=0))[:15]
+    if not sel:
+        return ""
+    lineas = "\n".join(
+        f"- [N{i+1}|{n.get('categoria', '')}|{n['fuente']}] "
+        f"{n['titulo']}"
+        + (f" — {n['resumen'][:280]}" if n.get("resumen") else "")
+        for i, n in enumerate(sel))
+    prompt = (
+        "Eres el host de un talk show nocturno mexicano. Escribe el "
+        "MONÓLOGO de cierre del día repasando lo más "
+        "relevante del poder judicial de Tabasco, usando SOLO estas "
+        "notas:\n" + lineas + "\n\n"
+        "Reglas:\n"
+        "- Tono: ingenioso, irónico ligero, ritmo de comedia en vivo — "
+        "pero CADA remate queda anclado en el hecho real de la nota.\n"
+        "- PROHIBIDO inventar datos, citas, cifras o personajes que no "
+        "estén en las notas.\n"
+        "- De 6 a 10 segmentos, párrafos cortos de 2-3 líneas, como "
+        "script hablado.\n"
+        "- Cierra cada segmento con [N#] — el número de la nota que lo "
+        "justifica.\n"
+        "- Sin títulos ni subtítulos: es un monólogo continuo. "
+        "Remata con un cierre breve de despedida."
+    )
+    try:
+        r = requests.post(
+            cfg["ollama"]["url"],
+            json={"model": cfg["ollama"]["modelo"], "prompt": prompt,
+                  "stream": False},
+            timeout=480)
+        texto = r.json().get("response", "").strip()
+    except Exception:
+        return ""
+    if not texto or texto.startswith("(no se pudo"):
+        return ""
+    with open(SINTESIS, "a", encoding="utf-8") as f:
+        f.write(json.dumps(
+            {"fecha": ahora.isoformat(timespec="seconds"),
+             "franja": "cierre", "texto": texto,
+             "n_notas": len(sel),
+             "notas": [{"f": n.get("fuente", ""),
+                        "t": n.get("titulo", ""),
+                        "u": n.get("link", "")} for n in sel]},
             ensure_ascii=False) + "\n")
     return texto
 
@@ -785,6 +843,40 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
         etag = st.get("etag")
         if fuente.get("tipo") == "telegram":
             entradas = fetch_telegram(fuente["canal"])
+        elif fuente.get("tipo") == "wpjson":
+            # WordPress REST API — para medios con RSS muerto o listados
+            # JS (En Cambio /opinion/). Fuente.url = endpoint posts con
+            # categories/per_page/_fields ya armados
+            try:
+                r = requests.get(fuente["url"], timeout=15,
+                                 headers={"User-Agent": agent})
+                posts = r.json() if r.status_code == 200 else []
+            except Exception as e:
+                st["err"] += 1
+                print(f"[!] {fuente['nombre']}: error de red ({e})")
+                continue
+            if not posts:
+                st["err"] += 1
+                print(f"[!] {fuente['nombre']}: wp-json sin posts")
+                continue
+            entradas = []
+            for p in posts:
+                try:
+                    pp = time.gmtime(time.mktime(time.strptime(
+                        p.get("date", ""), "%Y-%m-%dT%H:%M:%S")))
+                except Exception:
+                    pp = None
+                entradas.append({
+                    "link": p.get("link", ""),
+                    "title": html.unescape(re.sub(
+                        r"<[^>]+>", "",
+                        p.get("title", {}).get("rendered", ""))),
+                    "summary": re.sub(
+                        r"<[^>]+>", " ",
+                        p.get("excerpt", {}).get("rendered", "")),
+                    "published_parsed": pp})
+            st["ok"] += 1
+            st["ultimo_ok"] = datetime.now().isoformat(timespec="seconds")
         elif fuente.get("tipo") == "html":
             try:
                 headers = {"User-Agent": agent}
@@ -1531,34 +1623,41 @@ def _bajar_portada_fb(m: dict) -> list:
             fechas = (normalizar(fecha_txt),              # 5 de octubre
                       normalizar(fecha_txt.replace(
                           str(hoy.day), f"{hoy.day:02d}")))  # 05 de octubre
+            if _post_viejo(txt):
+                continue
             if re.search(r"portada|primera plana|edici[oó]n|bolet[ií]n",
                          txt) and \
                     (reciente or any(f in txt for f in fechas)
                      or re.search(r'\bhoy\b', txt)):
-                candidata = post["href"]
-                txt_sel = post["txt"]
+                cand.append((post["href"], post["txt"]))
                 por_texto = True
-                break
+                continue
             # fb_primero: la página sube la portada como PRIMER post con
             # foto de la madrugada, sin texto identificable (XEVT)
-            if m.get("fb_primero") and not candidata and reciente:
-                candidata = post["href"]
-                txt_sel = post["txt"]
+            if m.get("fb_primero") and not cand and reciente:
+                cand.append((post["href"], post["txt"]))
     except Exception:
         return []
-    if not candidata:
+    if not cand:
         return []
-    # un post con N fotos queda repartido en varios links /photo que
-    # comparten el texto del artículo — juntar todos sus fbid (TAD mete
-    # las 2 planas en el mismo post; el candidato solo trae una)
-    cands = [candidata]
-    if "fbid=" in candidata:
-        cands += [p["href"] for p in posts
-                  if p["txt"] == txt_sel and p["href"] != candidata
-                  and "fbid=" in p["href"]
-                  and "&set=a." not in p["href"]]
+    print(f"[fb] {m['nombre']}: {len(cand)} post(s) → {cand[0][1][:90]}")
+    # un post con N fotos se reparte en varios links /photo que
+    # comparten el texto del artículo — juntar los fbid de CADA post
+    # candidato (TAD a veces mete las 2 planas en el mismo post y
+    # otras en posts separados)
+    cands = []
+    for href, txt_sel in cand:
+        if href not in cands:
+            cands.append(href)
+        if "fbid=" in href:
+            for p_ in posts:
+                if p_["txt"] == txt_sel and p_["href"] != href \
+                        and "fbid=" in p_["href"] \
+                        and "&set=a." not in p_["href"] \
+                        and p_["href"] not in cands:
+                    cands.append(p_["href"])
     imgs = []
-    for u in cands[:4]:
+    for u in cands[:6]:
         for b in _imagenes_fb_post(u):
             if len(imgs) < 4 and b not in imgs:
                 imgs.append(b)
@@ -2262,18 +2361,17 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
                 pass
         if data:
             base.with_suffix(".png").unlink(missing_ok=True)
-            ayer_dir = _dir_dia(datetime.now() - timedelta(days=1))
             n_ok = 0
             for i, d in enumerate(data):
                 nom = base.name if i == 0 else f"{base.name}-{i + 1}"
                 f = base.parent / f"{nom}.jpg"
                 # kiosko a veces sirve la portada de AYER bajo la URL de
-                # hoy — bytes idénticos a la de ayer = no es edición
-                # nueva; FB la re-encodea (bytes cambian) → comparar
-                # también visual a 64×64 (CORAT/XHVX repitieron la del
-                # jueves posteada a las 23h)
-                ayer = ayer_dir / f.name
-                if ayer.exists() and ayer.read_bytes() == d:
+                # hoy — bytes idénticos a la ÚLTIMA edición conocida =
+                # no es edición nueva; FB la re-encodea (bytes cambian)
+                # → comparar también visual a 64×64 (CORAT/XHVX
+                # repitieron la del jueves posteada a las 23h)
+                ayer = _ultima_img_previa(f.stem)
+                if ayer is not None and ayer.read_bytes() == d:
                     continue
                 f.write_bytes(d)
                 # filtro de forma solo para FB (puede colar flyers
@@ -2434,18 +2532,29 @@ def _es_portada(b: bytes) -> bool:
         return False
 
 
+def _ultima_img_previa(nombre_base: str):
+    """Última imagen de este medio en días anteriores — camina hasta 10
+    días hacia atrás. Si ayer no se capturó NADA (medio sin edición el
+    sábado), su última portada conocida queda en anteayer — comparar
+    contra ella evita aceptar la misma edición como 'nueva' al día
+    siguiente."""
+    for i in range(1, 11):
+        d = _dir_dia(datetime.now() - timedelta(days=i))
+        for ext in (".jpg", ".png"):
+            f = d / f"{nombre_base}{ext}"
+            if f.exists():
+                return f
+    return None
+
+
 def _misma_img_ayer(nuevo: Path, nombre_base: str) -> bool:
     """True si la imagen recién capturada es visualmente la misma que
-    la de AYER — PressReader muestra la edición de ayer hasta la 1am:
-    comparar píxeles a 64x64 grises (los PNG/JPG nunca son
-    byte-idénticos entre estrategias)."""
-    ayer_dir = _dir_dia(datetime.now() - timedelta(days=1))
-    ayer = None
-    for ext in (".jpg", ".png"):
-        f = ayer_dir / f"{nombre_base}{ext}"
-        if f.exists():
-            ayer = f
-            break
+    la ÚLTIMA edición conocida — PressReader muestra la edición de ayer
+    hasta la 1am; y un medio que no publicó ayer (sin archivo en el
+    dir de ayer) no debe colar su portada vieja como nueva: comparar
+    píxeles a 64x64 grises (los PNG/JPG nunca son byte-idénticos entre
+    estrategias)."""
+    ayer = _ultima_img_previa(nombre_base)
     if ayer is None or not nuevo.exists():
         return False
     try:
@@ -3548,6 +3657,8 @@ PAGINA = """<!DOCTYPE html>
   nav {{ background: #1a237e; color: #fff; padding: .7rem 1rem .5rem;
         position: sticky; top: 0; z-index: 10; }}
   .nav-top {{ display: flex; align-items: center; gap: .8rem; }}
+  .nav-user {{ color: #9fa8da; font-size: .85rem; margin-left: auto;
+      margin-right: .4rem; }}
   nav .logo {{ font-weight: 800; font-size: 1.35rem; letter-spacing: .02em;
               color: #fff; text-decoration: none; }}
   .nav-tabs {{ display: flex; gap: .1rem; margin-top: .5rem;
@@ -3814,16 +3925,14 @@ PAGINA = """<!DOCTYPE html>
       <input type="text" name="q" placeholder="buscar nota..." value="{q}">
       <button>Buscar</button>
     </form>
+    <span class="nav-user" title="{usuario}">{usuario_html}</span>
     <a href="/salir" class="salir-top" title="Cerrar sesión">salir</a>
   </div>
   <div class="nav-tabs">
     <a href="/noticias">Noticias</a>
     <a href="/alertas">Alertas</a>
     <a href="/portadas">Portadas</a>
-    <a href="/columnas">Columnas</a>
-    <a href="/interes">Interés</a>
-    <a href="/resumenes">Resúmenes</a>
-    <a href="/fuentes">Fuentes</a>
+    {tabs_reg}
     {admin_tabs}
   </div>
 </nav>
@@ -4337,7 +4446,10 @@ def vista_columnas(email: str) -> str:
         pw = "<span class='col-pay'>suscripción</span>" if paywall else ""
         hits = ", ".join(_interes_match(n))
         kw = (f"<span style='font-size:.65rem;color:#2e7d32'>"
-              f"encontró: {html.escape(hits)}</span>" if hits else "")
+              f"encontró: {html.escape(hits)}</span>" if hits
+              else "<span style='font-size:.62rem;color:#bbb;"
+                   "border:1px solid #ddd;border-radius:8px;"
+                   "padding:0 5px'>irrelevante</span>")
         return (f"<a class='col-fila' "
                 f"href='/nota?u={quote(n['link'], safe='')}'"
                 f"><span class='col-fecha'>{fmt_fecha(n['fecha'])}</span>"
@@ -4348,13 +4460,13 @@ def vista_columnas(email: str) -> str:
     bloques = []
     for f in cols:
         _vl = set()
-        # solo entregas de la lista de interés — la sección Columnas
-        # depende únicamente de las palabras clave, igual que Interés
+        # TODAS las entregas de la columna — coincide_interes aquí
+        # solo alimenta el chip 'encontró:'; filtrar vaciaba la
+        # sección porque las columnas son opinión política nacional
         entradas = [n for n in sorted(
             por_col.get(f["nombre"], []),
             key=lambda n: n["fecha"], reverse=True)
-            if coincide_interes(n)
-            and not (n["link"] in _vl or _vl.add(n["link"]))]
+            if not (n["link"] in _vl or _vl.add(n["link"]))]
         ultima = fmt_fecha(entradas[0]["fecha"]) if entradas \
             else "sin capturas aún"
         medio = f["nombre"].split("·")[-1].strip()
@@ -4700,7 +4812,8 @@ def vista_resumenes(email: str, msg: str = "") -> str:
         franja = e.get("franja", "")
         badge = ("<span style='background:#1a237e;color:#fff;padding:2px 8px;"
                  "border-radius:10px;font-size:.7rem'>"
-                 + franja.upper() + "</span>")
+                 + {"cierre": "CIERRE DIARIO"}.get(
+                     franja, franja.upper()) + "</span>")
         notas_ref = e.get("notas", [])
         cuerpo = ""
         _toks_vistos = []   # dedup de bullets al render — las síntesis
@@ -4744,11 +4857,20 @@ def vista_resumenes(email: str, msg: str = "") -> str:
                            f"border-left:3px solid #e0e0e0'>• {txt}"
                            f"{chip}</p>")
             else:
+                # párrafos también pueden cerrar con [N#] (monólogo)
+                m_id = re.search(r"\[N(\d+)(?:\|[^\]]*)?\]\s*$", p)
+                nota_idx = None
+                if m_id:
+                    p = p[:m_id.start()].rstrip()
+                    k = int(m_id.group(1)) - 1
+                    if 0 <= k < len(notas_ref):
+                        nota_idx = notas_ref[k]
                 txt = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>",
                              html.escape(p))
+                chip = (_chip_nota(nota_idx) if nota_idx
+                        else _link_nota(p, notas_ref))
                 cuerpo += (f"<p style='margin:.35rem 0'>"
-                           f"{_resaltar_interes(txt)}"
-                           f"{_link_nota(p, notas_ref)}</p>")
+                           f"{_resaltar_interes(txt)}{chip}</p>")
         fuentes = sorted({n.get("f", "") for n in notas_ref} - {""})
         detalle = ""
         if fuentes:
@@ -4766,9 +4888,13 @@ def vista_resumenes(email: str, msg: str = "") -> str:
             + "<p class='meta'>Resumen ejecutivo generado con IA — "
               "matutina 9:00 h, vespertina 15:00 h y nocturna "
               "21:00 h.</p>"
-            + "<form method='post' action='/resumenes/generar' "
-              "style='margin-bottom:1rem'>"
-              "<button class='btn-linea'>Generar ahora</button></form>"
+            + ("<form method='post' action='/resumenes/generar' "
+               "style='margin-bottom:1rem;display:flex;gap:.5rem'>"
+               "<button class='btn-linea'>Generar ahora</button>"
+               "<button class='btn-linea' name='franja' value='cierre'>"
+               "Cierre diario</button></form>"
+               if es_admin(email, json.loads(CONFIG.read_text()))
+               else "")
             + (cards or "<p>Aún no hay síntesis — la primera sale a las "
                         "9:00 h.</p>"))
 
@@ -6216,8 +6342,27 @@ def render_pagina(contenido: str, q: str = "", base: str = "",
                   '<a href="/stats">Stats</a>'
                   '<a href="/analitica">Analítica</a>'
                   if usuario and es_admin(usuario, cfg) else "")
+    # guests (demo 24h): solo noticias/alertas/portadas — el producto
+    # judicial (interés, columnas, síntesis, fuentes) es de pago
+    tabs_reg = ('<a href="/columnas">Columnas</a>'
+                '<a href="/interes">Interés</a>'
+                '<a href="/resumenes">Resúmenes</a>'
+                '<a href="/fuentes">Fuentes</a>'
+                if "@demo.local" not in usuario else "")
+    # nombre en el header: perfil 'nombre' si lo trae, si no el
+    # local-part del email (paolo@… → paolo); guest → invitado
+    if usuario:
+        if "@demo.local" in usuario:
+            nombre_u = "invitado"
+        else:
+            nombre_u = ((cargar_usuarios().get(usuario) or {})
+                        .get("nombre") or usuario.split("@")[0])
+    else:
+        nombre_u = ""
     return PAGINA.format(contenido=contenido, q=html.escape(q),
-                         base=base, admin_tabs=admin_tabs).encode()
+                         base=base, admin_tabs=admin_tabs,
+                         tabs_reg=tabs_reg, usuario=html.escape(usuario),
+                         usuario_html=html.escape(nombre_u)).encode()
 
 
 def aplicar_accion_fuentes(form: dict, email: str):
@@ -6470,6 +6615,15 @@ def servir_web(puerto: int):
                     self.headers.get("Referer", ""),
                     params.get("q", [""])[0] if ruta.path == "/buscar"
                     else "")
+            # invitados demo: sin secciones del producto judicial —
+            # escribir la URL a mano no las abre
+            if (email and "@demo.local" in email
+                    and ruta.path in ("/interes", "/columnas",
+                                      "/resumenes", "/fuentes")):
+                self.send_response(303)
+                self.send_header("Location", "/noticias")
+                self.end_headers()
+                return
             if not email and ruta.path == "/":
                 # anónimo en la raíz: la landing es la cara del producto
                 self._html(vista_landing(base))
@@ -6775,18 +6929,28 @@ def servir_web(puerto: int):
 
             if ruta.path == "/resumenes/generar":
                 email = self._usuario()
-                if not email:
+                if not email or "@demo.local" in email:
                     self.send_response(303)
-                    self.send_header("Location", "/")
+                    self.send_header("Location", "/noticias")
                     self.end_headers()
                     return
                 cfg_s = json.loads(CONFIG.read_text())
-                h = datetime.now().hour
-                franja = ("matutina" if h < 9 else
-                          "vespertina" if h < 15 else "nocturna")
-                threading.Thread(target=generar_sintesis,
-                                 args=(cfg_s, franja), daemon=True,
-                                 name="sintesis").start()
+                if not es_admin(email, cfg_s):
+                    self.send_response(303)
+                    self.send_header("Location", "/resumenes")
+                    self.end_headers()
+                    return
+                if form.get("franja", [""])[0] == "cierre":
+                    threading.Thread(target=generar_cierre,
+                                     args=(cfg_s,), daemon=True,
+                                     name="cierre").start()
+                else:
+                    h = datetime.now().hour
+                    franja = ("matutina" if h < 9 else
+                              "vespertina" if h < 15 else "nocturna")
+                    threading.Thread(target=generar_sintesis,
+                                     args=(cfg_s, franja), daemon=True,
+                                     name="sintesis").start()
                 self.send_response(303)
                 self.send_header(
                     "Location",
