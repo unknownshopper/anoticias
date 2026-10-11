@@ -54,7 +54,7 @@ ESTADO_FUENTES = BASE / "fuentes_estado.json"  # salud por feed (stats)
 USUARIOS = BASE / "usuarios.json"    # reglas + fuentes ocultas + expira, por email
 ACTIVIDAD = BASE / "actividad.jsonl"  # {ts, email, ruta} por cada página vista
 SECRET = BASE / "secret.txt"    # llave HMAC para firmar cookies de sesión
-OG_PNG = BASE / "og.png"        # tarjeta de preview para compartir links
+OG_PNG = BASE / "brand" / "port02.jpeg"  # tarjeta de preview para compartir links
 PORTADAS_DIR = BASE / "portadas"  # PNGs del día + PDFs por sección
 ESTADO_PORTADAS = BASE / "portadas_estado.json"  # {"fecha": YYYY-MM-DD}
 MAX_NOTICIAS = 2000
@@ -148,6 +148,14 @@ def password_valida(email: str, pw: str, cfg: dict) -> bool:
     if not esperado and es_admin(email, cfg):
         esperado = hash_password(cfg.get("admin_password", ""))
     return bool(esperado) and hmac.compare_digest(esperado, hash_password(pw))
+
+
+def home_usuario(email: str) -> str:
+    """Landing del perfil — 'home' en usuarios.json (p. ej. '/interes'
+    para quien solo consume la lista judicial). Solo rutas internas."""
+    home = (cargar_usuarios().get(email) or {}).get("home", "")
+    return home if home.startswith("/") and not home.startswith("//") \
+        else "/noticias"
 
 
 def resolver_usuario(headers, cfg: dict) -> str:
@@ -414,14 +422,38 @@ def extraer_og_image(link: str) -> str:
     return ""
 
 
+def extraer_og_desc(link: str) -> str:
+    """og:description de la nota — el lede real. Para columnas cuyo
+    resumen RSS es boilerplate ('Templo Mayor 2026-10-09 · Reforma')."""
+    try:
+        r = requests.get(link, timeout=10,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        m = re.search(
+            r'<meta[^>]+property=["\']og:description["\']'
+            r'[^>]+content=["\']([^"\']+)', r.text
+        ) or re.search(
+            r'<meta[^>]+content=["\']([^"\']+)["\']'
+            r'[^>]+property=["\']og:description["\']', r.text)
+        if m:
+            return re.sub(r"<[^>]+>", "",
+                          html.unescape(m.group(1))).strip()
+    except Exception:
+        pass
+    return ""
+
+
 def coincide(texto: str, regla: dict) -> bool:
-    """True si TODAS las palabras/frases de la regla aparecen en el texto.
-    Cada palabra admite sinónimos con '/': 'villahermosa/tabasco'
-    cuenta como un término que matchea cualquiera de las variantes."""
+    """Match flexible: con 3+ términos basta que aparezcan TODOS MENOS
+    UNO (la nota 'Pepín López Obrador' alerta la regla 'Ramiro, Obrador,
+    Pepin' aunque falte 'Ramiro'). Con 1-2 términos se exigen todos.
+    '/' sigue siendo sinónimos dentro de un término."""
     t = normalizar(texto)
-    return all(
-        any(normalizar(v) in t for v in p.split("/"))
-        for p in regla["requiere_todas"])
+    palabras = regla["requiere_todas"]
+    hits = sum(1 for p in palabras
+               if any(normalizar(v) in t for v in p.split("/")))
+    min_hits = len(palabras) if len(palabras) <= 2 \
+        else len(palabras) - 1
+    return hits >= min_hits
 
 
 def fetch_telegram(canal: str) -> list:
@@ -463,9 +495,194 @@ def resumir_ollama(cfg: dict, titulo: str, resumen: str) -> str:
         return f"(no se pudo resumir: {e})"
 
 
+def resumir_ollama_seguro(cfg, titulo, resumen) -> str:
+    """resumir_ollama con guard de memoria: evita cargar llama3.2 con
+    RAM al límite (el NUC se congeló así). Devuelve "" si no hay margen."""
+    if _mem_disponible_gb() < 4:
+        return ""
+    return resumir_ollama(cfg, titulo, resumen)
+
+
+def _mem_disponible_gb() -> float:
+    """GiB realmente disponibles (MemAvailable de /proc/meminfo).
+    El NUC se congeló cargando llama3.2 con ~3 GB libres y swap lleno —
+    con menos de 4 GB no se dispara Ollama y se reintenta luego."""
+    try:
+        for l in Path("/proc/meminfo").read_text().splitlines():
+            if l.startswith("MemAvailable:"):
+                return int(l.split()[1]) / 1048576
+    except Exception:
+        pass
+    return 99.0
+
+
+def _norm_titulo(t: str) -> set:
+    """Tokens del título sin acentos/puntuación — base del dedup de
+    notas repetidas (el mismo suceso redactado distinto por cada
+    medio)."""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", t or "")
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    return set(re.sub(r"[^a-z0-9]+", " ", t.lower()).split())
+
+
+def _dedup_notas(notas: list, umbral: float = 0.7) -> list:
+    """Quita notas cuyo título traslape ≥`umbral` (Jaccard) con otra ya
+    aceptada — la misma nota en 4 medios entraba 4 veces a la
+    síntesis."""
+    vistos, out = [], []
+    for n in notas:
+        toks = _norm_titulo(n.get("titulo", ""))
+        if toks and any(len(toks & v) / max(len(toks | v), 1) >= umbral
+                        for v in vistos):
+            continue
+        vistos.append(toks)
+        out.append(n)
+    return out
+
+
+def generar_sintesis(cfg: dict, franja: str) -> str:
+    """Síntesis ejecutiva de la franja con Ollama (llama3.2):
+    'matutina' cubre 21:00 de ayer → 09:00; 'vespertina' 09:00 →
+    15:00; 'nocturna' 15:00 → 21:00. Solo notas de la lista de
+    interés judicial (tope ~60 para no reventar el contexto del 3B)."""
+    if _mem_disponible_gb() < 4:
+        return ""   # sin margen para el modelo — reintenta en otro ciclo
+    ahora = datetime.now()
+    if franja == "matutina":
+        desde = (ahora - timedelta(days=1)).replace(
+            hour=21, minute=0, second=0)
+    elif franja == "nocturna":
+        desde = ahora.replace(hour=15, minute=0, second=0)
+    else:   # vespertina
+        desde = ahora.replace(hour=9, minute=0, second=0)
+    noticias = [n for n in leer_jsonl(NOTICIAS, limite=0)
+                if n.get("fecha", "") >= desde.isoformat()]
+    noticias.sort(key=lambda n: n["fecha"])
+    # la síntesis resume SOLO lo de la lista de interés — interés y
+    # columnas dependen únicamente de las palabras clave (regla del
+    # usuario); una columna que mencione al TSJ entra por coincide
+    sel = _dedup_notas(
+        [n for n in noticias if coincide_interes(n)])[:60]
+    # franja pobre (<5 notas) → la ventana se extiende hasta 72 h para
+    # que la síntesis no salga vaga: cubre 'lo reciente de interés'
+    todas = noticias
+    while len(sel) < 5 and len(todas) < 5000:
+        desde = desde - timedelta(hours=12)
+        todas = [n for n in leer_jsonl(NOTICIAS, limite=0)
+                 if n.get("fecha", "") >= desde.isoformat()]
+        todas.sort(key=lambda n: n["fecha"])
+        sel = _dedup_notas(
+            [n for n in todas if coincide_interes(n)])[:60]
+    if not sel:
+        return ""
+    lineas = "\n".join(
+        f"- [N{i+1}|{n.get('categoria', '')}|{n['fuente']}] "
+        f"{n['titulo']}"
+        + (f" — {n['resumen'][:280]}" if n.get("resumen") else "")
+        for i, n in enumerate(sel))
+    nombre = {"matutina": "matutina (lo ocurrido desde ayer 21:00)",
+              "vespertina": "vespertina (hoy 09:00 a 15:00)",
+              "nocturna": "nocturna — cierre del día "
+                          "(hoy 15:00 a 21:00)"}.get(
+                  franja, franja)
+    prompt = (
+        "Eres el analista de comunicación social del Poder Judicial del "
+        "Estado de Tabasco. Redacta la SÍNTESIS EJECUTIVA " + nombre +
+        " con estas notas, al estilo de un reporte profesional de "
+        "monitoreo de medios. Formato exacto:\n"
+        "- Subtítulos de sección en mayúsculas, en este orden y solo si "
+        "hay material REAL en las notas: PODER JUDICIAL DE TABASCO, "
+        "JUSTICIA Y SEGURIDAD EN TABASCO, COLUMNAS Y OPINIÓN.\n"
+        "- Bajo cada sección, UN bullet '•' por cada nota o tema "
+        "distinto — no agrupes varias notas en un bullet ni repitas la "
+        "misma en dos secciones. Cada bullet lleva el dato concreto: "
+        "quién, qué y dónde (nombre del actor y municipio/sala si "
+        "aparece). 2-3 líneas máximo por bullet.\n"
+        "- Cada bullet TERMINA con el identificador de la nota que lo "
+        "sustenta: [N#]. Si un tema junta varias notas, usa la "
+        "principal.\n"
+        "- REGLA DURA: usa SOLO los hechos literales de las notas. "
+        "PROHIBIDO inventar citas textuales, usuarios de redes "
+        "(@alguien), cifras, nombres o hechos. No escribas 'no se "
+        "tienen noticias' — si una sección no tiene material, omítela.\n"
+        "- Sin introducción ni cierre.\n\n" + lineas)
+    try:
+        r = requests.post(
+            cfg["ollama"]["url"],
+            json={"model": cfg["ollama"]["modelo"], "prompt": prompt,
+                  "stream": False},
+            timeout=480)
+        texto = r.json().get("response", "").strip()
+    except Exception:
+        return ""
+    if not texto or texto.startswith("(no se pudo"):
+        return ""
+    with SINTESIS.open("a") as f:
+        f.write(json.dumps({
+            "fecha": ahora.isoformat(timespec="seconds"),
+            "franja": franja, "texto": texto,
+            "n_notas": len(sel),
+            "notas": [{"f": n.get("fuente", ""),
+                       "t": n.get("titulo", ""),
+                       "u": n.get("link", "")} for n in sel]},
+            ensure_ascii=False) + "\n")
+    return texto
+
+
+def toca_sintesis(franja: str) -> bool:
+    """True si pasó la hora de la franja y aún no hay síntesis de hoy."""
+    ahora = datetime.now()
+    hora = {"matutina": 9, "vespertina": 15, "nocturna": 21}.get(
+        franja, 9)
+    if ahora.hour < hora:
+        return False
+    hoy = ahora.strftime("%Y-%m-%d")
+    return not any(e.get("franja") == franja
+                   and e.get("fecha", "").startswith(hoy)
+                   for e in leer_jsonl(SINTESIS))
+
+
 PATRON_NOTA_HTML = re.compile(
     r'<a[^>]+href=["\']([^"\']*/[^/"\']+/\d{3,}/[^/"\']+)["\'][^>]*>'
     r"(.*?)</a>", re.I | re.S)
+
+
+def resolver_link_gn(link: str) -> str:
+    """news.google.com/rss/articles/ID → URL real del medio.
+    GN solo ofrece el redirect JS; el batchexecute Fbv4je con la firma
+    y timestamp de la página devuelve el enlace directo. Falla → el
+    link original (mejor una tarjeta GN que nada)."""
+    try:
+        if "news.google.com/rss/articles/" not in link:
+            return link
+        art = link.split("articles/", 1)[1].split("?")[0]
+        s = requests.Session()
+        ua = {"User-Agent": "Mozilla/5.0"}
+        r = s.get(link, timeout=15, headers=ua)
+        sig = re.search(r'data-n-a-sg="([^"]+)"', r.text)
+        ts = re.search(r'data-n-a-ts="([^"]+)"', r.text)
+        if not (sig and ts):
+            return link
+        inner = json.dumps(["garturlreq", [
+            ["es-ES", "ES", ["FINANCE_TOP_INDICES", "WEB_TEST_1_0_0"],
+             None, None, 1, 1, "ES:es", None, 180, None, None, None,
+             None, None, 0, None, None, [int(ts.group(1)), 0]],
+            "es-ES", "ES", 1, [2, 3, 4, 8], 1, 0, "655000234", 0, 0,
+            None, 0], art, int(ts.group(1)), sig.group(1)])
+        freq = json.dumps([[["Fbv4je", inner, None, "generic"]]])
+        resp = s.post(
+            "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+            data={"f.req": freq}, timeout=15,
+            headers={**ua, "Content-Type":
+                     "application/x-www-form-urlencoded;charset=UTF-8",
+                     "Referer": link})
+        m = re.search(r'\\"garturlres\\",\\"(https?://[^"\\]+)', resp.text)
+        if not m:
+            m = re.search(r'"garturlres","(https?://[^"\\]+)', resp.text)
+        return m.group(1) if m else link
+    except Exception:
+        return link
 
 
 def extraer_notas_html(doc: str, base: str) -> list:
@@ -624,6 +841,9 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
             link = entrada.get("link", "")
             if not link or link in vistos:
                 continue
+            solo_l = fuente.get("solo_link")
+            if solo_l and not re.search(solo_l, link):
+                continue
             vistos[link] = time.time()
             nuevas += 1
 
@@ -651,12 +871,29 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
             if ign and re.search(ign, titulo, re.I):
                 continue
 
+            # inclusión por título: columnas con ediciones regionales
+            # (Trascendió Monterrey/Puebla…) solo quedan si el titular
+            # es el esperado
+            solo_t = fuente.get("solo_titulo")
+            if solo_t and not re.search(solo_t, titulo, re.I):
+                continue
+
+            # inclusión por autor: feeds que mezclan columnistas
+            # (Crónica firma 'Pepe Grillo' — GN lo contaminaba porque el
+            # nombre va en los site_keywords de TODO el sitio)
+            solo_a = fuente.get("solo_autor")
+            if solo_a and solo_a not in normalizar(autor):
+                continue
+
             # mismo titular DEL MISMO medio con link distinto = nota
             # repetida (GN la da más de una vez); si es de OTRO medio
             # es cobertura real y entra al cluster
             clave = (normalizar(titulo),
                      _canon_medio(medio or fuente["nombre"]))
-            if clave in titulos_vistos:
+            # 'columnas' repite título cada edición (Sacapuntas, ¿Será?)
+            # — el link único ya garantiza dedup real
+            if clave in titulos_vistos \
+                    and fuente.get("categoria") != "columnas":
                 continue
             titulos_vistos.add(clave)
 
@@ -670,6 +907,26 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
             if imagen and frecuencia_img[imagen] >= 3:
                 imagen = ""
 
+            # links de GN son redirects JS — resolver al URL real del
+            # medio para que /nota abra el artículo y no la tarjeta GN.
+            # Dos entradas GN pueden resolver al MISMO artículo → dedup
+            if "news.google.com" in fuente["url"]:
+                real = resolver_link_gn(link)
+                if real != link:
+                    if real in vistos:
+                        continue
+                    link = real
+                    vistos[link] = time.time()
+
+            # resumen boilerplate del agregador (Reforma solo entrega
+            # 'Título · Medio') → lede real del og:description
+            if fuente.get("categoria") == "columnas":
+                boiler = len(normalizar(resumen)) <= (
+                    len(normalizar(titulo))
+                    + len(normalizar(medio or fuente["nombre"])) + 12)
+                if boiler:
+                    resumen = extraer_og_desc(link) or resumen
+
             # Guardar TODA nota que pasa el filtro → alimenta la sección
             # "Últimas noticias" del dashboard
             nota = {
@@ -677,6 +934,7 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
                 "fuente": medio or fuente["nombre"],
                 "via": fuente["nombre"] if medio else "",  # agregador que la trajo
                 "categoria": fuente.get("categoria", "prensa"),
+                "paywall": bool(fuente.get("paywall")),
                 "autor": autor,
                 "titulo": titulo,
                 "resumen": resumen,
@@ -748,6 +1006,7 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
 
 
 WP_SCAN = BASE / "wp_scan.json"   # {ts, hosts:[dominios con API WP viva]}
+SINTESIS = BASE / "sintesis.jsonl"  # síntesis IA: 2/día (9:00 y 16:00)
 
 
 def _limpia_html(h: str) -> str:
@@ -1057,39 +1316,65 @@ def _imagenes_fb_visores(pg, post_url: str) -> list:
         if _fb_sesion_caido(pg):
             _aviso_fb_sesion()
             return []
-        hrefs = pg.eval_on_selector_all(
-            'a[href*="/photo"]', "els => els.map(e => e.href)")
-        vistos = set()
-        for href in hrefs:
-            fid = re.search(r'fbid=(\d+)', href)
-            # set=a.* = avatar/portada de perfil, no del post
-            if not fid or fid.group(1) in vistos or "&set=a." in href:
-                continue
-            vistos.add(fid.group(1))
-            try:
-                pg.goto(href, wait_until="domcontentloaded",
-                        timeout=45000)
-                pg.wait_for_timeout(4500)
-                src = pg.evaluate("""() => {
-                    let best = null, area = 0;
-                    for (const i of document.querySelectorAll('img')) {
-                        const s = i.src || '';
-                        if (!/scontent/.test(s)) continue;
-                        const a = i.naturalWidth * i.naturalHeight;
-                        if (a > area) { area = a; best = s; }
-                    }
-                    return best;
-                }""")
-                if not src:
-                    continue
+        # si el candidato YA es un visor /photo?fbid= (el timeline real
+        # enlaza cada foto directo, no al permalink del post), la foto
+        # ES la página: tomar el <img> más grande de una vez
+        def _img_mayor():
+            return pg.evaluate("""() => {
+                let best = null, area = 0;
+                for (const i of document.querySelectorAll('img')) {
+                    const s = i.src || '';
+                    if (!/scontent/.test(s)) continue;
+                    const a = i.naturalWidth * i.naturalHeight;
+                    if (a > area) { area = a; best = s; }
+                }
+                return best;
+            }""")
+        if "fbid=" in post_url:
+            src = _img_mayor()
+            if src:
                 ir = requests.get(src, timeout=20,
                                   headers={"User-Agent": "Mozilla/5.0"})
                 if ir.status_code == 200 and len(ir.content) > 40000:
                     out.append(ir.content)
-            except Exception:
-                continue
-            if len(out) >= 4:
+        hrefs = pg.eval_on_selector_all(
+            'a[href*="/photo"]', "els => els.map(e => e.href)")
+        vistos = set()
+        # set=a.* = álbum/avatar — último recurso si no hubo pcb
+        for paso in (0, 1):
+            if paso == 1 and out:
                 break
+            for href in hrefs:
+                fid = re.search(r'fbid=(\d+)', href)
+                if not fid or fid.group(1) in vistos:
+                    continue
+                if "&set=a." in href and paso == 0:
+                    continue
+                vistos.add(fid.group(1))
+                try:
+                    pg.goto(href, wait_until="domcontentloaded",
+                            timeout=45000)
+                    pg.wait_for_timeout(4500)
+                    src = pg.evaluate("""() => {
+                        let best = null, area = 0;
+                        for (const i of document.querySelectorAll('img')) {
+                            const s = i.src || '';
+                            if (!/scontent/.test(s)) continue;
+                            const a = i.naturalWidth * i.naturalHeight;
+                            if (a > area) { area = a; best = s; }
+                        }
+                        return best;
+                    }""")
+                    if not src:
+                        continue
+                    ir = requests.get(src, timeout=20,
+                                      headers={"User-Agent": "Mozilla/5.0"})
+                    if ir.status_code == 200 and len(ir.content) > 40000:
+                        out.append(ir.content)
+                except Exception:
+                    continue
+                if len(out) >= 4:
+                    break
     except Exception:
         pass
     return out
@@ -1176,6 +1461,7 @@ def _bajar_portada_fb(m: dict) -> list:
               f"{pagina_fb}"
               "&tabs=timeline&width=500&height=900&hide_cover=true")
     candidata = ""
+    txt_sel = ""
     try:
         with sync_playwright() as p:
             br = _launch(p)
@@ -1213,7 +1499,10 @@ def _bajar_portada_fb(m: dict) -> list:
                 for (const a of document.querySelectorAll(
                         'a[href*="/posts/"], a[href*="/photos/"], '
                     + 'a[href*="/photo"], a[href*="story_fbid"]')) {
-                    const k = a.href.split('?')[0];
+                    // los /photo?fbid=N distan solo por query — dedup
+                    // por href completo o el primero (avatar del
+                    // header) se come a todas las fotos del post
+                    const k = a.href;
                     if (seen.has(k)) continue; seen.add(k);
                     // el texto del post queda en un ancestro ancho;
                     // el primer contenedor con >40 chars se cortaba
@@ -1247,15 +1536,32 @@ def _bajar_portada_fb(m: dict) -> list:
                     (reciente or any(f in txt for f in fechas)
                      or re.search(r'\bhoy\b', txt)):
                 candidata = post["href"]
+                txt_sel = post["txt"]
                 por_texto = True
                 break
             # fb_primero: la página sube la portada como PRIMER post con
             # foto de la madrugada, sin texto identificable (XEVT)
             if m.get("fb_primero") and not candidata and reciente:
                 candidata = post["href"]
+                txt_sel = post["txt"]
     except Exception:
         return []
-    imgs = _imagenes_fb_post(candidata) if candidata else []
+    if not candidata:
+        return []
+    # un post con N fotos queda repartido en varios links /photo que
+    # comparten el texto del artículo — juntar todos sus fbid (TAD mete
+    # las 2 planas en el mismo post; el candidato solo trae una)
+    cands = [candidata]
+    if "fbid=" in candidata:
+        cands += [p["href"] for p in posts
+                  if p["txt"] == txt_sel and p["href"] != candidata
+                  and "fbid=" in p["href"]
+                  and "&set=a." not in p["href"]]
+    imgs = []
+    for u in cands[:4]:
+        for b in _imagenes_fb_post(u):
+            if len(imgs) < 4 and b not in imgs:
+                imgs.append(b)
     if imgs and m.get("fb_primero") and not por_texto:
         # fallback sin texto identificable: exigir formato angosto de
         # primera plana — flyers verticales (donación ISSET 0.8) no son
@@ -1446,7 +1752,10 @@ def _portada_fecha(m: dict) -> list:
             imgs = re.findall(r'https?://[^"\' ]+\.(?:jpe?g|png|webp)',
                               r.text)
             if b := _imagen_portada_grande(imgs, toks):
-                return [b]
+                # sin 'portada' ni fecha en la URL la imagen pudo ser
+                # banner o foto de nota (Fonacot 1600x197, foto 1196x781)
+                if _es_portada(b):
+                    return [b]
     except Exception:
         pass
     return []
@@ -1854,6 +2163,13 @@ def _es_hoy(path: Path) -> bool:
         datetime.now().date()
 
 
+# NO WEB SHOTS — orden del usuario: ningún medio puede caer a
+# screenshot de homepage; solo impresas reales (kiosko/fb/issuu/etc).
+# Las estrategias que SI capturan la propia portada (PR visor,
+# img_portada, pdf) no son screenshots de homepage y siguen activas.
+_WEB_SHOTS = False
+
+
 def _tiene_img_hoy(base: Path) -> bool:
     """Impresa o shot principal del medio, de HOY y no blanco/negro."""
     return any(_es_hoy(c) and _img_ok(c)
@@ -1883,11 +2199,12 @@ def _medio_listo(m: dict, base: Path, tardia: bool) -> bool:
         n_img = 1 + sum(1 for _ in base.parent.glob(f"{base.name}-[0-9].jpg"))
         if n_img < n_min:
             return False
-    web = base.with_name(base.name + "-web.png")
-    # los dobles (impresa+web) exigen las dos: la web se captura en
-    # cuanto aparece la impresa, a cualquier hora de la ventana
-    if _es_doble(m) and not (_es_hoy(web) and _img_ok(web)):
-        return False
+    if _WEB_SHOTS:
+        web = base.with_name(base.name + "-web.png")
+        # los dobles (impresa+web) exigen las dos: la web se captura en
+        # cuanto aparece la impresa, a cualquier hora de la ventana
+        if _es_doble(m) and not (_es_hoy(web) and _img_ok(web)):
+            return False
     return True
 
 
@@ -1897,6 +2214,7 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
     00:30 la homepage todavía muestra la portada de ayer o popups de
     madrugada."""
     data = []
+    src_fb = False
     tiene_impresa = False
     img_ok = _tiene_img_hoy(base)
     if not img_ok:
@@ -1912,6 +2230,7 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
             data = [b] if b else []
         if m.get("fb") and not data:
             data = _bajar_portada_fb(m)
+            src_fb = bool(data)
         if m.get("calameo") and not data:
             data = _portada_calameo(m)
         if m.get("issuu") and not data:
@@ -1949,12 +2268,19 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
                 nom = base.name if i == 0 else f"{base.name}-{i + 1}"
                 f = base.parent / f"{nom}.jpg"
                 # kiosko a veces sirve la portada de AYER bajo la URL de
-                # hoy — bytes idénticos a la de ayer = no es edición nueva
+                # hoy — bytes idénticos a la de ayer = no es edición
+                # nueva; FB la re-encodea (bytes cambian) → comparar
+                # también visual a 64×64 (CORAT/XHVX repitieron la del
+                # jueves posteada a las 23h)
                 ayer = ayer_dir / f.name
                 if ayer.exists() and ayer.read_bytes() == d:
                     continue
                 f.write_bytes(d)
-                if _img_ok(f):   # kiosko a veces da placeholder negro
+                # filtro de forma solo para FB (puede colar flyers
+                # 4:5); kiosko/edicion/issuu/etc ya son la plana real —
+                # periódicos anchos (ratio ~1.25, p.ej. OEM) no mueren
+                if _img_ok(f) and (not src_fb or _es_portada(d)) \
+                        and not _misma_img_ayer(f, f.stem):
                     n_ok += 1
                 else:
                     f.unlink(missing_ok=True)
@@ -1965,15 +2291,22 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
             # PDF del ejemplar → página 1 (es del día, puede ir temprano)
             png = base.with_suffix(".png")
             ok, _ = _portada_pdf(m, png)
+            # El Día cuelga el PDF de AYER hasta después de la 1am —
+            # mismo guard que PR: si es la edición de ayer, no vale
+            if ok and _misma_img_ayer(png, base.name):
+                png.unlink(missing_ok=True)
+                ok = False
             tiene_impresa = ok and _img_ok(png)
-        if not tiene_impresa and tardia and not m.get("solo_impresa"):
+        if _WEB_SHOTS and not tiene_impresa and tardia \
+                and not m.get("solo_impresa"):
             # último recurso: screenshot de la web — solo en el pase
             # tardío, de madrugada la home muestra la edición de ayer
             png = base.with_suffix(".png")
             url_tiro = m["url"]
             if m.get("pdf"):
                 _, fb2 = _portada_pdf(m, png)
-                if _img_ok(png):
+                if _img_ok(png) and not _misma_img_ayer(
+                        png, base.name):
                     tiene_impresa = True
                 else:
                     url_tiro = fb2 or url_tiro
@@ -1998,11 +2331,11 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
     # doble portada: con impresa (jpg/pdf) también portada web — solo en
     # el pase tardío, antes la home sigue mostrando la edición de ayer
     tiene_impresa = tiene_impresa or _tiene_img_hoy(base)
-    if tiene_impresa and _es_doble(m):
+    if _WEB_SHOTS and tiene_impresa and _es_doble(m):
         # web apenas cayó la impresa: el sitio ya muestra la edición
         # del día — no hay que esperar a hora_web
         web = base.with_name(base.name + "-web.png")
-        imp = _portada_img(slug)
+        imp = _portada_img(base.name)
         web_vieja = (not _es_hoy(web)) or (
             imp.exists() and web.exists()
             and web.stat().st_mtime < imp.stat().st_mtime)
@@ -2194,14 +2527,20 @@ def capturar_portadas(cfg: dict):
 
 def _cada_efectivo(m: dict, port: dict, ahora: datetime = None) -> int:
     """cada_min del medio comprimido cerca del cierre: ≤90 min al
-    hora_pdf toca cada 20, a ≤45 min cada 10 — los medios lentos de
+    hora_cierre toca cada 20, a ≤45 min cada 5 — los medios lentos de
     publicar (kiosko 404, FB tardío) tienen más oportunidades."""
     cada = int(m.get("cada_min", 55))
     ahora = ahora or datetime.now()
-    restan = _hhmm(port, "hora_pdf", "06:45") - \
-        (ahora.hour * 60 + ahora.minute)
+    ahora_m = ahora.hour * 60 + ahora.minute
+    fin1 = _hhmm(port, "hora_pdf", "06:45")
+    # antes del 1er PDF: rampa a tope (los lentos tienen más chances);
+    # después: modo tranquilo — 30 min fijos hasta el cierre, no hace
+    # falta martillar FB/kiosko cada 5 min para el 2º PDF
+    if ahora_m >= fin1:
+        return min(cada, 30)
+    restan = fin1 - ahora_m
     if restan <= 45:
-        return min(cada, 10)
+        return min(cada, 5)
     if restan <= 90:
         return min(cada, 20)
     return cada
@@ -2209,14 +2548,47 @@ def _cada_efectivo(m: dict, port: dict, ahora: datetime = None) -> int:
 
 def _merge_eventos(a: list, b: list) -> list:
     """Unión de eventos sin duplicados — el timeline no pierde pins
-    aunque el servicio tenga en RAM un estado más viejo que el disco."""
+    aunque el servicio tenga en RAM un estado más viejo que el disco.
+    Una mutación en `b` (ok→borrada al descartar una captura mala) pisa
+    la versión vieja de `a` con mismo (d,t,m): sin esto el ok=True
+    original resucita y el medio fantasma queda 'capturado'."""
+    pisados = {(e.get('d'), e.get('t'), e.get('m'))
+               for e in b if e.get('borrada')}
     seen, out = set(), []
     for e in a + b:
+        if (e.get('d'), e.get('t'), e.get('m')) in pisados \
+                and not e.get('borrada'):
+            continue
         k = (e.get('d'), e.get('t'), e.get('m'), e.get('ok'))
         if k not in seen:
             seen.add(k)
             out.append(e)
     return out
+
+
+def _descartar_portada(nombre: str) -> str:
+    """'Recapturar': el admin vio que la imagen del día es mala (banner,
+    anuncio, edición vieja) — borra sus archivos, libera el sello y el
+    evento queda descartado. Si el medio sigue en ventana, la próxima
+    corrida lo reintenta solo."""
+    if not nombre:
+        return "medio vacío"
+    hoy_s = datetime.now().strftime("%Y-%m-%d")
+    slug = _slug_portada(nombre)
+    n = 0
+    for f in _dir_dia().glob(f"{slug}*"):
+        if f.is_file() and f.suffix != ".pdf":
+            f.unlink(missing_ok=True)
+            n += 1
+    est = cargar_json(ESTADO_PORTADAS, {})
+    est.get("cap_medios", {}).pop(slug, None)
+    for e in est.get("eventos", []):
+        if e.get("d") == hoy_s and e.get("m") == nombre:
+            e["ok"] = False
+            e["borrada"] = True
+    _guardar_portadas(est)
+    return (f"{nombre}: {n} archivo(s) descartado(s) — "
+            "reintenta en la próxima corrida")
 
 
 def _guardar_portadas(est: dict):
@@ -2240,9 +2612,50 @@ def _guardar_portadas(est: dict):
 
 
 def _pagina_portada_pdf(sec: str, n_medios: int):
-    """Página de portada del PDF — institucional, sin marca: solo
-    servicio, sección, fecha y conteo de medios."""
+    """Página de portada del PDF — brand/port01.jpeg con fecha y conteo
+    dinámicos en la columna vacía; la nacional repinta el título sobre el
+    fondo crema. Sin el asset, portada institucional generada."""
     from PIL import ImageDraw, ImageFont
+    hoy = datetime.now()
+    fecha = f"{hoy.day} de {_MESES_PORTADA[hoy.month - 1]} de {hoy.year}"
+    dia_sem = _DIAS_PORTADA[hoy.weekday()].capitalize()
+    asset = BASE / "brand" / "port01.jpeg"
+    if asset.exists():
+        img = Image.open(asset).convert("RGB")
+        img = img.resize((1240, int(img.height * 1240 / img.width)),
+                         Image.LANCZOS)
+        W, H = img.size
+        dr = ImageDraw.Draw(img)
+        try:
+            ft = ImageFont.truetype("DejaVuSans-Bold.ttf",
+                                    int(W * 0.072))
+            fm = ImageFont.truetype("DejaVuSans.ttf",
+                                    int(W * 0.036))
+            fs = ImageFont.truetype("DejaVuSans.ttf",
+                                    int(W * 0.027))
+        except Exception:
+            ft = fm = fs = ImageFont.load_default()
+        negro, gris = (26, 26, 26), (105, 100, 92)
+        if sec == "nacional":
+            # la pieza dice TABASCO — cubrir el título con el color
+            # promedio del área (el fondo JPEG tiene degradado) y
+            # repintar PORTADAS / NACIONAL
+            zona = img.crop((0, 0, int(W * 0.62), int(H * 0.205)))
+            claro = [p for p in zona.getdata()
+                     if sum(p) / 3 > 200]
+            crema = tuple(int(sum(c[i] for c in claro) / len(claro))
+                          for i in range(3)) if claro else (244, 240, 228)
+            dr.rectangle((0, 0, int(W * 0.62), int(H * 0.19)),
+                         fill=crema)
+            dr.text((W * 0.05, H * 0.078), "PORTADAS",
+                    font=ft, fill=negro)
+            dr.text((W * 0.05, H * 0.132), "NACIONAL",
+                    font=ft, fill=negro)
+        x = W * 0.05
+        dr.text((x, H * 0.60), dia_sem, font=fm, fill=gris)
+        dr.text((x, H * 0.645), fecha, font=fm, fill=negro)
+        dr.text((x, H * 0.69), f"{n_medios} medios", font=fs, fill=gris)
+        return img
     W, H = 1240, 1754   # proporción carta/vertical como las portadas
     img = Image.new("RGB", (W, H), (250, 250, 250))
     dr = ImageDraw.Draw(img)
@@ -2252,9 +2665,6 @@ def _pagina_portada_pdf(sec: str, n_medios: int):
         fs = ImageFont.truetype("DejaVuSans.ttf", 30)
     except Exception:
         fb = fm = fs = ImageFont.load_default()
-    hoy = datetime.now()
-    fecha = f"{hoy.day} de {_MESES_PORTADA[hoy.month - 1]} de {hoy.year}"
-    dia_sem = _DIAS_PORTADA[hoy.weekday()].capitalize()
     titulo = "PORTADAS NACIONAL" if sec == "nacional" \
         else "PORTADAS TABASCO"
     negro, gris, esm = (9, 9, 11), (82, 82, 91), (52, 211, 153)
@@ -2270,9 +2680,10 @@ def _pagina_portada_pdf(sec: str, n_medios: int):
     return img
 
 
-def generar_pdfs_portadas(cfg: dict):
-    """Hora_pdf (06:45): arma los PDFs con lo recolectado en la ventana,
-    los manda por correo y lista los medios que nunca respondieron."""
+def generar_pdfs_portadas(cfg: dict, marca: str = "pdf_fecha"):
+    """Hora_pdf (06:45) y hora_pdf2 (09:00): arma los PDFs con lo
+    recolectado, los manda por correo y lista los que no respondieron.
+    `marca` = llave del estado que registra qué emisión ya salió."""
     medios = cfg.get("portadas", {}).get("medios", [])
     escribir_schedule_portadas(cfg)   # schedule.html siempre al día
     hoy = datetime.now().strftime("%Y-%m-%d")
@@ -2319,9 +2730,9 @@ def generar_pdfs_portadas(cfg: dict):
             pdfs[sec] = pdf
     enviar_portadas(cfg, pdfs, fallos)
     est = cargar_json(ESTADO_PORTADAS, {})
-    est["pdf_fecha"] = hoy
+    est[marca] = hoy
     _guardar_portadas(est)
-    print(f"[portadas] {len(pdfs)} PDFs enviados, fallos: "
+    print(f"[portadas] {len(pdfs)} PDFs enviados ({marca}), fallos: "
           f"{fallos or 'ninguno'}")
 
 
@@ -2396,7 +2807,8 @@ def _ventana_medio(m: dict, port: dict) -> tuple:
                   ("kiosko", "fb", "issuu", "flip", "pr", "pdf",
                    "edicion", "json", "calameo", "flowpaper"))
     desde = _min(m.get("cap_desde") or port.get("hora_desde", "00:30"))
-    hasta = _min(m.get("cap_hasta") or port.get("hora_pdf", "06:45"))
+    hasta = _min(m.get("cap_hasta") or port.get(
+        "hora_cierre", port.get("hora_pdf", "06:45")))
     if not impresa:
         desde = max(desde, _hhmm(port, "hora_web", "05:45"))
     return desde, hasta
@@ -2528,7 +2940,9 @@ def escribir_schedule_portadas(cfg: dict):
     # rojo=fallo); tick ámbar = hora cumplida sin corrida registrada
     ahora = datetime.now()
     ahora_m = ahora.hour * 60 + ahora.minute
-    d0, d1 = _min(desde), _min(pdf)
+    d0 = _min(desde)
+    pdf2 = port.get("hora_pdf2")
+    d1 = _min(pdf2) if pdf2 else _min(pdf)   # eje hasta el 2º PDF
     span = max(d1 - d0, 1)
     est_tl = cargar_json(ESTADO_PORTADAS, {})
     hoy_s = ahora.strftime("%Y-%m-%d")
@@ -2555,29 +2969,36 @@ def escribir_schedule_portadas(cfg: dict):
             "transform:translateX(-50%);font-size:.68rem;color:#666'>"
             f"{t//60:02d}:{t%60:02d}</span>")
         t += 55
-    # tick final: hora del PDF (deadline de envío ~+5 min)
-    if t - 55 < d1:
-        paso = d1 <= ahora_m
-        pdf_ok = est_tl.get("pdf_fecha") == hoy_s
+    # ticks de emisión: 1er PDF en hora_pdf y 2º en hora_pdf2
+    marcas_pdf = [(_min(pdf), "pdf_fecha")]
+    if pdf2:
+        marcas_pdf.append((_min(pdf2), "pdf_fecha2"))
+    for mm_pdf, marca_pdf in marcas_pdf:
+        paso = mm_pdf <= ahora_m
+        pdf_ok = est_tl.get(marca_pdf) == hoy_s
         color = "#0a7a2f" if pdf_ok else \
                 ("#d97706" if paso else "#9ca3af")
         tl += (
-            f"<div title='PDF {d1//60:02d}:{d1%60:02d} — envío ~"
-            f"{(d1+5)//60:02d}:{(d1+5)%60:02d}' style="
-            f"'position:absolute;left:{_pct(d1):.2f}%;top:202px;width:16px;"
-            "height:16px;margin-left:-8px;border-radius:50%;"
+            f"<div title='PDF {mm_pdf//60:02d}:{mm_pdf%60:02d} — envío ~"
+            f"{(mm_pdf+5)//60:02d}:{(mm_pdf+5)%60:02d}' style="
+            f"'position:absolute;left:{_pct(mm_pdf):.2f}%;top:202px;"
+            f"width:16px;height:16px;margin-left:-8px;border-radius:50%;"
             f"background:{color}'></div>"
-            f"<span style='position:absolute;left:{_pct(d1):.2f}%;top:228px;"
-            "transform:translateX(-50%);font-size:.68rem;color:#666'>"
-            f"{d1//60:02d}:{d1%60:02d} PDF</span>")
+            f"<span style='position:absolute;left:{_pct(mm_pdf):.2f}%;"
+            f"top:228px;transform:translateX(-50%);font-size:.68rem;"
+            f"color:#666'>{mm_pdf//60:02d}:{mm_pdf%60:02d} PDF</span>")
     # pines: solo capturas logradas — eventos cercanos (≤10 min) se
     # agrupan en UN cluster: etiqueta compacta HH:MM ×N (los nombres en
     # el tooltip y en la leyenda desplegable de abajo) — sin clusters,
     # la ola de las ~06:00 empalma 20 etiquetas diagonales ilegibles
+    _vistos_ok = set()
     oks = sorted(
-        (_min(str(e.get("t", "00:00"))), str(e.get("m", "")))
+        (mm, nm)
         for e in evs_tl if e.get("ok")
-        and d0 <= _min(str(e.get("t", "00:00"))) <= d1 + 60)
+        for mm, nm in [(_min(str(e.get("t", "00:00"))),
+                        str(e.get("m", "")))]
+        if d0 <= mm <= d1 + 60
+        and nm not in _vistos_ok and not _vistos_ok.add(nm))
     clusters = []
     for mm, nombre in oks:
         if clusters and mm - clusters[-1][0] <= 10:
@@ -2618,9 +3039,25 @@ def escribir_schedule_portadas(cfg: dict):
     # leyenda: cada captura con su hora real, agrupada por cluster
     if grupos:
         n_olas = sum(1 for _, items in grupos if len(items) > 1)
+        dia_leg = _dir_dia()
+
+        def _n_planas(nombre: str) -> int:
+            s = _slug_portada(nombre)
+            return sum(1 for f in dia_leg.glob(f"{s}*.*")
+                       if not f.name.endswith("-web.png"))
+
         items_leg = "".join(
             f"<li><b>{e_mm // 60:02d}:{e_mm % 60:02d}</b> "
-            f"{html.escape(e_n)}</li>"
+            f"{html.escape(e_n)}"
+            + (f" <b style='color:#2563eb'>×{n}</b>"
+               if (n := _n_planas(e_n)) > 1 else "")
+            + " <form method='post' action='/portadas/recapturar' "
+              "style='display:inline'><input type='hidden' name='m' "
+              f"value='{html.escape(e_n)}'>"
+              "<button title='Descartar y recapturar' style='border:0;"
+              "background:none;cursor:pointer;color:#dc2626;"
+              "font-size:.7rem;padding:0'>&#8635;</button></form>"
+            + "</li>"
             for _mm, items in grupos for e_mm, e_n in sorted(items))
         tl += ("</div><details open style='font-size:.75rem;color:#333;"
                "margin:0 0 4px'><summary style='cursor:pointer'>"
@@ -2728,7 +3165,7 @@ def escribir_schedule_portadas(cfg: dict):
         ".then(function(r){"
         "el.style.outline=r.ok?'2px solid #0a7a2f':'2px solid red';"
         "if(r.ok&&el.name.indexOf('del')===0)location.reload();})"
-        ".catch(function(){el.style.outline='2px solid red';});});});"
+        ".catch(function(){el.style.outline='2px solid red';});});"
         "</script>"
         "<p class=\"nota\">Aplica en el siguiente ciclo — sin reiniciar. "
         "El fin de ventana lo marca el PDF de las 06:45. Las capturas "
@@ -2749,7 +3186,7 @@ def _hhmm(port: dict, clave: str, default: str) -> int:
 
 
 def toca_captura_portadas(cfg: dict) -> bool:
-    """Ventana de recolección [hora_desde, hora_pdf): corre cada ~55 min
+    """Ventana de recolección [hora_desde, hora_cierre): corre cada ~55 min
     mientras falte algún medio — kiosko sale de madrugada, FB a las
     00:0x, issuu/pdf cuando lo suban."""
     port = cfg.get("portadas", {})
@@ -2759,7 +3196,7 @@ def toca_captura_portadas(cfg: dict) -> bool:
     ahora = datetime.now()
     if not (_hhmm(port, "hora_desde", "00:30")
             <= ahora.hour * 60 + ahora.minute
-            < _hhmm(port, "hora_pdf", "06:45")):
+            < _hhmm(port, "hora_cierre", "08:45")):
         return False
     ahora_m = ahora.hour * 60 + ahora.minute
     tardia = ahora_m >= _hhmm(port, "hora_web", "05:45")
@@ -2796,6 +3233,23 @@ def toca_pdf_portadas(cfg: dict) -> bool:
     est = cargar_json(ESTADO_PORTADAS, {})
     return est.get("pdf_fecha") != ahora.strftime("%Y-%m-%d") and \
         ahora.hour * 60 + ahora.minute >= _hhmm(port, "hora_pdf", "06:45")
+
+
+def toca_pdf_portadas2(cfg: dict) -> bool:
+    """hora_pdf2 (09:00) → 2ª emisión con los medios tardíos (kiosko
+    indexa después del cierre del 1er PDF). Solo corre si ya salió el
+    de hora_pdf — si el servicio estuvo caído, el 1er PDF tiene
+    prioridad."""
+    port = cfg.get("portadas", {})
+    if not port.get("medios") or not port.get("hora_pdf2"):
+        return False
+    ahora = datetime.now()
+    hoy = ahora.strftime("%Y-%m-%d")
+    est = cargar_json(ESTADO_PORTADAS, {})
+    return est.get("pdf_fecha") == hoy and \
+        est.get("pdf_fecha2") != hoy and \
+        ahora.hour * 60 + ahora.minute >= _hhmm(
+            port, "hora_pdf2", "09:00")
 
 
 def toca_limpia_portadas(cfg: dict) -> bool:
@@ -3030,7 +3484,7 @@ def detectar_desarrollo(cfg: dict, resumir: bool) -> int:
                 "titulo": rep["titulo"],
                 "link": rep["link"],
                 "imagen": rep.get("imagen", ""),
-                "resumen_ia": resumir_ollama(cfg, rep["titulo"],
+                "resumen_ia": resumir_ollama_seguro(cfg, rep["titulo"],
                                              " ".join(n["titulo"] for n in cluster))
                               if resumir else "",
             }
@@ -3130,6 +3584,30 @@ PAGINA = """<!DOCTYPE html>
   .card.top {{ border-left-color: #7b1fa2; }}
 
   details {{ margin: .5rem 0 0; }}
+  .col-card {{ background: #fff; border-left: 5px solid #455a64;
+             border-radius: 8px; margin: .7rem 0; box-shadow: 0 1px 4px #0002; }}
+  .col-card > summary {{ cursor: pointer; padding: .8rem 1rem;
+                       display: flex; align-items: baseline; gap: .8rem;
+                       flex-wrap: wrap; list-style: none; }}
+  .col-card > summary::-webkit-details-marker {{ display: none; }}
+  .col-card > summary::after {{ content: "▾"; margin-left: auto; color: #90a4ae; }}
+  .col-card[open] > summary::after {{ content: "▴"; }}
+  .col-nom {{ font-weight: 700; font-size: 1.05rem; }}
+  .col-list {{ border-top: 1px solid #eceff1; padding: .2rem .5rem .6rem; }}
+  .col-fila {{ display: flex; gap: .8rem; padding: .45rem .5rem;
+             color: inherit; text-decoration: none; border-radius: 6px; }}
+  .col-fila:hover {{ background: #f4f6f8; }}
+  .col-fecha {{ color: #78909c; font-size: .8rem; white-space: nowrap;
+              min-width: 6.5rem; padding-top: .1rem; }}
+  .col-tit {{ font-weight: 500; }}
+  .col-bloq {{ display: flex; flex-direction: column; gap: .15rem; }}
+  .col-res {{ font-weight: 400; font-size: .8rem; color: #78909c;
+             line-height: 1.3; }}
+  .col-pay {{ margin-left: auto; align-self: flex-start; flex-shrink: 0;
+             font-size: .68rem; font-weight: 600; color: #b45309;
+             background: #fef3c7; border: 1px solid #fcd34d;
+             border-radius: 999px; padding: .12rem .5rem;
+             white-space: nowrap; }}
   summary {{ cursor: pointer; color: #1565c0; font-size: 1rem;
            padding: .5rem 0; }}
   details .variante {{ display: block; padding: .55rem 0; border-top: 1px solid #eee; }}
@@ -3339,10 +3817,12 @@ PAGINA = """<!DOCTYPE html>
     <a href="/salir" class="salir-top" title="Cerrar sesión">salir</a>
   </div>
   <div class="nav-tabs">
-    <a href="/destacadas">Destacadas</a>
     <a href="/noticias">Noticias</a>
     <a href="/alertas">Alertas</a>
     <a href="/portadas">Portadas</a>
+    <a href="/columnas">Columnas</a>
+    <a href="/interes">Interés</a>
+    <a href="/resumenes">Resúmenes</a>
     <a href="/fuentes">Fuentes</a>
     {admin_tabs}
   </div>
@@ -3648,18 +4128,252 @@ def tarjeta_destacada(rep: dict, cluster: list) -> str:
     )
 
 
-def tarjeta_noticia(n: dict) -> str:
+def tarjeta_noticia(n: dict, extra: str = "") -> str:
     autor = _autor_limpio(n)
     return (
-        f"<a class='card nota' href='/nota?u={quote(n['link'], safe='')}'>"
-        + (f"<img class='thumb' src='{html.escape(url_https(n['imagen']))}' loading='lazy' "
+        f"<a class='card nota' href='/nota?u={quote(n['link'], safe='')}'"
+        f">"+ (f"<img class='thumb' src='{html.escape(url_https(n['imagen']))}' loading='lazy' "
            f"onerror='this.remove()'>" if n.get("imagen") else "")
         + f"<div class='meta2'><span class='chip-fuente'>"
         f"{html.escape(n['fuente'])}</span>"
         f"<span class='meta'>{fmt_fecha(n['fecha'])}{autor}</span></div>"
         f"<span class='titulo'>{html.escape(n['titulo'])}</span>"
+        + (f"<p style='font-size:.68rem;color:#2e7d32;margin:.2rem 0 0'>"
+           f"{html.escape(extra)}</p>" if extra else "")
         + "</a>"
     )
+
+
+INTERES_FUERTES = [
+    # nombres propios — bastan solos
+    "efrain resendez", "resendez bocanegra", "carlos efrain",
+    "mario balcazar",
+    "paola hernandez", "paola hernandez garcia",
+    "donaciano quen", "quen perez",
+    "juan pablo rabago", "rabago contreras",
+    "paolo orrico", "orrico julien",
+    "german garcia mollinedo", "garcia mollinedo", "german garcia",
+    "gustavo glori tellechea", "gustavo glori",
+    "jose ramiro lopez obrador", "pepin lopez obrador",
+    "javier may", "javier may rodriguez", 
+
+
+    # TSJ Tabasco inequívoco
+    "tribunal superior de justicia de tabasco",
+    "poder judicial de tabasco",
+    "sindicato del tribunal superior de justicia de tabasco",
+    "voluntariado del tribunal superior de justicia",
+    "magistrados del tsj", "magistrados de tsj",
+    "magistrados tabasco", "judicial tabasco",
+]
+# \b en nombres: 'javier may' como substring crudo colaría
+# 'Mayagoitia'/'Javier Mayor'
+RX_FUERTES = re.compile(r"\b(?:" + "|".join(
+    re.escape(t) for t in INTERES_FUERTES) + r")\b")
+# siglas tabasqueñas inequívocas — \b obligatorio ('tet' de substring
+# colaría 'teta'); TET = Tribunal Electoral de Tabasco, OSFE = órgano
+# estatal de fiscalización
+RX_SIGLAS_FUERTES = re.compile(r"\b(tet|osfe)\b")
+INTERES_DEBILES_TEMA = [
+    # temas abstractos: sin 'tabasco' explícito pueden ser de otro
+    # estado o de la reforma federal — no cuentan
+    "reforma judicial", "poder judicial",
+    "administracion judicial", "disciplina judicial",
+    # OAJ es órgano FEDERAL del PJF — sin ancla Tabasco colaba notas
+    # de la reforma federal como si fueran del TSJT
+    "organo de administracion judicial",
+    "organos de administracion judicial",
+    # TDJ también es FEDERAL (disciplina del PJF) — solo cuenta si la
+    # nota la amarra a Tabasco
+    "tribunal de disciplina",
+]
+INTERES_DEBILES_ACTOR = [
+    # actores judiciales: en prensa local el 'magistrado'/'juzgado'/
+    # 'tribunal' es casi siempre el de Tabasco — basta medio local
+    "magistrad", "tribunal superior de justicia",
+    "juzgad", "oficial mayor",
+    "sindicato del tribunal", "voluntariado del tribunal",
+    "presidente del tribunal", "presidenta del tribunal",
+    "titular del poder judicial",
+    "oficial mayor del tribunal",
+]
+INTERES_TABASCO = ["tabasco", "villahermosa", "resendez"]
+RX_SIGLAS_TEMA = re.compile(r"\btdj\b")
+RX_TSJ = re.compile(r"\btsjt?\b")
+# 'Tribunal Superior de Justicia de Guerrero/CDMX/…' — no es el TSJT
+RX_TSJ_OTRO = re.compile(
+    r"tribunal superior de justicia (?:de|del) (?!tabasco\b)\w+")
+# estados/tribunales ajenos — 'jueza de Zacatecas', 'TEEY de Yucatán',
+# poder judicial de Quintana Roo: sin ancla TSJT → fuera
+INTERES_AJENOS = [
+    "aguascalientes", "baja california", "campeche", "chiapas",
+    "chihuahua", "coahuila", "colima", "durango", "guanajuato",
+    "guerrero", "hidalgo", "jalisco", "estado de mexico", "edomex",
+    "cdmx", "ciudad de mexico", "michoacan", "morelos", "nayarit",
+    "nuevo leon", "oaxaca", "puebla", "queretaro", "quintana roo",
+    "san luis potosi", "sinaloa", "sonora", "tamaulipas", "tlaxcala",
+    "veracruz", "yucatan", "zacatecas", "teey", "teez",
+    "tribunal electoral del estado de yucatan",
+]
+RX_AJENOS = re.compile(r"\b(?:" + "|".join(
+    re.escape(t) for t in INTERES_AJENOS) + r")\b")
+
+
+_RX_ACENTOS = {"a": "[aá]", "e": "[eé]", "i": "[ií]",
+               "o": "[oó]", "u": "[uúü]", "n": "[nñ]"}
+
+
+def _pat_interes(t: str) -> str:
+    """Regex insensible a acentos para un término de la lista;
+    palabra sola admite sufijo (magistrad → magistrado/a/s)."""
+    pat = "".join(_RX_ACENTOS.get(c, re.escape(c)) for c in t)
+    return pat + (r"\w*" if " " not in t else "")
+
+
+_RX_INTERES_HL = re.compile(
+    r"\b(" + "|".join(
+        _pat_interes(t) for t in sorted(
+            INTERES_FUERTES + INTERES_DEBILES_TEMA
+            + INTERES_DEBILES_ACTOR + INTERES_TABASCO,
+            key=len, reverse=True))
+    + r"|tsjt?|tet|osfe|tdj)", re.I)
+
+
+def _resaltar_interes(txt_html: str) -> str:
+    """<mark> sobre los términos de interés dentro de texto ya
+    escapado — el cliente ve de un vistazo por qué entró cada dato."""
+    return _RX_INTERES_HL.sub(
+        r"<mark style='background:#fff59d;padding:0 1px'>\1</mark>",
+        txt_html)
+
+
+def coincide_interes(nota: dict) -> bool:
+    """True si la nota toca la lista de interés judicial-Tabasco."""
+    return bool(_interes_match(nota))
+
+
+def _interes_match(nota: dict) -> list:
+    """Lista de términos de la lista de interés que activaron la nota —
+    vacío si no es de interés. Sirve para justificar cada nota en la
+    vista ('encontró: resendez bocanegra').
+
+    Nombres propios y siglas TSJ entran solos; términos genéricos
+    ('reforma judicial', 'poder judicial', 'sindicato del tribunal')
+    requieren contexto Tabasco en la misma nota — una reforma judicial
+    nacional o el poder judicial de otro estado NO deben aparecer."""
+    # SIN fuente/via: el nombre del medio ('Tabasco HOY') no puede
+    # aportar el contexto Tabasco — una nota de la CDMX publicada en
+    # un medio tabasqueño NO es de interés judicial local
+    res = str(nota.get("resumen") or "")
+    # boilerplate WP: '…apareció primero en Tabasco HOY' mete el nombre
+    # del medio al resumen y falsea el contexto Tabasco
+    res = re.split(
+        r"apareci[oó] primero en|first appeared on|the post\b",
+        res, flags=re.I)[0]
+    # byline 'REDACCIÓN/QUADRATÍN TABASCO' al final del resumen — misma
+    # contaminación de contexto que el boilerplate WP
+    res = re.split(r"redacci[oó]n\s*/", res, flags=re.I)[0]
+    texto = normalizar(
+        f"{nota.get('titulo') or ''} {res} {nota.get('autor') or ''}")
+    # contexto Tabasco solo en titulo+resumen — el autor puede ser el
+    # propio medio ('Ahora Tabasco') y también falsea el contexto
+    texto_ctx = normalizar(f"{nota.get('titulo') or ''} {res}")
+    # 'local' = prensa Tabasco + fuentes oficiales — QUINTANA ROO NO:
+    # el usuario lo definió — una nota de QRoo solo es de interés si
+    # menciona Tabasco/TSJ o un nombre de la lista, no por su tribunal
+    local = nota.get("categoria") in ("prensa", "oficial")
+    hay_tab = any(c in texto_ctx for c in INTERES_TABASCO)
+    hits = RX_FUERTES.findall(texto)
+    hits += RX_SIGLAS_FUERTES.findall(texto)
+    # nombres propios entran siempre — si Reséndez/Orrico sale en
+    # una nota de otro estado, el nombre manda sobre las guardias
+    if hits:
+        return hits
+    # la nota es de OTRO poder judicial (TSJ de Guerrero, de la
+    # Ciudad de México…) y no nombra Tabasco → no es de interés
+    if RX_TSJ_OTRO.search(texto) and "tabasco" not in texto_ctx:
+        return []
+    # judicial de otro estado sin ancla TSJT (jueza de Zacatecas,
+    # TEEY de Yucatán, poder judicial de Quintana Roo…) → fuera.
+    # 'tabasco'/'villahermosa'/'resendez'/'tsj' en el texto la rescata
+    if RX_AJENOS.search(texto) and not (
+            hay_tab or RX_TSJ.search(texto)):
+        return []
+    if RX_TSJ.search(texto) and (local or hay_tab):
+        return ["tsj"]
+    hits = [t for t in INTERES_DEBILES_TEMA if t in texto]
+    hits += RX_SIGLAS_TEMA.findall(texto)
+    if hits and hay_tab:
+        return hits
+    hits = [t for t in INTERES_DEBILES_ACTOR if t in texto]
+    if hits and (hay_tab or local):
+        return hits
+    return []
+
+
+def vista_columnas(email: str) -> str:
+    """Sección Columnas: una tarjeta desplegable por columna política
+    (categoria 'columnas'). La entrega más reciente queda a la vista y
+    el histórico se despliega — algunas publican cada 2-3 días."""
+    cfg = json.loads(CONFIG.read_text())
+    cols = [f for f in cfg["fuentes"]
+            if f.get("categoria") == "columnas"]
+    nombres = {f["nombre"] for f in cols}
+    vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
+    por_col: dict = {}
+    for n in leer_jsonl(NOTICIAS, limite=0):
+        clave = n.get("via") or n.get("fuente", "")
+        if clave in nombres and (n["fuente"] in vis or clave in vis):
+            por_col.setdefault(clave, []).append(n)
+
+    def _fila(n: dict, col_nombre: str = "", paywall: bool = False) -> str:
+        res = ""
+        # columnas de título fijo ('Templo Mayor 2026-10-09') no dicen de
+        # qué tratan — el resumen indexado da el adelanto
+        if col_nombre and col_nombre.lower() in n["titulo"].lower() \
+                and n.get("resumen"):
+            res = (f"<span class='col-res'>"
+                   f"{html.escape(n['resumen'][:160])}…</span>")
+        pw = "<span class='col-pay'>suscripción</span>" if paywall else ""
+        hits = ", ".join(_interes_match(n))
+        kw = (f"<span style='font-size:.65rem;color:#2e7d32'>"
+              f"encontró: {html.escape(hits)}</span>" if hits else "")
+        return (f"<a class='col-fila' "
+                f"href='/nota?u={quote(n['link'], safe='')}'"
+                f"><span class='col-fecha'>{fmt_fecha(n['fecha'])}</span>"
+                f"<span class='col-bloq'><span class='col-tit'>"
+                f"{html.escape(n['titulo'])}</span>{res}{kw}</span>"
+                f"{pw}</a>")
+
+    bloques = []
+    for f in cols:
+        _vl = set()
+        # solo entregas de la lista de interés — la sección Columnas
+        # depende únicamente de las palabras clave, igual que Interés
+        entradas = [n for n in sorted(
+            por_col.get(f["nombre"], []),
+            key=lambda n: n["fecha"], reverse=True)
+            if coincide_interes(n)
+            and not (n["link"] in _vl or _vl.add(n["link"]))]
+        ultima = fmt_fecha(entradas[0]["fecha"]) if entradas \
+            else "sin capturas aún"
+        medio = f["nombre"].split("·")[-1].strip()
+        columna = f["nombre"].split("·")[0].strip()
+        cab = (f"<summary><span class='col-nom'>{html.escape(columna)}"
+               f"</span><span class='meta'>{html.escape(medio)} · "
+               f"{len(entradas)} entregas · última {ultima}</span></summary>")
+        cuerpo = "".join(
+            _fila(n, columna, f.get("paywall", False))
+            for n in entradas[:40]) \
+            or "<p class='meta'>Aún no captura — esperando la próxima " \
+               "entrega.</p>"
+        bloques.append((entradas[0]["fecha"] if entradas else "",
+                        f"<details class='col-card'>{cab}"
+                        f"<div class='col-list'>{cuerpo}</div></details>"))
+    bloques.sort(key=lambda b: b[0], reverse=True)
+    cards = "".join(b for _, b in bloques)
+    return (f"<h1>Columnas</h1><p class='meta'>{len(cols)} columnas "
+            "en seguimiento</p>" + cards)
 
 
 def vista_destacadas(email: str, cat: str = "") -> str:
@@ -3684,6 +4398,8 @@ def vista_destacadas(email: str, cat: str = "") -> str:
                   cat == "quintana_roo")
             + tab("/destacadas?cat=nacional", "Nacional",
                   cat == "nacional")
+            + tab("/destacadas?cat=columnas", "Columnas",
+                  cat == "columnas")
             + tab("/destacadas?cat=regional", "Regional",
                   cat == "regional") + "</div>")
     cards = "".join(tarjeta_destacada(rep, c) for rep, c in destacadas)
@@ -3757,8 +4473,21 @@ def cobertura_relacionada(items: list, noticias: list) -> list:
     tema = tokens_hit & distintivos
     if not tema:
         return []
+    if len(tema) == 1:
+        # tema de una sola palabra: vale solo si está en TODOS los
+        # titulares que dispararon — un raro compartido por azar
+        # ('centro' = centro de votación, Centroamérica…) no basta
+        for a in items:
+            tema &= tokens_titulo(a["titulo"])
+        if not tema:
+            return []
+        return [n for n in noticias
+                if n["link"] not in links_hit
+                and tema <= tokens_n[n["link"]]]
+    # ≥2 tokens distintivos compartidos — uno solo es ruido
     return [n for n in noticias
-            if n["link"] not in links_hit and tokens_n[n["link"]] & tema]
+            if n["link"] not in links_hit
+            and len(tokens_n[n["link"]] & tema) >= 2]
 
 
 def vista_alertas(email: str, msg: str = "") -> str:
@@ -3864,7 +4593,9 @@ def trending_chips(noticias: list) -> str:
 def vista_noticias(email: str, pagina: int = 1) -> str:
     cfg = json.loads(CONFIG.read_text())
     vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
-    noticias = [n for n in leer_jsonl(NOTICIAS, limite=0) if n["fuente"] in vis or n.get("via") in vis]
+    noticias = [n for n in leer_jsonl(NOTICIAS, limite=0)
+                if (n["fuente"] in vis or n.get("via") in vis)
+                and n.get("categoria") != "columnas"]
     ordenadas = sorted(noticias, key=lambda n: n["fecha"], reverse=True)
     chips = trending_chips(noticias)
     trending = f"<div class='trending'>{chips}</div>" if chips else ""
@@ -3891,47 +4622,207 @@ def vista_noticias(email: str, pagina: int = 1) -> str:
             else "<h1>Últimas noticias</h1><p>Sin noticias todavía.</p>")
 
 
+def vista_interes(email: str, pagina: int = 1) -> str:
+    """Sección Interés: notas (Tabasco o nacional) que tocan los temas
+    y nombres de la lista judicial — coincide_interes hace el filtro
+    de dos niveles."""
+    cfg = json.loads(CONFIG.read_text())
+    vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
+    noticias = [n for n in leer_jsonl(NOTICIAS, limite=0)
+                if (n["fuente"] in vis or n.get("via") in vis)
+                and coincide_interes(n)]
+    ordenadas = sorted(noticias, key=lambda n: n["fecha"], reverse=True)
+    total = len(ordenadas)
+    por_pagina = 100
+    total_paginas = max(1, (total + por_pagina - 1) // por_pagina)
+    pagina = max(1, min(pagina, total_paginas))
+    inicio = (pagina - 1) * por_pagina
+    fin = min(inicio + por_pagina, total)
+    cards = "".join(tarjeta_noticia(
+        n, "encontró: " + ", ".join(_interes_match(n)))
+        for n in ordenadas[inicio:fin])
+    info = f"{inicio + 1}-{fin} de {total}" if total else "0"
+    nav = ""
+    if total_paginas > 1:
+        ant = (f"<a href='/interes?p={pagina - 1}'>← Anterior</a>"
+               if pagina > 1 else "<span>← Anterior</span>")
+        sig = (f"<a href='/interes?p={pagina + 1}'>Siguiente →</a>"
+               if pagina < total_paginas else "<span>Siguiente →</span>")
+        nav = (f"<div class='paginacion'>{ant} "
+               f"<span class='pag-info'>{info}</span> {sig}</div>")
+    return (f"<h1>Notas de interés</h1>"
+            f"<p class='meta'>{info} notas · poder judicial y "
+            "actores del TSJ Tabasco</p>"
+            f"{nav}{cards}{nav}" if cards
+            else "<h1>Notas de interés</h1>"
+                 "<p>Aún no cae ninguna nota de la lista.</p>")
+
+
+def _chip_nota(n: dict) -> str:
+    """Enlaces por dato: primero nuestra /nota formateada, luego el
+    sitio original — el cliente confía más si puede llegar a la fuente."""
+    if not n or not n.get("u"):
+        return ""
+    u = html.escape(n["u"], quote=True)
+    t = html.escape(n.get("t", ""), quote=True)
+    fnt = html.escape(n.get("f", ""))
+    est = ("font-size:.72rem;color:#1a237e;text-decoration:none;"
+           "white-space:nowrap")
+    return (f" <a href='/nota?u={quote(n['u'], safe='')}' title='{t}'"
+            f" style='{est}'>nota</a>"
+            f"<span style='font-size:.7rem;color:#bbb'>·</span>"
+            f"<a href='{u}' target='_blank' title='{t}'"
+            f" style='{est}'>↗ {fnt}</a>")
+
+
+def _link_nota(bullet: str, notas_ref: list) -> str:
+    """Chip ↗ con la fuente si el bullet coincide (Jaccard ≥0.35) con
+    alguna nota que alimentó la síntesis."""
+    toks = _norm_titulo(bullet)
+    mejor, mejor_j = None, 0.35
+    for n in notas_ref:
+        tn = _norm_titulo(n.get("t", ""))
+        if not tn:
+            continue
+        j = len(toks & tn) / max(len(toks | tn), 1)
+        if j > mejor_j:
+            mejor, mejor_j = n, j
+    return _chip_nota(mejor) if mejor else ""
+
+
+def vista_resumenes(email: str, msg: str = "") -> str:
+    """Síntesis ejecutivas generadas con Ollama (9:00, 15:00 y 21:00)."""
+    entradas = sorted(leer_jsonl(SINTESIS),
+                      key=lambda e: e.get("fecha", ""), reverse=True)
+    cards = ""
+    for e in entradas[:30]:
+        fecha = e.get("fecha", "")[:16].replace("T", " ")
+        franja = e.get("franja", "")
+        badge = ("<span style='background:#1a237e;color:#fff;padding:2px 8px;"
+                 "border-radius:10px;font-size:.7rem'>"
+                 + franja.upper() + "</span>")
+        notas_ref = e.get("notas", [])
+        cuerpo = ""
+        _toks_vistos = []   # dedup de bullets al render — las síntesis
+        # viejas repiten la misma nota en 2-3 secciones
+        for p in e.get("texto", "").split("\n"):
+            p = p.strip()
+            if not p:
+                continue
+            sec = re.fullmatch(r"\*\*(.+?)\*\*", p)
+            if sec or (p.isupper() and len(p) > 3):
+                cuerpo += (f"<h3 style='margin:1rem 0 .4rem;color:#1a237e;"
+                           f"font-size:.95rem;letter-spacing:.05em'>"
+                           f"{html.escape(sec.group(1) if sec else p)}"
+                           f"</h3>")
+            elif re.match(
+                    r"^no (hay|se (tienen|encuentran|han|mencionan|"
+                    r"presentan|detectaron|incluye))", p, flags=re.I):
+                continue   # relleno del modelo — sección sin material
+            elif re.match(r"^[•*\-—]\s|^[•*\-—]?\s*•", p):
+                plano = re.sub(r"^[•\-—]\s*", "", p)
+                # [N#] o [N#|cat|fuente] al final → chip a esa nota
+                m_id = re.search(r"\[N(\d+)(?:\|[^\]]*)?\]\s*$", plano)
+                nota_idx = None
+                if m_id:
+                    plano = plano[:m_id.start()].rstrip()
+                    k = int(m_id.group(1)) - 1
+                    if 0 <= k < len(notas_ref):
+                        nota_idx = notas_ref[k]
+                toks = _norm_titulo(plano)
+                if any(len(toks & v) / max(len(toks | v), 1) >= 0.7
+                       for v in _toks_vistos):
+                    continue   # bullet repetido — se omite
+                _toks_vistos.append(toks)
+                txt = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>",
+                             html.escape(plano))
+                txt = txt.replace("**", "")   # asteriscos huérfanos
+                txt = _resaltar_interes(txt)
+                chip = (_chip_nota(nota_idx) if nota_idx
+                        else _link_nota(p, notas_ref))
+                cuerpo += (f"<p style='margin:.3rem 0;padding-left:1rem;"
+                           f"border-left:3px solid #e0e0e0'>• {txt}"
+                           f"{chip}</p>")
+            else:
+                txt = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>",
+                             html.escape(p))
+                cuerpo += (f"<p style='margin:.35rem 0'>"
+                           f"{_resaltar_interes(txt)}"
+                           f"{_link_nota(p, notas_ref)}</p>")
+        fuentes = sorted({n.get("f", "") for n in notas_ref} - {""})
+        detalle = ""
+        if fuentes:
+            detalle = (f"<p class='meta'>interés encontrado en "
+                       f"{len(fuentes)} fuentes: "
+                       f"{html.escape(', '.join(fuentes[:8]))}"
+                       f"{'…' if len(fuentes) > 8 else ''}</p>")
+        chips = (f"{e.get('n_notas', 0)} notas de interés"
+                 + (f" · {len(fuentes)} fuentes" if fuentes else ""))
+        cards += (f"<div class='card'><div class='meta'>{badge} {fecha} · "
+                  f"{chips}</div>{cuerpo}{detalle}</div>")
+    aviso = (f"<p class='meta' style='color:#1a237e'>{html.escape(msg)}</p>"
+             if msg else "")
+    return ("<h1>Síntesis</h1>" + aviso
+            + "<p class='meta'>Resumen ejecutivo generado con IA — "
+              "matutina 9:00 h, vespertina 15:00 h y nocturna "
+              "21:00 h.</p>"
+            + "<form method='post' action='/resumenes/generar' "
+              "style='margin-bottom:1rem'>"
+              "<button class='btn-linea'>Generar ahora</button></form>"
+            + (cards or "<p>Aún no hay síntesis — la primera sale a las "
+                        "9:00 h.</p>"))
+
+
 def busqueda_viva_wp(q: str, cfg: dict, ya: set) -> list:
     """Consulta en vivo el archivo WordPress de cada medio del catálogo:
     encuentra notas que el feed RSS no capturó (el cliente quiere TODO).
-    AND de palabras sobre el título, mismo criterio que la búsqueda local."""
+    AND de palabras sobre el título, mismo criterio que la búsqueda local.
+    Solo los hosts con API WP viva (wp_scan.json, escaneo diario) —
+    antes pegaba a ~100 dominios ×2 hosts y la página se colgaba ~1min."""
     import concurrent.futures
-    doms, vistos_d = [], set()
+    nom_por_dom = {}
     for f in cfg["fuentes"]:
         m = re.search(r"https?://([^/]+)", f["url"])
-        if m and m.group(1) not in vistos_d:
-            vistos_d.add(m.group(1))
-            doms.append((m.group(1), f["nombre"]))
+        if m:
+            nom_por_dom.setdefault(
+                re.sub(r"^www\.", "", m.group(1)), f["nombre"])
+    # lista del escaneo diario; si no existe todavía, no buscar en vivo
+    # (mejor sin 'en el archivo' que colgar la búsqueda 1 min)
+    hosts_vivos = cargar_json(WP_SCAN, {}).get("hosts", [])
+    if not hosts_vivos:
+        return []
+    doms = []
+    for h in hosts_vivos:
+        dom = re.sub(r"^www\.", "", h)
+        nom = nom_por_dom.get(dom)
+        if nom:
+            doms.append((h, nom))
     terms = normalizar(q).split()
     if not terms:
         return []
 
-    def probe(dom_nombre):
-        dom, nombre = dom_nombre
-        hosts = [dom] + ([] if dom.startswith("www.") else ["www." + dom])
-        for host in hosts:
-            try:
-                r = requests.get(
-                    f"https://{host}/wp-json/wp/v2/search",
-                    params={"search": q, "per_page": 10},
-                    timeout=6, headers={"User-Agent": "Mozilla/5.0"})
-                if r.status_code != 200:
-                    continue
-                data = r.json()
-                if not isinstance(data, list):
-                    continue
-                hits = [{"titulo": html.unescape(it.get("title", "")),
-                         "link": it.get("url", ""), "fuente": nombre}
-                        for it in data
-                        if it.get("url") and it.get("url") not in ya
-                        and all(t in normalizar(it.get("title", ""))
-                                for t in terms)]
-                return hits   # el endpoint respondió: no probar otro host
-            except Exception:
-                continue
-        return []
+    def probe(host_nombre):
+        host, nombre = host_nombre
+        try:
+            r = requests.get(
+                f"https://{host}/wp-json/wp/v2/search",
+                params={"search": q, "per_page": 10},
+                timeout=4, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            if not isinstance(data, list):
+                return []
+            return [{"titulo": html.unescape(it.get("title", "")),
+                     "link": it.get("url", ""), "fuente": nombre}
+                    for it in data
+                    if it.get("url") and it.get("url") not in ya
+                    and all(t in normalizar(it.get("title", ""))
+                            for t in terms)]
+        except Exception:
+            return []
 
-    with concurrent.futures.ThreadPoolExecutor(30) as ex:
+    with concurrent.futures.ThreadPoolExecutor(16) as ex:
         out = []
         for hits in ex.map(probe, doms):
             out.extend(hits)
@@ -3997,11 +4888,12 @@ def vista_config(email: str) -> str:
     <input type="hidden" name="idx" value="{i}">
     <label>Nombre de la regla</label>
     <input type="text" name="nombre" value="{html.escape(r['nombre'], quote=True)}" required>
-    <label>Palabras que deben aparecer TODAS (separadas por coma)</label>
+    <label>Palabras clave (separadas por coma)</label>
     <input type="text" name="palabras"
            value="{html.escape(', '.join(r['requiere_todas']), quote=True)}" required>
-    <p class="meta" style="margin:.2rem 0">Coma = todas deben aparecer ·
-    <b>/</b> = sinónimos (ej: <code>villahermosa/tabasco</code>)</p>
+    <p class="meta" style="margin:.2rem 0">Coma = palabras a buscar ·
+    con 3+ basta que falte UNA · <b>/</b> = sinónimos
+    (ej: <code>villahermosa/tabasco</code>)</p>
     <div class="regla-pie">
       <input type="color" name="color" value="{color}" title="Color del badge">
       <button name="accion" value="editar">Guardar</button>
@@ -4081,11 +4973,28 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
                          headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
     except Exception as e:
-        return (f"<div class='lector'><h2>No se pudo cargar la nota</h2>"
-                f"<p class='meta'>{html.escape(str(e))}</p>"
-                f"<a class='origen' href='{html.escape(link)}' "
-                f"target='_blank' rel='noopener'>Abrir en {html.escape(dominio)} ↗</a></div>",
-                {"titulo": "", "imagen": "", "desc": "", "dominio": dominio})
+        # el medio bloquea al servidor (403/WAF) — mostrar lo que tenemos
+        # guardado de la nota en vez de una pantalla vacía
+        nota = next((n for n in leer_jsonl(NOTICIAS)
+                     if n["link"] == link), {})
+        t = nota.get("titulo", "")
+        img = nota.get("imagen", "")
+        res = nota.get("resumen", "")
+        return ("<div class='lector'>"
+                "<a href='javascript:history.back()'>← Regresar</a>"
+                f"<h1>{html.escape(t or 'No se pudo cargar la nota')}</h1>"
+                f"<div class='meta'>Fuente original: {html.escape(dominio)}</div>"
+                + (f"<img class='hero' src='{html.escape(url_https(img))}' "
+                   f"onerror='this.remove()'>" if img else "")
+                + (f"<p class='lede'>{html.escape(res[:600])}</p>" if res else "")
+                + f"<p class='meta'>El medio bloqueó la lectura "
+                  f"({html.escape(str(e))}) — el texto completo está en "
+                  "el sitio original.</p>"
+                + f"<a class='origen' href='{html.escape(link)}' "
+                  f"target='_blank' rel='noopener'>Abrir en "
+                  f"{html.escape(dominio)} ↗</a></div>",
+                {"titulo": t, "imagen": img,
+                 "desc": res[:200], "dominio": dominio})
 
     titulo = _meta(r.text, "og:title") or _meta(r.text, "twitter:title") or ""
     if not titulo:
@@ -4095,12 +5004,21 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
     if imagen and imagen.startswith("/"):
         imagen = urljoin(link, imagen)   # og:image relativo → absoluto
     desc = _meta(r.text, "og:description") or _meta(r.text, "description")
+    if desc:
+        # &lt;/B&gt; literal del medio (Reforma escapa dos veces) — unescape
+        # y limpiar cualquier tag residual para que no salga crudo
+        desc = re.sub(r"<[^>]+>", "", html.unescape(desc)).strip()
     meta = {"titulo": titulo, "imagen": imagen, "desc": desc,
             "dominio": dominio}
 
     # párrafos del cuerpo: filtrar menús/pies (textos cortos) y duplicados
+    # — primero limpiar <script>/<style>: los ads los meten dentro de <p>
+    #   y el regex los volcaba como texto plano (googletag de Crónica)
+    doc_p = re.sub(r"<script[\s\S]*?</script>", " ", r.text, flags=re.I)
+    doc_p = re.sub(r"<style[\s\S]*?</style>", " ", doc_p, flags=re.I)
+    doc_p = re.sub(r"<!--[\s\S]*?-->", " ", doc_p)
     paras, vistos_p = [], set()
-    for p in re.findall(r"<p[^>]*>(.*?)</p>", r.text, re.S | re.I):
+    for p in re.findall(r"<p[^>]*>(.*?)</p>", doc_p, re.S | re.I):
         txt = re.sub(r"<[^>]+>", " ", p)
         txt = html.unescape(re.sub(r"\s+", " ", txt)).strip()
         if len(txt) > 60 and txt not in vistos_p:
@@ -4113,6 +5031,14 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
         + "".join(f"<p>{html.escape(p)}</p>" for p in paras)
     if not cuerpo:
         cuerpo = ("<p class='meta'>El sitio no permitió extraer el texto.</p>")
+
+    # fuente paywalled → avisar que solo hay lede
+    nota_guardada = next((n for n in leer_jsonl(NOTICIAS)
+                          if n["link"] == link), {})
+    if nota_guardada.get("paywall"):
+        cuerpo += ("<p class='meta' style='color:#b45309;font-weight:600'>"
+                   "SUSCRIPCIÓN REQUERIDA — el medio solo publica el "
+                   "adelanto; el texto completo es de pago.</p>")
 
     # ¿la página original tiene video? metas, tag <video> o players conocidos
     hay_video = bool(re.search(
@@ -5577,7 +6503,8 @@ def servir_web(puerto: int):
                 return
             if ruta.path == "/":
                 self.send_response(303)
-                self.send_header("Location", "/noticias")
+                self.send_header(
+                    "Location", home_usuario(email))
                 self.end_headers()
             elif ruta.path == "/destacadas":
                 self._html(render_pagina(
@@ -5642,6 +6569,17 @@ def servir_web(puerto: int):
                         self.wfile.write(doc.read_bytes())
                     else:
                         self.send_error(404)
+            elif ruta.path == "/columnas":
+                self._html(render_pagina(vista_columnas(email),
+                                         base=base, usuario=email))
+            elif ruta.path == "/interes":
+                self._html(render_pagina(vista_interes(
+                    email, int(params.get("p", ["1"])[0])),
+                    base=base, usuario=email))
+            elif ruta.path == "/resumenes":
+                self._html(render_pagina(vista_resumenes(
+                    email, params.get("msg", [""])[0]),
+                    base=base, usuario=email))
             elif ruta.path == "/portadas":
                 sec = params.get("sec", ["nacional"])[0]
                 self._html(render_pagina(
@@ -5766,7 +6704,9 @@ def servir_web(puerto: int):
                 self.wfile.write(MANIFEST)
             elif ruta.path == "/og.png" and OG_PNG.exists():
                 self.send_response(200)
-                self.send_header("Content-Type", "image/png")
+                mime_og = "image/jpeg" if OG_PNG.suffix in \
+                    (".jpg", ".jpeg") else "image/png"
+                self.send_header("Content-Type", mime_og)
                 self.send_header("Cache-Control", "public, max-age=86400")
                 self.end_headers()
                 self.wfile.write(OG_PNG.read_bytes())
@@ -5808,7 +6748,8 @@ def servir_web(puerto: int):
                 if email and password_valida(email, pw, cfg):
                     perfil_usuario(email, cfg)  # autocrear en el primer login
                     self.send_response(303)
-                    self.send_header("Location", "/noticias")
+                    self.send_header("Location",
+                                     home_usuario(email))
                     self.send_header("Set-Cookie",
                                      cookie_sesion(email, https))
                     self.end_headers()
@@ -5829,6 +6770,43 @@ def servir_web(puerto: int):
                 self.send_response(303)
                 self.send_header("Location", "/noticias")
                 self.send_header("Set-Cookie", cookie_sesion(email, https))
+                self.end_headers()
+                return
+
+            if ruta.path == "/resumenes/generar":
+                email = self._usuario()
+                if not email:
+                    self.send_response(303)
+                    self.send_header("Location", "/")
+                    self.end_headers()
+                    return
+                cfg_s = json.loads(CONFIG.read_text())
+                h = datetime.now().hour
+                franja = ("matutina" if h < 9 else
+                          "vespertina" if h < 15 else "nocturna")
+                threading.Thread(target=generar_sintesis,
+                                 args=(cfg_s, franja), daemon=True,
+                                 name="sintesis").start()
+                self.send_response(303)
+                self.send_header(
+                    "Location",
+                    "/resumenes?msg=" + quote(
+                        "Generando síntesis — recarga en ~1 minuto"))
+                self.end_headers()
+                return
+
+            if ruta.path == "/portadas/recapturar":
+                email = self._usuario()
+                cfg_r = json.loads(CONFIG.read_text())
+                if not email or not es_admin(email, cfg_r):
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                msg = _descartar_portada(
+                    form.get("m", [""])[0])
+                self.send_response(303)
+                self.send_header("Location", "/schedule?msg="
+                                 + quote(msg))
                 self.end_headers()
                 return
 
@@ -5926,9 +6904,18 @@ def main():
                 threading.Thread(target=generar_pdfs_portadas,
                                  args=(cfg,), daemon=True,
                                  name="portadas-pdf").start()
+            if toca_pdf_portadas2(cfg):
+                threading.Thread(target=generar_pdfs_portadas,
+                                 args=(cfg, "pdf_fecha2"), daemon=True,
+                                 name="portadas-pdf2").start()
             if toca_limpia_portadas(cfg):
                 limpiar_portadas()
                 marcar_limpia_portadas()
+            for franja in ("matutina", "vespertina", "nocturna"):
+                if toca_sintesis(franja):
+                    threading.Thread(target=generar_sintesis,
+                                     args=(cfg, franja), daemon=True,
+                                     name=f"sintesis-{franja}").start()
             with _LOCK_REVISAR:
                 revisar(cfg, args.todo, args.resumir)
             # siesta adaptativa: en la ventana portadas (00:10→07:00)
@@ -5939,7 +6926,8 @@ def main():
             _p = cfg.get("portadas", {})
             en_zona = (_hhmm(_p, "hora_desde", "00:30") - 20
                        <= ahora_m
-                       < _hhmm(_p, "hora_pdf", "06:45") + 15)
+                       < _hhmm(_p, "hora_pdf2",
+                               _p.get("hora_pdf", "06:45")) + 15)
             siesta = 5 if en_zona else args.loop
             print(f"\n--- durmiendo {siesta} min ---")
             time.sleep(siesta * 60)
@@ -5953,4 +6941,5 @@ if __name__ == "__main__":
 if __name__ == "__main__":
     sys.exit(main())
 if __name__ == "__main__":
+    sys.exit(main())
     sys.exit(main())
