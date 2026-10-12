@@ -2158,13 +2158,13 @@ def scrapear_posts_fb(cfg: dict):
                             "if (el.scrollHeight > el.clientHeight+50) "
                             "el.scrollTop += 2200;")
                         pg.wait_for_timeout(1300)
-                        n = pg.evaluate(
-                            "document.querySelectorAll("
-                            "'a[href*=\"/posts/\"]"
-                            ",a[href*=\"pfbid\"]"
-                            ",a[href*=\"/photo/?fbid=\"]"
-                            ",a[href*=\"/reel/\"]"
-                            ").length")
+                        try:
+                            n = pg.evaluate(
+                                "document.querySelectorAll("
+                                "'a[href*=\"/posts/\"],a[href*=\"pfbid\"]"
+                                ",a[href*=\"/permalink/\"]').length")
+                        except Exception:
+                            n = prev  # si el evaluate falla, sigue
                         # FB virtualiza el DOM — los articles vienen y
                         # van; acumular en cada paso o la ventana final
                         # puede quedar VACÍA (10 scrolls → 0 posts)
