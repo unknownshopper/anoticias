@@ -576,7 +576,9 @@ def generar_sintesis(cfg: dict, franja: str) -> str:
         "monitoreo de medios. Formato exacto:\n"
         "- Subtítulos de sección en mayúsculas, en este orden y solo si "
         "hay material REAL en las notas: PODER JUDICIAL DE TABASCO, "
-        "JUSTICIA Y SEGURIDAD EN TABASCO, COLUMNAS Y OPINIÓN.\n"
+        "JUSTICIA Y SEGURIDAD EN TABASCO, COLUMNAS Y OPINIÓN, "
+        "REDES SOCIALES (esta última para notas con categoria "
+        "'redes' o 'x' — cita quién publicó y de qué habla).\n"
         "- Bajo cada sección, UN bullet '•' por cada nota o tema "
         "distinto — no agrupes varias notas en un bullet ni repitas la "
         "misma en dos secciones. Cada bullet lleva el dato concreto: "
@@ -630,6 +632,18 @@ def _sel_interes_extendida(desde: datetime) -> list:
             [n for n in leer_jsonl(NOTICIAS, limite=0)
              if n.get("fecha", "") >= desde.isoformat()
              and coincide_interes(n)])[:60]
+    # posts de redes que DISPARARON alguna regla (alertas.jsonl) entran
+    # a la selección aunque no sean de interés judicial — la síntesis
+    # puede citar al menos uno cuando hay ruido social relevante
+    alertados = {a["link"] for a in leer_jsonl(ALERTAS)
+                 if a.get("fecha", "") >= desde.isoformat()}
+    if alertados:
+        en_sel = {n["link"] for n in sel}
+        sel += [n for n in leer_jsonl(NOTICIAS, limite=0)
+                if n.get("categoria") in ("redes", "x")
+                and n["link"] in alertados
+                and n["link"] not in en_sel
+                and n.get("fecha", "") >= desde.isoformat()][:4]
     return sel
 
 
@@ -700,6 +714,9 @@ def generar_cierre(cfg: dict) -> str:
         "- PROHIBIDO inventar datos, citas, cifras o personajes que no "
         "estén en las notas.\n"
         "- De 6 a 10 segmentos, párrafos cortos de 2-3 líneas.\n"
+        "- Si hay notas de categoria 'redes' o 'x' (publicaciones en "
+        "Facebook/X), reserva UN segmento para la más relevante, "
+        "citando quién publicó.\n"
         "- Cierra cada segmento con [N#] — el número de la nota que lo "
         "justifica.\n"
         "- Sin títulos ni subtítulos: texto continuo de briefing. "
@@ -719,19 +736,24 @@ def generar_cierre(cfg: dict) -> str:
     if not texto or texto.startswith("(no se pudo"):
         print("[cierre] respuesta vacía de ollama")
         return ""
-    # versión para X: un solo post ≤280, mismo tono institucional —
+    # versión para X: la CONCLUSIÓN de la tarjeta adaptada a un post
+    # ≤280 (el primer post real salió así y es el formato deseado) —
     # el modelo sigue caliente (KEEP_ALIVE), costo ~2s
     post_x = ""
     try:
         r2 = requests.post(
             cfg["ollama"]["url"],
             json={"model": cfg["ollama"]["modelo"],
-                  "prompt": "Condensa este briefing institucional en UN "
-                            "post de X de máximo 270 caracteres: tono "
-                            "sobrio, tercera persona, sin hashtags "
-                            "inventados, sin emojis, sin nombres que "
-                            "no estén en el texto. Devuelve SOLO el "
-                            "post, nada más.\n\n" + texto[:3500],
+                  "prompt": "Este briefing institucional termina con una "
+                            "conclusión ('En conclusion…' o similar). "
+                            "Reescríbela como UN post de X de máximo "
+                            "270 caracteres: tono sobrio, tercera "
+                            "persona, sin hashtags inventados, sin "
+                            "emojis, sin nombres que no estén en el "
+                            "texto. Si menciona al Poder Judicial del "
+                            "Estado de Tabasco, firma @tsj_tabasco. "
+                            "Devuelve SOLO el post, nada más.\n\n"
+                            + texto[-2500:],
                   "stream": False},
             timeout=240)
         post_x = r2.json().get("response", "").strip()
@@ -759,9 +781,12 @@ def generar_cierre(cfg: dict) -> str:
 def toca_sintesis(franja: str) -> bool:
     """True si pasó la hora de la franja y aún no hay síntesis de hoy."""
     ahora = datetime.now()
-    hora = {"matutina": 9, "vespertina": 15, "nocturna": 21}.get(
-        franja, 9)
-    if ahora.hour < hora:
+    # minutos desde medianoche — el cierre va 5 min tras la nocturna,
+    # no a las 23:00 (demasiado tarde para publicar en X)
+    hora = {"matutina": 9 * 60, "vespertina": 15 * 60,
+            "nocturna": 21 * 60, "cierre": 21 * 60 + 5}.get(
+        franja, 9 * 60)
+    if ahora.hour * 60 + ahora.minute < hora:
         return False
     hoy = ahora.strftime("%Y-%m-%d")
     return not any(e.get("franja") == franja
@@ -934,9 +959,14 @@ def _scrapear_x_posts(handle: str) -> list:
                     const tt = t.querySelector(
                         'div[data-testid="tweetText"]');
                     const tm = t.querySelector('time');
+                    // media real del post (foto adjunta) — el avatar
+                    // NO (og:image de X siempre devuelve el perfil)
+                    const ph = t.querySelector(
+                        'div[data-testid="tweetPhoto"] img');
                     out.push({link: link,
                               autor: (link.split('/')[3] || ''),
                               txt: tt ? tt.innerText : '',
+                              img: ph ? ph.src : '',
                               time: tm ? (tm.dateTime || '') : ''});
                 }
                 return out;
@@ -953,10 +983,13 @@ def _scrapear_x_posts(handle: str) -> list:
                 if p_.get("time") else None
         except Exception:
             pp = None
-        out.append({"link": p_["link"], "title": txt[:140] or "post",
-                    "summary": txt, "published_parsed": pp,
-                    "_autor": "@" + p_["autor"] if p_.get("autor")
-                              else ""})
+        ent = {"link": p_["link"], "title": txt[:140] or "post",
+               "summary": txt, "published_parsed": pp,
+               "_autor": "@" + p_["autor"] if p_.get("autor")
+                         else ""}
+        if p_.get("img"):
+            ent["media_content"] = [{"url": p_["img"]}]
+        out.append(ent)
     return out
 
 
@@ -1193,7 +1226,10 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
             solo = fuente.get("solo_si_menciona")
             if solo and not any(normalizar(p) in normalizar(texto) for p in solo):
                 continue
-            if not imagen:
+            # X: su og:image es siempre el avatar del autor — inútil;
+            # el media real lo extrae el scraper del DOM del tweet
+            if not imagen and not re.search(
+                    r"(x|twitter)\.com/", link):
                 imagen = url_https(extraer_og_image(link))
             if imagen and frecuencia_img[imagen] >= 3:
                 imagen = ""
@@ -4763,10 +4799,14 @@ def tarjeta_destacada(rep: dict, cluster: list) -> str:
 
 def tarjeta_noticia(n: dict, extra: str = "") -> str:
     autor = _autor_limpio(n)
+    img = n.get("imagen", "")
+    # avatar de X (og:image = perfil) no es media del post — fuera
+    if "profile_images" in img:
+        img = ""
     return (
         f"<a class='card nota' href='/nota?u={quote(n['link'], safe='')}'"
-        f">"+ (f"<img class='thumb' src='{html.escape(url_https(n['imagen']))}' loading='lazy' "
-           f"onerror='this.remove()'>" if n.get("imagen") else "")
+        f">"+ (f"<img class='thumb' src='{html.escape(url_https(img))}' loading='lazy' "
+           f"onerror='this.remove()'>" if img else "")
         + f"<div class='meta2'><span class='chip-fuente'>"
         f"{html.escape(n['fuente'])}</span>"
         f"<span class='meta'>{fmt_fecha(n['fecha'])}{autor}</span></div>"
@@ -5288,8 +5328,114 @@ def vista_x(email: str) -> str:
     posts = [n for n in posts
              if not n["fuente"].startswith("@")
              or n["fuente"].lower().lstrip("@") in permitidos][:200]
+
+    # 'Lo más comentado': clustering del radar COMPLETO (los ~1,100
+    # follows, no solo la whitelist) — mismo tema repetido en varias
+    # cuentas = de qué se habla hoy, tipo trending de tu propia red
+    h24 = (datetime.now() - timedelta(hours=24)).isoformat()
+    radar = [n for n in leer_jsonl(NOTICIAS, limite=0)
+             if n.get("categoria") == "x" and n.get("fecha", "") > h24]
+    clusters = []
+    for rep, c in agrupar_noticias(radar, ventana_dias=1):
+        if len(c) < 2:
+            continue
+        # copypasta bot: ≥4 posts y casi todo el texto idéntico entre
+        # cuentas distintas — campaña coordinada, no conversación
+        # (X los banea rápido: por eso el link ya no muestra nada)
+        textos = {normalizar(n["titulo"])[:120] for n in c}
+        if len(c) >= 4 and len(textos) <= 2:
+            continue
+        # ancla local: toca la lista de interés, menciona Tabasco, o
+        # lo publica una cuenta local SIN que el tema sea de otro
+        # estado — XEVT republicando notas de Manzanillo/Colima no
+        # vuelve relevante el tema por ser un medio tabasqueño
+        def _ancla(n):
+            txt = normalizar(n["titulo"] + " " + (n.get("resumen") or ""))
+            return (coincide_interes(n)
+                    or any(g in txt for g in ("tabasco", "villahermosa"))
+                    or (n["fuente"].lower().lstrip("@") in permitidos
+                        and not RX_AJENOS.search(txt)))
+        if not any(_ancla(n) for n in c):
+            continue
+        clusters.append((rep, c))
+
+    def _run_comun(a: str, b: str) -> int:
+        """Palabras del run contiguo común más largo entre dos
+        titulares — mide si hablan del mismo asunto con distinto
+        actor/hashtag."""
+        ta, tb = a.split(), b.lower()
+        for L in range(min(len(ta), 20), 3, -1):
+            for i in range(len(ta) - L + 1):
+                if " ".join(ta[i:i + L]).lower() in tb:
+                    return L
+        return 0
+
+    # fusión: dos clusters cuyos representantes comparten un run largo
+    # son EL MISMO tema partido por hashtag/nombre distinto
+    # (#EntérateTH vs #Rumboal2027 — ambos 'registro p/Coordinación')
+    fus = []
+    for rep, c in clusters:
+        for j, (r2, c2) in enumerate(fus):
+            if _run_comun(rep["titulo"], r2["titulo"]) >= 6:
+                fus[j] = (r2 if len(r2["titulo"]) >= len(rep["titulo"])
+                          else rep, c2 + c)
+                break
+        else:
+            fus.append((rep, c))
+    clusters = fus[:12]
+
+    def _tema_cluster(c: list) -> str:
+        """Etiqueta del tema: la frase contigua más larga presente en
+        TODOS los posts del cluster — no el titular de un solo post
+        ('José Del Carmen anunció registro' esconde que el tema real es
+        'registros para la Coordinación Municipal')."""
+        if len(c) < 2:
+            return c[0]["titulo"]
+        toks = [n["titulo"].split() for n in c]
+        # el titular más largo como base del n-grama — no el primero
+        base, otros = max(toks, key=len), [
+            " ".join(t).lower() for t in toks]
+        mejor = ""
+        # n-grama común más largo (4+ palabras), de mayor a menor
+        for L in range(min(len(base), 15), 3, -1):
+            for i in range(len(base) - L + 1):
+                g = " ".join(base[i:i + L]).lower()
+                if len(g) > len(mejor) and all(
+                        g in o for o in otros):
+                    mejor = " ".join(base[i:i + L])
+            if mejor:
+                break
+        # hashtag común a todos como prefijo del tema
+        ht = [t for t in set(base) if t.startswith("#")
+              and all(t.lower() in o for o in otros)]
+        etiqueta = mejor or c[0]["titulo"]
+        if ht and ht[0].lower() not in mejor.lower():
+            etiqueta = f"{ht[0]} {etiqueta}"
+        return etiqueta[:130]
+    trend = ""
+    if clusters:
+        filas = "".join(
+            f"<details class='card' style='border-left-color:#1da1f2'>"
+            f"<summary><b>{len(c)} posts</b> · "
+            f"{html.escape(_tema_cluster(c))} · "
+            f"<span class='meta'>{', '.join(sorted({n['fuente'] for n in c}))}</span>"
+            f"</summary>"
+            + "".join(
+                f"<p style='margin:.4rem 0 .4rem 1rem'>"
+                f"<a href='/nota?u={quote(n['link'], safe='')}'>"
+                f"{html.escape(n['titulo'][:140])}</a> "
+                f"<span class='meta'>{n['fuente']} · "
+                f"{fmt_fecha(n['fecha'])}</span></p>"
+                for n in sorted(c, key=lambda n: n['fecha'],
+                                reverse=True))
+            + "</details>"
+            for rep, c in clusters)
+        trend = (f"<h2 style='margin:1rem 0 .4rem'>Lo más comentado "
+                 f"en tu red · 24 h</h2>{filas}")
+
     cards = "".join(tarjeta_noticia(n) for n in posts)
-    return (f"<h1>X</h1><p class='meta'>{len(posts)} posts</p>{cards}"
+    return (f"<h1>X</h1><p class='meta'>{len(posts)} posts</p>"
+            f"{trend}<h2 style='margin:1rem 0 .4rem'>Cronológico</h2>{cards}"
             if cards
             else "<h1>X</h1><p class='meta'>Aún no hay posts capturados "
                  "— agrega cuentas en Fuentes con tipo 'x' (x:handle). "
@@ -5556,9 +5702,9 @@ def vista_resumenes(email: str, msg: str = "") -> str:
                 "text-align:center;font-weight:600'")
         filas = "".join(
             f"<tr><td {td_e}>{g}</td>"
-            f"<td {td_n}>{conteo_g.get(g, 0):02d}</td></tr>"
+            f"<td {td_n}>{conteo_g[g]:02d}</td></tr>"
             for g in ("Portales de Internet", "Facebook", "X",
-                      "Columnas"))
+                      "Columnas") if conteo_g.get(g))
         cuadro_g = (
             f"<table style='border-collapse:collapse;font-size:.74rem;"
             f"margin:.4rem 0 1rem;width:260px'>"
@@ -5591,7 +5737,7 @@ def vista_resumenes(email: str, msg: str = "") -> str:
             f"{datetime.now().strftime('%d/%m/%y')}</h1>" + aviso
             + "<p class='meta'>Resumen ejecutivo — "
               "matutina 9:00 h, vespertina 15:00 h y nocturna "
-              "21:00 h.</p>" + cuadro_g
+              "21:00 h, cierre 21:05 h.</p>" + cuadro_g
             + (("<form method='post' action='/resumenes/generar' "
                 "style='margin-bottom:1rem;display:flex;gap:.5rem'>"
                 + (f"<button class='btn-linea' disabled "
@@ -5659,8 +5805,9 @@ def vista_reporte_resumenes(sel: list) -> str:
     filas = "".join(
         f"<tr><td style='{td_e}'>{g}</td>"
         f"<td style='{td_e};text-align:center;font-weight:600'>"
-        f"{conteo.get(g, 0):02d}</td></tr>"
-        for g in ("Portales de Internet", "Facebook", "X", "Columnas"))
+        f"{conteo[g]:02d}</td></tr>"
+        for g in ("Portales de Internet", "Facebook", "X", "Columnas")
+        if conteo.get(g))
     cuadro = (f"<table style='border-collapse:collapse;font-size:.78rem;"
               f"margin:.8rem 0 1.2rem;width:280px'>"
               f"<tr><th style='background:#1a237e;color:#fff;padding:5px"
@@ -5711,9 +5858,9 @@ def vista_reporte_resumenes(sel: list) -> str:
   <button onclick="window.print()">Imprimir / guardar PDF</button>
   <a href="/resumenes/reporte?{qs}&fmt=png"><button>Descargar PNG</button></a>
 </div>
-<h1>SÍNTESIS EJECUTIVA DEL {fecha_larga.upper()}</h1>
+<h1>SÍNTESIS DE NOTICIAS DEL {fecha_larga.upper()}</h1>
 <p class="sub">Monitor de medios — matutina 9:00 h, vespertina 15:00 h,
-nocturna 21:00 h · {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
+nocturna 21:00 h, cierre del día 21:05 h · {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
 {cuadro}
 {secciones or "<p>Sin síntesis seleccionadas.</p>"}
 </body></html>"""
@@ -5966,6 +6113,31 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
                   f"target='_blank' rel='noopener'>Abrir la nota en el medio ↗</a></div>",
                 {"titulo": t, "imagen": img,
                  "desc": "Nota vía Google News", "dominio": dominio})
+    if re.search(r"(^|\.)(x|twitter)\.com$", dominio):
+        # el post ES el contenido — x.com anónimo solo enseña el
+        # login-wall ('age-restricted'). Servir el texto guardado.
+        nota = next((n for n in leer_jsonl(NOTICIAS)
+                     if n["link"] == link), {})
+        t = nota.get("resumen") or nota.get("titulo", "")
+        aut = nota.get("fuente", "")
+        img = nota.get("imagen", "")
+        # avatar guardado de antes del fix (og:image de X = perfil):
+        # no es media del post — fuera
+        if "profile_images" in img:
+            img = ""
+        return ("<div class='lector'>"
+                "<a href='javascript:history.back()'>← Regresar</a>"
+                f"<h1>{html.escape(t[:140] or 'Post en X')}</h1>"
+                f"<div class='meta'>Fuente: {html.escape(aut)}"
+                f" · {html.escape(dominio)} · "
+                f"{html.escape(fmt_fecha(nota.get('fecha', '')))}</div>"
+                + (f"<img class='hero' src='{html.escape(url_https(img))}' "
+                   f"onerror='this.remove()'>" if img else "")
+                + (f"<p class='lede'>{html.escape(t)}</p>" if t else "")
+                + f"<a class='origen' href='{html.escape(link)}' "
+                  f"target='_blank' rel='noopener'>Abrir en X ↗</a></div>",
+                {"titulo": t[:140], "imagen": img,
+                 "desc": t[:200], "dominio": dominio})
     try:
         # (4s conexión, 8s por lectura) + tope 1.5MB: un medio que
         # entrega el body a gotas podía colgar el lector minutos —
@@ -8125,6 +8297,13 @@ def main():
                     threading.Thread(target=generar_sintesis,
                                      args=(cfg, franja), daemon=True,
                                      name=f"sintesis-{franja}").start()
+            # cierre del día: automático 21:05, 5 min tras la
+            # nocturna (el post a X sigue siendo botón — humano)
+            if toca_sintesis("cierre") and "cierre" not in _GENERANDO:
+                _GENERANDO.add("cierre")
+                threading.Thread(target=_gen_bg,
+                                 args=(generar_cierre, "cierre", cfg),
+                                 daemon=True, name="cierre").start()
             # chucky: posts de las fuentes tipo fb, cada 4 h
             if toca_fb_posts():
                 threading.Thread(target=scrapear_posts_fb,
