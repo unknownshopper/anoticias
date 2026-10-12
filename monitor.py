@@ -2881,6 +2881,9 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
         if m.get("fb") and not data:
             data = _bajar_portada_fb(m)
             src_fb = bool(data)
+            if not data:
+                print(f"[fb] {m['nombre']}: sin portada usable "
+                      "(sin post de hoy o 0 imágenes bajadas)")
         if m.get("calameo") and not data:
             data = _portada_calameo(m)
         if m.get("issuu") and not data:
