@@ -4892,12 +4892,6 @@ INTERES_FUERTES = [
 ]
 # \b en nombres: 'javier may' como substring crudo colaría
 # 'Mayagoitia'/'Javier Mayor'
-RX_FUERTES = re.compile(r"\b(?:" + "|".join(
-    re.escape(t) for t in INTERES_FUERTES) + r")\b")
-# siglas tabasqueñas inequívocas — \b obligatorio ('tet' de substring
-# colaría 'teta'); TET = Tribunal Electoral de Tabasco, OSFE = órgano
-# estatal de fiscalización
-RX_SIGLAS_FUERTES = re.compile(r"\b(tet|osfe)\b")
 INTERES_DEBILES_TEMA = [
     # temas abstractos: sin 'tabasco' explícito pueden ser de otro
     # estado o de la reforma federal — no cuentan
@@ -4922,7 +4916,6 @@ INTERES_DEBILES_ACTOR = [
     "oficial mayor del tribunal",
 ]
 INTERES_TABASCO = ["tabasco", "villahermosa", "resendez"]
-RX_SIGLAS_TEMA = re.compile(r"\btdj\b")
 RX_TSJ = re.compile(r"\btsjt?\b")
 # 'Tribunal Superior de Justicia de Guerrero/CDMX/…' — no es el TSJT
 RX_TSJ_OTRO = re.compile(
@@ -4939,8 +4932,57 @@ INTERES_AJENOS = [
     "veracruz", "yucatan", "zacatecas", "teey", "teez",
     "tribunal electoral del estado de yucatan",
 ]
-RX_AJENOS = re.compile(r"\b(?:" + "|".join(
-    re.escape(t) for t in INTERES_AJENOS) + r")\b")
+# ── listas de interés extensibles desde config.json['interes'] ──
+# claves opcionales: fuertes, debiles_tema, debiles_actor, tabasco,
+# ajenos (listas de frases) y siglas_fuertes/siglas_tema (\b crudo).
+# Los regex se compilan por demanda y se cachean por mtime — editar
+# config.json basta, sin restart ni cambios de código.
+_INTERES_RX: dict = {"m": -1.0, "d": {}}
+
+
+def _interes_listas() -> dict:
+    """Listas base + extras de config.json['interes'] con los regex
+    compilados — mtime de config invalida el cache."""
+    try:
+        m = CONFIG.stat().st_mtime
+    except OSError:
+        m = 0.0
+    if _INTERES_RX["m"] != m:
+        try:
+            ext = json.loads(CONFIG.read_text()).get("interes", {})
+        except Exception:
+            ext = {}
+        def L(base, clave):
+            return list(base) + [str(t) for t in ext.get(clave, [])]
+        d = {
+            "fuertes": L(INTERES_FUERTES, "fuertes"),
+            "debiles_tema": L(INTERES_DEBILES_TEMA, "debiles_tema"),
+            "debiles_actor": L(INTERES_DEBILES_ACTOR, "debiles_actor"),
+            "tabasco": L(INTERES_TABASCO, "tabasco"),
+            "ajenos": L(INTERES_AJENOS, "ajenos"),
+        }
+        # siglas tabasqueñas inequívocas — \b obligatorio ('tet' como
+        # substring colaría 'teta'); TET = Tribunal Electoral de Tabasco,
+        # OSFE = órgano estatal de fiscalización
+        sig_f = [re.escape(t) for t in
+                 list(ext.get("siglas_fuertes", [])) or ["tet", "osfe"]]
+        sig_t = [re.escape(t) for t in
+                 list(ext.get("siglas_tema", [])) or ["tdj"]]
+        d["rx_fuertes"] = re.compile(r"\b(?:" + "|".join(
+            re.escape(t) for t in d["fuertes"]) + r")\b")
+        d["rx_siglas_f"] = re.compile(r"\b(?:" + "|".join(sig_f) + r")\b")
+        d["rx_siglas_t"] = re.compile(r"\b(?:" + "|".join(sig_t) + r")\b")
+        d["rx_ajenos"] = re.compile(r"\b(?:" + "|".join(
+            re.escape(t) for t in d["ajenos"]) + r")\b")
+        d["rx_hl"] = re.compile(
+            r"\b(" + "|".join(
+                _pat_interes(t) for t in sorted(
+                    d["fuertes"] + d["debiles_tema"]
+                    + d["debiles_actor"] + d["tabasco"],
+                    key=len, reverse=True))
+            + r"|tsjt?|" + "|".join(sig_f + sig_t) + r")", re.I)
+        _INTERES_RX.update({"m": m, "d": d})
+    return _INTERES_RX["d"]
 
 
 _RX_ACENTOS = {"a": "[aá]", "e": "[eé]", "i": "[ií]",
@@ -4954,19 +4996,10 @@ def _pat_interes(t: str) -> str:
     return pat + (r"\w*" if " " not in t else "")
 
 
-_RX_INTERES_HL = re.compile(
-    r"\b(" + "|".join(
-        _pat_interes(t) for t in sorted(
-            INTERES_FUERTES + INTERES_DEBILES_TEMA
-            + INTERES_DEBILES_ACTOR + INTERES_TABASCO,
-            key=len, reverse=True))
-    + r"|tsjt?|tet|osfe|tdj)", re.I)
-
-
 def _resaltar_interes(txt_html: str) -> str:
     """<mark> sobre los términos de interés dentro de texto ya
     escapado — el cliente ve de un vistazo por qué entró cada dato."""
-    return _RX_INTERES_HL.sub(
+    return _interes_listas()["rx_hl"].sub(
         r"<mark style='background:#fff59d;padding:0 1px'>\1</mark>",
         txt_html)
 
@@ -5005,10 +5038,11 @@ def _interes_match(nota: dict) -> list:
     # 'local' = prensa Tabasco + fuentes oficiales — QUINTANA ROO NO:
     # el usuario lo definió — una nota de QRoo solo es de interés si
     # menciona Tabasco/TSJ o un nombre de la lista, no por su tribunal
+    li = _interes_listas()
     local = nota.get("categoria") in ("prensa", "oficial")
-    hay_tab = any(c in texto_ctx for c in INTERES_TABASCO)
-    hits = RX_FUERTES.findall(texto)
-    hits += RX_SIGLAS_FUERTES.findall(texto)
+    hay_tab = any(c in texto_ctx for c in li["tabasco"])
+    hits = li["rx_fuertes"].findall(texto)
+    hits += li["rx_siglas_f"].findall(texto)
     # nombres propios entran siempre — si Reséndez/Orrico sale en
     # una nota de otro estado, el nombre manda sobre las guardias
     if hits:
@@ -5020,16 +5054,16 @@ def _interes_match(nota: dict) -> list:
     # judicial de otro estado sin ancla TSJT (jueza de Zacatecas,
     # TEEY de Yucatán, poder judicial de Quintana Roo…) → fuera.
     # 'tabasco'/'villahermosa'/'resendez'/'tsj' en el texto la rescata
-    if RX_AJENOS.search(texto) and not (
+    if li["rx_ajenos"].search(texto) and not (
             hay_tab or RX_TSJ.search(texto)):
         return []
     if RX_TSJ.search(texto) and (local or hay_tab):
         return ["tsj"]
-    hits = [t for t in INTERES_DEBILES_TEMA if t in texto]
-    hits += RX_SIGLAS_TEMA.findall(texto)
+    hits = [t for t in li["debiles_tema"] if t in texto]
+    hits += li["rx_siglas_t"].findall(texto)
     if hits and hay_tab:
         return hits
-    hits = [t for t in INTERES_DEBILES_ACTOR if t in texto]
+    hits = [t for t in li["debiles_actor"] if t in texto]
     if hits and (hay_tab or local):
         return hits
     return []
@@ -5405,7 +5439,8 @@ def vista_x(email: str) -> str:
             return (coincide_interes(n)
                     or any(g in txt for g in ("tabasco", "villahermosa"))
                     or (n["fuente"].lower().lstrip("@") in permitidos
-                        and not RX_AJENOS.search(txt)))
+                        and not _interes_listas()["rx_ajenos"].search(
+                            txt)))
         if not any(_ancla(n) for n in c):
             continue
         clusters.append((rep, c))
