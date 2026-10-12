@@ -21,3 +21,14 @@ fb_session.json
 portadas/
 portadas_estado.json
 *.bak*
+
+# sesiones y datos de X/FB — credenciales, NUNCA subir
+x_session.json
+fb_session_redes.json
+.x_login_profile/
+x_posts.jsonl
+
+# exports y debug temporales
+x_siguiendo*.csv
+*_debug.png
+porrico_bottom.png

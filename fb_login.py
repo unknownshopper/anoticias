@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """Login manual de FB para guardar la sesión que usa el monitor.
 
-Corre:  .venv/bin/python fb_login.py
+Corre:  .venv/bin/python fb_login.py [archivo_salida.json]
+        (default fb_session.json — portadas;
+         cuenta de posts → fb_session_redes.json)
 
 Se abre un Chrome visible con facebook.com — inicia sesión con la
-cuenta troll (usuario, contraseña y 2FA si pide). Cuando ya veas el
-feed cargado, vuelve a esta terminal y presiona ENTER: las cookies
-quedan en fb_session.json y el monitor las usa para:
+cuenta troll (usuario, contraseña y 2FA si pide). En cuanto detecte
+la cookie c_user (sesión real) guarda el storage_state y se cierra
+sola — ya no hay que presionar ENTER. El monitor la usa para:
   - timeline real de páginas (todos los posts, no solo el último)
   - fotos en tamaño original (view_full_size) en vez del feed 600px
 La sesión dura semanas/meses; si caduca, repite este script.
 """
+import sys
+import time
 from playwright.sync_api import sync_playwright
 from pathlib import Path
 
-SESION = Path(__file__).parent / "fb_session.json"
+SESION = Path(__file__).parent / (
+    sys.argv[1] if len(sys.argv) > 1 else "fb_session.json")
 
 
 def main():
@@ -26,16 +31,20 @@ def main():
         ctx = br.new_context()
         pg = ctx.new_page()
         pg.goto("https://www.facebook.com/login")
-        print("\n>>> Inicia sesión con la cuenta troll en el navegador.")
-        print(">>> Cuando veas tu feed cargado, presiona ENTER aquí.")
-        input()
-        # sanity: c_user cookie = sesión real
-        cookies = ctx.cookies()
-        if not any(c["name"] == "c_user" for c in cookies):
-            print("!! No detecté cookie c_user — ¿seguro que entraste? "
-                  "Guardo de todos modos por si acaso.")
-        ctx.storage_state(path=str(SESION))
-        print(f"Sesión guardada en {SESION}")
+        print(f"\n>>> Inicia sesión en el navegador que se abrió.")
+        print(f">>> Al entrar tu feed se guarda en {SESION.name} "
+              f"y la ventana se cierra sola.")
+        ok = False
+        for _ in range(240):            # 20 min de espera máxima
+            time.sleep(5)
+            if any(c["name"] == "c_user" for c in ctx.cookies()):
+                ok = True
+                break
+        if ok:
+            ctx.storage_state(path=str(SESION))
+            print(f"Sesión guardada en {SESION}")
+        else:
+            print("!! No detecté login en 20 min — nada se guardó.")
         br.close()
 
 

@@ -610,6 +610,7 @@ def generar_sintesis(cfg: dict, franja: str) -> str:
                        "t": n.get("titulo", ""),
                        "u": n.get("link", "")} for n in sel]},
             ensure_ascii=False) + "\n")
+    _poda_sintesis()           # la nueva desbanca a la anterior
     return texto
 
 
@@ -632,16 +633,50 @@ def _sel_interes_extendida(desde: datetime) -> list:
     return sel
 
 
+_GENERANDO = set()          # franjas con Ollama corriendo ahora
+
+
+def _poda_sintesis():
+    """Deja solo la entrada más reciente por franja — sin archivo
+    histórico: máximo 4 tarjetas (matutina, vespertina, nocturna,
+    cierre), siempre la última de cada una."""
+    if not SINTESIS.exists():
+        return
+    mejor = {}
+    for l in SINTESIS.read_text(encoding="utf-8").splitlines():
+        try:
+            e = json.loads(l)
+        except Exception:
+            continue
+        f = e.get("franja", "")
+        if f not in mejor or e.get("fecha", "") > mejor[f][0]:
+            mejor[f] = (e.get("fecha", ""), l)
+    out = sorted((p[1] for p in mejor.values()),
+                 key=lambda l: json.loads(l).get("fecha", ""))
+    SINTESIS.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def _gen_bg(fn, key: str, *args):
+    """Wrapper del hilo de generación — quita el flag al terminar
+    (éxito o excepción) para que el botón se rehabilite solo."""
+    try:
+        fn(*args)
+    finally:
+        _GENERANDO.discard(key)
+
+
 def generar_cierre(cfg: dict) -> str:
     """CIERRE DIARIO — solo on-demand (botón admin, /resumenes).
     Monólogo de host repasando lo de interés del día; cada segmento
     cierra con [N#] → misma trazabilidad que la síntesis."""
     if _mem_disponible_gb() < 4:
+        print("[cierre] memoria <4GB — abortado")
         return ""
     ahora = datetime.now()
     sel = _sel_interes_extendida(ahora.replace(hour=0, minute=0,
                                              second=0))[:15]
     if not sel:
+        print("[cierre] sin notas de interés hoy — abortado")
         return ""
     lineas = "\n".join(
         f"- [N{i+1}|{n.get('categoria', '')}|{n['fuente']}] "
@@ -649,21 +684,27 @@ def generar_cierre(cfg: dict) -> str:
         + (f" — {n['resumen'][:280]}" if n.get("resumen") else "")
         for i, n in enumerate(sel))
     prompt = (
-        "Eres el host de un talk show nocturno mexicano. Escribe el "
-        "MONÓLOGO de cierre del día repasando lo más "
-        "relevante del poder judicial de Tabasco, usando SOLO estas "
-        "notas:\n" + lineas + "\n\n"
+        "Eres el redactor de comunicación social del Poder Judicial de "
+        "Tabasco. Escribe la TARJETA DE DISCURSO de cierre del día: el "
+        "briefing que un vocero usaría para informar a su superior lo "
+        "relevante del día, usando SOLO estas notas:\n" + lineas + "\n\n"
         "Reglas:\n"
-        "- Tono: ingenioso, irónico ligero, ritmo de comedia en vivo — "
-        "pero CADA remate queda anclado en el hecho real de la nota.\n"
+        "- Tono: institucional e impersonal — tercera persona siempre; "
+        "cero 'yo', cero saludos, cero despedidas de conductor, cero "
+        "preguntas retóricas.\n"
+        "- Estilo: informe asertivo que expone hechos y resalta la "
+        "labor de las instituciones y sus titulares; frases que un "
+        "vocero pueda leer textualmente ante un superior.\n"
+        "- PROHIBIDAS las acotaciones escénicas: nada de (risas), "
+        "(aplausos), (pausa) ni similares.\n"
         "- PROHIBIDO inventar datos, citas, cifras o personajes que no "
         "estén en las notas.\n"
-        "- De 6 a 10 segmentos, párrafos cortos de 2-3 líneas, como "
-        "script hablado.\n"
+        "- De 6 a 10 segmentos, párrafos cortos de 2-3 líneas.\n"
         "- Cierra cada segmento con [N#] — el número de la nota que lo "
         "justifica.\n"
-        "- Sin títulos ni subtítulos: es un monólogo continuo. "
-        "Remata con un cierre breve de despedida."
+        "- Sin títulos ni subtítulos: texto continuo de briefing. "
+        "Termina con un cierre sobrio de una línea, sin despedida "
+        "personal."
     )
     try:
         r = requests.post(
@@ -672,19 +713,46 @@ def generar_cierre(cfg: dict) -> str:
                   "stream": False},
             timeout=480)
         texto = r.json().get("response", "").strip()
-    except Exception:
+    except Exception as exc:
+        print(f"[cierre] ollama falló: {exc}")
         return ""
     if not texto or texto.startswith("(no se pudo"):
+        print("[cierre] respuesta vacía de ollama")
         return ""
+    # versión para X: un solo post ≤280, mismo tono institucional —
+    # el modelo sigue caliente (KEEP_ALIVE), costo ~2s
+    post_x = ""
+    try:
+        r2 = requests.post(
+            cfg["ollama"]["url"],
+            json={"model": cfg["ollama"]["modelo"],
+                  "prompt": "Condensa este briefing institucional en UN "
+                            "post de X de máximo 270 caracteres: tono "
+                            "sobrio, tercera persona, sin hashtags "
+                            "inventados, sin emojis, sin nombres que "
+                            "no estén en el texto. Devuelve SOLO el "
+                            "post, nada más.\n\n" + texto[:3500],
+                  "stream": False},
+            timeout=240)
+        post_x = r2.json().get("response", "").strip()
+        post_x = re.sub(r'^["\']|["\']$', "", post_x.strip())
+        if len(post_x) > 280:
+            post_x = post_x[:277].rsplit(" ", 1)[0] + "…"
+    except Exception as exc:
+        print(f"[cierre] post_x falló ({exc}) — no se guarda")
+        post_x = ""
     with open(SINTESIS, "a", encoding="utf-8") as f:
+        print(f"[cierre] guardado — {len(texto)} chars")
         f.write(json.dumps(
             {"fecha": ahora.isoformat(timespec="seconds"),
              "franja": "cierre", "texto": texto,
+             "post_x": post_x,
              "n_notas": len(sel),
              "notas": [{"f": n.get("fuente", ""),
                         "t": n.get("titulo", ""),
                         "u": n.get("link", "")} for n in sel]},
             ensure_ascii=False) + "\n")
+    _poda_sintesis()           # la nueva desbanca a la anterior
     return texto
 
 
@@ -763,9 +831,19 @@ def resolver_feed(url: str) -> tuple:
     """Valida una URL de fuente. Devuelve (url_final, tipo, error).
     RSS/Atom directo → 'rss'. HTML con <link rel=alternate> → el feed
     detectado como 'rss'. HTML con enlaces /seccion/id/slug → 'html'.
-    Atajo: 'gn:búsqueda' → feed RSS de Google News por tema.
+    Atajos: 'gn:búsqueda' → feed RSS de Google News por tema;
+    'x:handle' o x.com/handle → timeline vía espejos Nitter.
     Así se puede pegar la portada y se decide solo."""
-    if url.lower().startswith("gn:"):
+    low = url.lower().strip()
+    if low.startswith("x:") or re.match(
+            r"^https?://(www\.)?(x|twitter)\.com/[A-Za-z0-9_]+/?$", low):
+        h = low[2:] if low.startswith("x:") else url.split("/")[-1] \
+            or url.split("/")[-2]
+        h = h.strip().lstrip("@")
+        if re.fullmatch(r"[A-Za-z0-9_]{1,15}", h):
+            return f"x:{h}", "x", ""
+        return None, None, "handle de X inválido"
+    if low.startswith("gn:"):
         q = quote(url[3:].strip())
         url = ("https://news.google.com/rss/search?q=" + q
                + "&hl=es-419&gl=MX&ceid=MX:es-419")
@@ -797,6 +875,111 @@ def resolver_feed(url: str) -> tuple:
     return None, None, "no parece un feed RSS — ¿es la portada del sitio?"
 
 
+# espejos Nitter para el tipo 'x' — la API oficial es de pago y el
+# syndication público murió (404). Son frágiles: rotar si uno cae.
+_NITTER_HOSTS = (
+    "nitter.tiekoetter.com", "xcancel.com", "nitter.poast.org",
+    "lightbrd.com", "nuku.trabun.org", "nitter.space")
+
+
+def _handle_x(url: str) -> str:
+    handle = re.sub(r"^x:", "", url.strip(), flags=re.I)
+    handle = re.sub(r"^https?://(www\.)?(x|twitter)\.com/", "", handle)
+    handle = handle.strip("/").split("/")[0].lstrip("@")
+    return handle if re.fullmatch(r"[A-Za-z0-9_]{1,15}", handle) else ""
+
+
+def _scrapear_x_posts(handle: str) -> list:
+    """Timeline de X con sesión guardada (x_session.json) — anónimo
+    X solo enseña login-wall. handle='home' → pestaña 'Siguiendo'
+    del feed propio (todo lo que sigue el poli, atribuido por autor)."""
+    if not X_SESSION.exists():
+        return []
+    es_home = handle.lower() == "home"
+    posts = []
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            br = _launch(p)
+            pg = br.new_context(
+                storage_state=str(X_SESSION)).new_page()
+            pg.goto("https://x.com/home" if es_home
+                    else f"https://x.com/{handle}",
+                    wait_until="domcontentloaded", timeout=45000)
+            pg.wait_for_timeout(6000)
+            if "login" in pg.url:
+                br.close()
+                print(f"[!] X sesión caída — re-correr x_login.py")
+                return []
+            if es_home:
+                # 'Para ti' es default — cambiar a 'Siguiendo'
+                try:
+                    pg.get_by_role("tab", name=re.compile(
+                        r"siguiendo|following", re.I)).first\
+                        .click(timeout=8000)
+                    pg.wait_for_timeout(4000)
+                except Exception:
+                    pass   # si no hay tab, queda 'Para ti' (ruido)
+            for _ in range(4):
+                pg.mouse.wheel(0, 3000)
+                pg.wait_for_timeout(1800)
+            posts = pg.evaluate("""() => {
+                const out = [], seen = new Set();
+                for (const t of document.querySelectorAll(
+                        'article[data-testid="tweet"]')) {
+                    const a = t.querySelector('a[href*="/status/"]');
+                    const link = a ? a.href.split('?')[0] : '';
+                    if (!link || seen.has(link)) continue;
+                    seen.add(link);
+                    const tt = t.querySelector(
+                        'div[data-testid="tweetText"]');
+                    const tm = t.querySelector('time');
+                    out.push({link: link,
+                              autor: (link.split('/')[3] || ''),
+                              txt: tt ? tt.innerText : '',
+                              time: tm ? (tm.dateTime || '') : ''});
+                }
+                return out;
+            }""")
+            br.close()
+    except Exception:
+        return []
+    out = []
+    for p_ in posts:
+        txt = " ".join((p_.get("txt") or "").split())
+        try:
+            pp = datetime.fromisoformat(
+                p_["time"].replace("Z", "+00:00")).timetuple() \
+                if p_.get("time") else None
+        except Exception:
+            pp = None
+        out.append({"link": p_["link"], "title": txt[:140] or "post",
+                    "summary": txt, "published_parsed": pp,
+                    "_autor": "@" + p_["autor"] if p_.get("autor")
+                              else ""})
+    return out
+
+
+def _feed_x(url: str) -> list:
+    """Timeline de X. Fuente.url = 'x:handle'. Primero Nitter (gratis);
+    si los espejos mueren cae al scraper con sesión (x_session.json)."""
+    handle = _handle_x(url)
+    if not handle:
+        return []
+    for host in _NITTER_HOSTS:
+        try:
+            d = feedparser.parse(f"https://{host}/{handle}/rss")
+            if d.entries:
+                for e in d.entries:
+                    if e.get("link"):
+                        e["link"] = re.sub(r"^https?://[^/]+/",
+                                           "https://x.com/", e["link"])
+                return d.entries
+        except Exception:
+            continue
+    return _scrapear_x_posts(handle)
+
+
 def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
     vistos = cargar_vistos()
     usuarios = cargar_usuarios()
@@ -819,6 +1002,8 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
         "user_agent",
         "OlmecaCode-Monitor/1.0 (+mailto:the@unknownshoppers.com)")
     for i, fuente in enumerate(cfg["fuentes"]):
+        if fuente.get("tipo") == "fb":
+            continue   # la raspa chucky cada 4h — sin feed que pedir
         st = estado.setdefault(fuente["nombre"], {"ok": 0, "err": 0, "ultimo_ok": ""})
         # respetar robots.txt; cachear 24h
         if "crawl_delay" not in st or now - st.get("robots_checked", 0) > 86400:
@@ -875,6 +1060,14 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
                         r"<[^>]+>", " ",
                         p.get("excerpt", {}).get("rendered", "")),
                     "published_parsed": pp})
+            st["ok"] += 1
+            st["ultimo_ok"] = datetime.now().isoformat(timespec="seconds")
+        elif fuente.get("tipo") == "x":
+            entradas = _feed_x(fuente["url"])
+            if not entradas:
+                st["err"] += 1
+                print(f"[!] {fuente['nombre']}: espejos X sin respuesta")
+                continue
             st["ok"] += 1
             st["ultimo_ok"] = datetime.now().isoformat(timespec="seconds")
         elif fuente.get("tipo") == "html":
@@ -949,6 +1142,12 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
             # <source>. Le atribuimos la nota a él y limpiamos el
             # sufijo " - Medio" que GN pega al titular.
             medio = ""
+            # posts del feed 'Siguiendo' (x:home) se atribuyen al autor
+            # real — 'X · Siguiendo' queda como agregador en 'via'.
+            # TODO pasa a la base (los ~1200 follows = radar para
+            # alertas/Interés); el tab /x filtra por x_permitidos
+            if fuente.get("tipo") == "x" and entrada.get("_autor"):
+                medio = entrada["_autor"]
             if "news.google.com" in fuente["url"]:
                 src = entrada.get("source") or {}
                 medio = (src.get("title") or src.get("value") or "").strip()
@@ -1359,6 +1558,59 @@ def _portada_issuu(handle: str):
 
 
 FB_SESSION = BASE / "fb_session.json"
+FB_SESSION_REDES = BASE / "fb_session_redes.json"  # chucky — posts
+X_SESSION = BASE / "x_session.json"              # X — timeline
+X_POSTS = BASE / "x_posts.jsonl"               # log de publicados
+_ULT_FB_POSTS = 0.0        # epoch de la última pasada de chucky
+_FB_POSTS_CORRIENDO = False
+
+
+def _post_x(texto: str) -> bool:
+    """Publica un post en X con la sesión guardada (x_session.json).
+    Disparo manual desde la tarjeta de Cierre — no es cron: X marca
+    publicación bot periódica como actividad automatizada."""
+    if not X_SESSION.exists() or not texto.strip():
+        return False
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            br = _launch(p)
+            pg = br.new_context(
+                storage_state=str(X_SESSION)).new_page()
+            pg.goto("https://x.com/compose/post",
+                    wait_until="domcontentloaded", timeout=45000)
+            pg.wait_for_timeout(5000)
+            if "login" in pg.url:
+                br.close()
+                print("[!] X sesión caída al postear — x_login.py")
+                return False
+            tb = "div[data-testid='tweetTextarea_0']"
+            pg.locator(tb).first.click(timeout=10000)
+            pg.locator(tb).first.fill(texto[:280])
+            pg.wait_for_timeout(1200)
+            pg.locator("button[data-testid='tweetButton']").first\
+                .click(timeout=10000)
+            pg.wait_for_timeout(5000)
+            # el composer se cierra/limpia al postear; si el texto
+            # sigue ahí el click no pegó
+            quedo = pg.evaluate(
+                "() => {const e=document.querySelector("
+                "\"div[data-testid='tweetTextarea_0']\");"
+                "return e ? (e.innerText||'').trim() : '';}")
+            br.close()
+            ok = not quedo
+            print(f"[x] post {'enviado' if ok else 'NO confirmado'}"
+                  f" — {len(texto)} chars")
+            return ok
+    except Exception as e:
+        print(f"[x] error posteando: {e}")
+        return False
+
+
+def _x_publicado(fecha: str) -> bool:
+    """¿La síntesis con esta fecha ya se posteó en X?"""
+    return any(p.get("fecha") == fecha and p.get("ok")
+               for p in leer_jsonl(X_POSTS))
 
 
 def _fb_sesion_caido(pg) -> bool:
@@ -1412,15 +1664,23 @@ def _imagenes_fb_visores(pg, post_url: str) -> list:
         # enlaza cada foto directo, no al permalink del post), la foto
         # ES la página: tomar el <img> más grande de una vez
         def _img_mayor():
+            # solo imgs del visor/main — el documento entero carga el
+            # feed lateral (flyers, posts sugeridos ajenos) y ganaban
+            # por tamaño (11/oct: flyer TramitaMóvil, post de Reddit)
             return pg.evaluate("""() => {
                 let best = null, area = 0;
-                for (const i of document.querySelectorAll('img')) {
-                    const s = i.src || '';
-                    if (!/scontent/.test(s)) continue;
-                    const a = i.naturalWidth * i.naturalHeight;
-                    if (a > area) { area = a; best = s; }
+                for (const sel of ['div[role="dialog"] img',
+                                   'div[role="main"] img',
+                                   'main img']) {
+                    for (const i of document.querySelectorAll(sel)) {
+                        const s = i.src || '';
+                        if (!/scontent/.test(s)) continue;
+                        const a = i.naturalWidth * i.naturalHeight;
+                        if (a > area) { area = a; best = s; }
+                    }
+                    if (best) return best;
                 }
-                return best;
+                return null;
             }""")
         if "fbid=" in post_url:
             src = _img_mayor()
@@ -1430,7 +1690,10 @@ def _imagenes_fb_visores(pg, post_url: str) -> list:
                 if ir.status_code == 200 and len(ir.content) > 40000:
                     out.append(ir.content)
         hrefs = pg.eval_on_selector_all(
-            'a[href*="/photo"]', "els => els.map(e => e.href)")
+            'div[role="main"] a[href*="/photo"],'
+            + 'div[role="article"] a[href*="/photo"],'
+            + 'main a[href*="/photo"]',
+            "els => els.map(e => e.href)")
         vistos = set()
         # set=a.* = álbum/avatar — último recurso si no hubo pcb
         for paso in (0, 1):
@@ -1447,16 +1710,7 @@ def _imagenes_fb_visores(pg, post_url: str) -> list:
                     pg.goto(href, wait_until="domcontentloaded",
                             timeout=45000)
                     pg.wait_for_timeout(4500)
-                    src = pg.evaluate("""() => {
-                        let best = null, area = 0;
-                        for (const i of document.querySelectorAll('img')) {
-                            const s = i.src || '';
-                            if (!/scontent/.test(s)) continue;
-                            const a = i.naturalWidth * i.naturalHeight;
-                            if (a > area) { area = a; best = s; }
-                        }
-                        return best;
-                    }""")
+                    src = _img_mayor()
                     if not src:
                         continue
                     ir = requests.get(src, timeout=20,
@@ -1607,13 +1861,54 @@ def _bajar_portada_fb(m: dict) -> list:
                         if (t.length > txt.length) txt = t;
                         if (t.length > 250) break;
                     }
-                    out.push({href: a.href,
+                    // autor del post: primer link de perfil dentro del
+                    // bloque — con sesión el timeline cuela posts
+                    // 'sugeridos' de páginas ajenas
+                    let owner = '';
+                    if (n) {
+                        const own = n.querySelector(
+                            'a[href*="facebook.com/"]'
+                            + ':not([href*="/posts/"]):not([href*="/photos/"])'
+                            + ':not([href*="/photo?"]):not([href*="/reels"])'
+                            + ':not([href*="/watch"]):not([href*="/groups"])'
+                            + ':not([href*="/hashtag"])');
+                        if (own) {
+                            const seg = own.pathname.split('/')
+                                .filter(Boolean);
+                            owner = seg.length === 1 ? seg[0] : '';
+                        }
+                    }
+                    out.push({href: a.href, owner: owner,
                               txt: txt.split(NL).join(' ').slice(0, 300)});
                 }
                 return out;
             }""")
         por_texto = False
+        cand = []            # [(href, txt)] — TAD puede subir las 2
+        # planas en posts SEPARADOS: no cortar en la primera
+        meses_pat = "|".join(meses)
+        # slug de la página del medio — los posts 'sugeridos' de páginas
+        # ajenas que el timeline con sesión cuela se descartan por autor
+        segs = [s for s in urlparse(
+            fb.split("#")[0]).path.split("/") if s]
+        slug_page = normalizar(segs[0]) if segs \
+            and segs[0] != "profile.php" else ""
+
+        def _post_viejo(txt_n: str) -> bool:
+            """Texto fechado en otro día ('9 de octubre') = edición
+            vieja — sin este guard el scraper escrolea hasta una
+            portada de días atrás y la cuela como la de hoy."""
+            fechas_post = {(int(dd), meses.index(mm) + 1)
+                           for dd, mm in re.findall(
+                               rf"(\d{{1,2}})\s+de\s+({meses_pat})",
+                               txt_n)}
+            return bool(fechas_post) and \
+                (hoy.day, hoy.month) not in fechas_post
+
         for post in posts:
+            if slug_page and post.get("owner") \
+                    and normalizar(post["owner"]) != slug_page:
+                continue        # post 'sugerido' de otra página
             txt = normalizar(post["txt"])
             # el plugin renderiza en EN ó ES según locale del CDN —
             # "3 hours ago"/"3h" vale igual que "hace 3 horas"
@@ -1625,10 +1920,11 @@ def _bajar_portada_fb(m: dict) -> list:
                           str(hoy.day), f"{hoy.day:02d}")))  # 05 de octubre
             if _post_viejo(txt):
                 continue
+            # 'hoy' en el texto NO es frescura — el post fijado de
+            # ayer ('#EnPortada hoy', 1d) se colaba y repetía edición
             if re.search(r"portada|primera plana|edici[oó]n|bolet[ií]n",
                          txt) and \
-                    (reciente or any(f in txt for f in fechas)
-                     or re.search(r'\bhoy\b', txt)):
+                    (reciente or any(f in txt for f in fechas)):
                 cand.append((post["href"], post["txt"]))
                 por_texto = True
                 continue
@@ -1666,8 +1962,173 @@ def _bajar_portada_fb(m: dict) -> list:
         # primera plana — flyers verticales (donación ISSET 0.8) no son
         # portada. Si el post dijo 'portada/boletín/edición + hoy',
         # confiamos en el texto aunque la imagen sea 0.8
-        imgs = [b for b in imgs if _es_portada(b)]
+        imgs = [b for b in imgs
+                if _es_portada(b, 1.15) and _texto_denso(b)]
     return imgs
+
+
+def toca_fb_posts() -> bool:
+    """Chucky cada 4 h y solo si tiene sesión — ritmo tranquilo para
+    no quemar la cuenta dedicada."""
+    return (FB_SESSION_REDES.exists()
+            and time.time() - _ULT_FB_POSTS >= 4 * 3600)
+
+
+def _texto_post(lines: list, autor: str) -> tuple:
+    """(titulo, cuerpo) de las líneas de un article de FB: salta
+    boilerplate (nombre, 'Seguir', contadores, 'hace 2 h') hasta la
+    primera línea sustantiva; corta antes de los botones de acción."""
+    meta = {"seguir", "mensaje", "buscar", "ver todas las fotos",
+            "fotos", "videos", "menciones", "resenas", "reseñas",
+            "me gusta", "comentar", "compartir", "enviar"}
+    au = normalizar(autor)
+    resto, titulo = [], ""
+    for l in lines:
+        ln = normalizar(l).strip("· ").lower()
+        if not ln or ln in meta or ln == au:
+            continue
+        if re.fullmatch(r"(hace\s+)?[\d.,]+\s*(mil\s+)?"
+                        r"(min|h|d|hora?s?|minutos?|dias?|días?|"
+                        r"seguidores|seguidos|semanas?)\b.*", ln):
+            continue
+        if re.fullmatch(r"[\d.,]+\s*(mil\s+)?(seguidores|seguidos|"
+                        r"me gusta|comentarios|compartidos)", ln):
+            continue
+        resto.append(l)
+    if not resto:
+        return "", ""
+    titulo = resto[0][:140]
+    cuerpo = " ".join(resto[1:6])[:600]
+    return titulo, cuerpo
+
+
+def scrapear_posts_fb(cfg: dict):
+    """Chucky: timeline de fuentes tipo 'fb' → posts como notas.
+    Dedup por link; filtro de autor (posts 'sugeridos' de páginas
+    ajenas se descartan); una instancia a la vez."""
+    global _ULT_FB_POSTS, _FB_POSTS_CORRIENDO
+    if _FB_POSTS_CORRIENDO:
+        return
+    _FB_POSTS_CORRIENDO = True
+    _ULT_FB_POSTS = time.time()
+    try:
+        fuentes_fb = [f for f in cfg["fuentes"]
+                      if f.get("tipo") == "fb"]
+        if not fuentes_fb:
+            return
+        links_vistos = {n.get("link", "")
+                        for n in leer_jsonl(NOTICIAS, limite=0)}
+        from playwright.sync_api import sync_playwright
+        nuevas = 0
+        with sync_playwright() as p:
+            br = _launch(p)
+            pg = br.new_context(
+                storage_state=str(FB_SESSION_REDES)).new_page()
+            for fuente in fuentes_fb:
+                url = fuente["url"].split("#")[0]
+                segs = [s for s in urlparse(url).path.split("/") if s]
+                slug = (normalizar(segs[0]) if segs
+                        and segs[0] != "profile.php" else "")
+                try:
+                    pg.goto(url, wait_until="domcontentloaded",
+                            timeout=45000)
+                    if _fb_sesion_caido(pg):
+                        print("[fb-posts] sesión de chucky cayó — "
+                              "re-correr fb_login.py")
+                        break
+                    pg.wait_for_timeout(5000)
+                    prev = -1
+                    for _ in range(10):
+                        pg.evaluate(
+                            "for (const el of "
+                            "document.querySelectorAll('*')) "
+                            "if (el.scrollHeight > el.clientHeight+50) "
+                            "el.scrollTop += 2200;")
+                        pg.wait_for_timeout(1300)
+                        n = pg.evaluate(
+                            "document.querySelectorAll("
+                            "'a[href*=\"/posts/\"],a[href*=\"pfbid\"],"
+                            "a[href*=\"/permalink/\"]').length")
+                        if n == prev:
+                            break
+                        prev = n
+                    posts = pg.evaluate("""() => {
+                        // en perfiles personales role=article son
+                        // COMENTARIOS (href con comment_id) — el post
+                        // se agarra por su permalink puro
+                        const out = [], seen = new Set();
+                        for (const a of document.querySelectorAll(
+                                'a[href*="/posts/"],'
+                              + 'a[href*="story_fbid"],'
+                              + 'a[href*="/permalink/"],'
+                              + 'a[href*="pfbid"]')) {
+                            const h = a.href;
+                            if (h.includes('comment_id')) continue;
+                            if (seen.has(h)) continue; seen.add(h);
+                            let n = a, txt = '';
+                            for (let i = 0; i < 12 && n; i++) {
+                                n = n.parentElement; if (!n) break;
+                                const t = n.innerText || '';
+                                if (t.length > txt.length) txt = t;
+                                if (t.length > 300) break;
+                            }
+                            let owner = '';
+                            if (n) {
+                                for (const o of n.querySelectorAll(
+                                        'a[href*="facebook.com/"]')) {
+                                    const seg = new URL(o.href).pathname
+                                        .split('/').filter(Boolean);
+                                    if (seg.length === 1 &&
+                                        !/posts|photos|photo|reels|watch|groups|hashtag|permalink/
+                                        .test(seg[0])) {
+                                        owner = seg[0]; break;
+                                    }
+                                }
+                            }
+                            out.push({href: h, owner,
+                                lines: txt.split(String.fromCharCode(10))
+                                    .map(s => s.trim())
+                                    .filter(Boolean).slice(0, 20)});
+                        }
+                        return out;
+                    }""")
+                    for post in posts[:15]:
+                        href = post["href"].split("?")[0].rstrip("/") \
+                            if "/photo" in post["href"] \
+                            else post["href"]
+                        if href in links_vistos or \
+                                post["href"] in links_vistos:
+                            continue
+                        if slug and post.get("owner") \
+                                and normalizar(post["owner"]) != slug:
+                            continue   # post sugerido de otra página
+                        titulo, cuerpo = _texto_post(
+                            post["lines"], fuente["nombre"])
+                        if len(titulo) < 25:
+                            continue   # post sin texto útil
+                        links_vistos.add(post["href"])
+                        links_vistos.add(href)
+                        guardar_noticia({
+                            "fecha": datetime.now()
+                            .isoformat(timespec="seconds"),
+                            "fuente": fuente["nombre"],
+                            "via": "", "categoria": fuente.get(
+                                "categoria", "columnas"),
+                            "paywall": False,
+                            "autor": fuente["nombre"],
+                            "titulo": titulo,
+                            "resumen": cuerpo,
+                            "link": post["href"],
+                            "imagen": ""})
+                        nuevas += 1
+                except Exception as e:
+                    print(f"[fb-posts] {fuente['nombre']}: {e}")
+                pg.wait_for_timeout(4000)   # respiro entre páginas
+            br.close()
+        print(f"[fb-posts] {nuevas} posts nuevos "
+              f"de {len(fuentes_fb)} páginas")
+    finally:
+        _FB_POSTS_CORRIENDO = False
 
 
 _MESES_EN = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -2314,6 +2775,7 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
     madrugada."""
     data = []
     src_fb = False
+    src_edic = False
     tiene_impresa = False
     img_ok = _tiene_img_hoy(base)
     if not img_ok:
@@ -2322,6 +2784,7 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
             data = [b] if b else []
         if m.get("edicion") and not data:
             data = _portada_fecha(m)
+            src_edic = bool(data)
         if m.get("json") and not data:
             data = _portada_json(m)
         if m.get("flowpaper") and not data:
@@ -2363,7 +2826,10 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
             base.with_suffix(".png").unlink(missing_ok=True)
             n_ok = 0
             for i, d in enumerate(data):
-                nom = base.name if i == 0 else f"{base.name}-{i + 1}"
+                # nombre SECUENCIAL de aceptadas — si la 1ª se rechaza,
+                # la 2ª toma {slug}.jpg (antes quedaban huérfanos
+                # {slug}-2.jpg sin {slug}.jpg: medio invisible)
+                nom = base.name if n_ok == 0 else f"{base.name}-{n_ok + 1}"
                 f = base.parent / f"{nom}.jpg"
                 # kiosko a veces sirve la portada de AYER bajo la URL de
                 # hoy — bytes idénticos a la ÚLTIMA edición conocida =
@@ -2374,11 +2840,15 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
                 if ayer is not None and ayer.read_bytes() == d:
                     continue
                 f.write_bytes(d)
-                # filtro de forma solo para FB (puede colar flyers
-                # 4:5); kiosko/edicion/issuu/etc ya son la plana real —
-                # periódicos anchos (ratio ~1.25, p.ej. OEM) no mueren
-                if _img_ok(f) and (not src_fb or _es_portada(d)) \
-                        and not _misma_img_ayer(f, f.stem):
+                # forma 1.15 para fb/edicion (portadas reales llegan a
+                # 1.26 — Sol del Sureste 11/oct); fb además exige
+                # densidad de texto (memes/fotos de feed se cuelan)
+                if _img_ok(f) \
+                        and ((not src_fb and not src_edic)
+                             or _es_portada(d, 1.15)) \
+                        and (not src_fb or _texto_denso(d)) \
+                        and not _misma_img_ayer(f, f.stem) \
+                        and not _img_repetida_hoy(f, base.name):
                     n_ok += 1
                 else:
                     f.unlink(missing_ok=True)
@@ -2521,13 +2991,55 @@ def _es_vertical(b: bytes) -> bool:
         return False
 
 
-def _es_portada(b: bytes) -> bool:
-    """Vertical Y angosta — proporción de primera plana (~0.55–0.77 w/h).
+def _es_portada(b: bytes, r_min: float = 1.3) -> bool:
+    """Vertical Y angosta — proporción de primera plana (~0.55–0.77 
+w/h).                                                                    
     Un flyer vertical 4:5 o cuadrado (600x750 = 0.8, posts de evento)
-    NO es portada aunque sea alto."""
+    NO es portada aunque sea alto. r_min menor (1.15) sirve para
+    descartar solo lo landscape (fotos de nota en estrategia edicion)."""
     try:
         im = Image.open(io.BytesIO(b))
-        return im.height >= im.width * 1.3
+        return im.height >= im.width * r_min
+    except Exception:
+        return False
+
+
+def _img_repetida_hoy(nuevo: Path, propio: str) -> bool:
+    """La misma imagen ya capturada HOY de OTRO medio = gráfica viral
+    compartida entre páginas (el 11/oct 'Piden ayuda Lenín' cayó como
+    portada en El Heraldo, El Sol y XEVT). Comparación visual 64×64
+    contra todo lo del día, excluyendo los archivos del propio medio."""
+    try:
+        a = Image.open(nuevo).convert("L").resize((64, 64))
+        pa = list(a.getdata())
+    except Exception:
+        return False
+    for f in sorted(nuevo.parent.glob("*.*")):
+        if f.suffix not in (".jpg", ".png"):
+            continue
+        if f.stem == propio or f.stem.startswith(propio + "-"):
+            continue
+        try:
+            b = Image.open(f).convert("L").resize((64, 64))
+            diff = sum(abs(p - q) for p, q in zip(pa, b.getdata()))
+            if diff / (64 * 64) < 8:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _texto_denso(b: bytes) -> bool:
+    """Densidad de bordes — una primera plana está saturada de texto
+    chico (0.19–0.31 en las portadas reales); fotos/flyers/memes
+    quedan <=0.15 la mayoría. Guard extra para posts FB: la forma
+    vertical sola no distingue plana de gráfica social."""
+    try:
+        im = Image.open(io.BytesIO(b)).convert("L")
+        w, h = im.size
+        im = im.resize((400, max(1, int(400 * h / w))))
+        px = list(im.filter(ImageFilter.FIND_EDGES).getdata())
+        return sum(1 for v in px if v > 40) / len(px) >= 0.15
     except Exception:
         return False
 
@@ -3678,7 +4190,18 @@ PAGINA = """<!DOCTYPE html>
   /* Tarjeta = área de toque completa (dedos, no mouse) */
   .card {{ display: block; background: #fff; border-left: 5px solid #d32f2f;
          border-radius: 8px; padding: 1rem 1.1rem; margin: .9rem 0;
-         box-shadow: 0 1px 4px #0002; color: inherit; text-decoration: none; }}
+         box-shadow: 0 1px 4px #0002; color: inherit; text-decoration: none;
+         position: relative; }}
+  /* imprimir/PDF por tarjeta de síntesis — píldora arriba-derecha */
+  .btn-imp {{ position: absolute; top: .7rem; right: .9rem; z-index: 1;
+             font-size: .6rem; font-weight: 600; letter-spacing: .05em;
+             text-transform: uppercase; color: #3949ab;
+             border: 1px solid #c5cae9; border-radius: 999px;
+             padding: .28rem .75rem; background: #fafbff;
+             text-decoration: none; transition: all .15s; }}
+  .btn-imp:hover {{ background: #1a237e; color: #fff;
+                   border-color: #1a237e; }}
+  @media print {{ .btn-imp {{ display: none; }} }}
   .card:active {{ background: #f0f4ff; }}
   /* clearfix: sin esto el thumb flotante se sale por abajo/derecha
      cuando el texto de la tarjeta es más corto que la imagen */
@@ -3921,8 +4444,9 @@ PAGINA = """<!DOCTYPE html>
 <nav>
   <div class="nav-top">
     <a class="logo" href="/noticias">@noticias</a>
-    <form method="get" action="/buscar" role="search">
-      <input type="text" name="q" placeholder="buscar nota..." value="{q}">
+    <form method="get" action="/buscar" role="search"
+          onsubmit="showLoader('Buscando...')">
+      <input type="text" name="q" placeholder="buscar nota... (&quot;frase exacta&quot;)" value="{q}">
       <button>Buscar</button>
     </form>
     <span class="nav-user" title="{usuario}">{usuario_html}</span>
@@ -4428,11 +4952,15 @@ def vista_columnas(email: str) -> str:
     cols = [f for f in cfg["fuentes"]
             if f.get("categoria") == "columnas"]
     nombres = {f["nombre"] for f in cols}
-    vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
+    # selección del usuario SÍ filtra (objetivo: solo lo marcado), pero
+    # con transparencia — cada tarjeta oculta se señala en vez de
+    # quedar en '0 entregas' fantasma
+    ocultas = set(perfil_usuario(email, cfg).get("fuentes_ocultas", []))
+    n_sel = sum(1 for f in cols if f["nombre"] not in ocultas)
     por_col: dict = {}
     for n in leer_jsonl(NOTICIAS, limite=0):
         clave = n.get("via") or n.get("fuente", "")
-        if clave in nombres and (n["fuente"] in vis or clave in vis):
+        if clave in nombres:
             por_col.setdefault(clave, []).append(n)
 
     def _fila(n: dict, col_nombre: str = "", paywall: bool = False) -> str:
@@ -4459,13 +4987,15 @@ def vista_columnas(email: str) -> str:
 
     bloques = []
     for f in cols:
+        oculta = f["nombre"] in ocultas
         _vl = set()
         # TODAS las entregas de la columna — coincide_interes aquí
         # solo alimenta el chip 'encontró:'; filtrar vaciaba la
         # sección porque las columnas son opinión política nacional
-        entradas = [n for n in sorted(
-            por_col.get(f["nombre"], []),
-            key=lambda n: n["fecha"], reverse=True)
+        entradas = [] if oculta else [
+            n for n in sorted(
+                por_col.get(f["nombre"], []),
+                key=lambda n: n["fecha"], reverse=True)
             if not (n["link"] in _vl or _vl.add(n["link"]))]
         ultima = fmt_fecha(entradas[0]["fecha"]) if entradas \
             else "sin capturas aún"
@@ -4473,19 +5003,25 @@ def vista_columnas(email: str) -> str:
         columna = f["nombre"].split("·")[0].strip()
         cab = (f"<summary><span class='col-nom'>{html.escape(columna)}"
                f"</span><span class='meta'>{html.escape(medio)} · "
-               f"{len(entradas)} entregas · última {ultima}</span></summary>")
+               + ("fuente oculta en tu selección"
+                  if oculta else
+                  f"{len(entradas)} entregas · última {ultima}")
+               + "</span></summary>")
         cuerpo = "".join(
             _fila(n, columna, f.get("paywall", False))
             for n in entradas[:40]) \
-            or "<p class='meta'>Aún no captura — esperando la próxima " \
-               "entrega.</p>"
+            or ("<p class='meta'>Oculta en tu selección — actívala en "
+                "<a href='/fuentes'>Fuentes</a> para verla aquí.</p>"
+                if oculta
+                else "<p class='meta'>Aún no captura — esperando la "
+                     "próxima entrega.</p>")
         bloques.append((entradas[0]["fecha"] if entradas else "",
                         f"<details class='col-card'>{cab}"
                         f"<div class='col-list'>{cuerpo}</div></details>"))
     bloques.sort(key=lambda b: b[0], reverse=True)
     cards = "".join(b for _, b in bloques)
     return (f"<h1>Columnas</h1><p class='meta'>{len(cols)} columnas "
-            "en seguimiento</p>" + cards)
+            f"en seguimiento · {n_sel} en tu selección</p>" + cards)
 
 
 def vista_destacadas(email: str, cat: str = "") -> str:
@@ -4707,7 +5243,7 @@ def vista_noticias(email: str, pagina: int = 1) -> str:
     vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
     noticias = [n for n in leer_jsonl(NOTICIAS, limite=0)
                 if (n["fuente"] in vis or n.get("via") in vis)
-                and n.get("categoria") != "columnas"]
+                and n.get("categoria") not in ("columnas", "x")]
     ordenadas = sorted(noticias, key=lambda n: n["fecha"], reverse=True)
     chips = trending_chips(noticias)
     trending = f"<div class='trending'>{chips}</div>" if chips else ""
@@ -4732,6 +5268,32 @@ def vista_noticias(email: str, pagina: int = 1) -> str:
             f"<p class='meta'>{info} notas</p>"
             f"{trending}{nav}{cards}{nav}" if cards
             else "<h1>Últimas noticias</h1><p>Sin noticias todavía.</p>")
+
+
+def vista_x(email: str) -> str:
+    """Tab X: posts de cuentas seguidas (categoria 'x', fuentes tipo
+    'x' vía espejos Nitter). Feed cronológico sin clustering — son
+    posts, no cobertura."""
+    cfg = json.loads(CONFIG.read_text())
+    vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
+    posts = sorted((n for n in leer_jsonl(NOTICIAS, limite=0)
+                    if (n["fuente"] in vis or n.get("via") in vis)
+                    and n.get("categoria") == "x"),
+                   key=lambda n: n["fecha"], reverse=True)
+    # el feed 'Siguiendo' trae ~1200 cuentas (de todo): el tab solo
+    # muestra autores aprobados — el resto igual se ingirió y ya pasó
+    # por alertas/Interés
+    permitidos = {h.lower().lstrip("@") for h in
+                  cfg.get("x_permitidos", [])}
+    posts = [n for n in posts
+             if not n["fuente"].startswith("@")
+             or n["fuente"].lower().lstrip("@") in permitidos][:200]
+    cards = "".join(tarjeta_noticia(n) for n in posts)
+    return (f"<h1>X</h1><p class='meta'>{len(posts)} posts</p>{cards}"
+            if cards
+            else "<h1>X</h1><p class='meta'>Aún no hay posts capturados "
+                 "— agrega cuentas en Fuentes con tipo 'x' (x:handle). "
+                 "</p>")
 
 
 def vista_interes(email: str, pagina: int = 1) -> str:
@@ -4770,21 +5332,21 @@ def vista_interes(email: str, pagina: int = 1) -> str:
                  "<p>Aún no cae ninguna nota de la lista.</p>")
 
 
-def _chip_nota(n: dict) -> str:
-    """Enlaces por dato: primero nuestra /nota formateada, luego el
-    sitio original — el cliente confía más si puede llegar a la fuente."""
+def _chip_nota(n: dict) -> tuple:
+    """(badge_fuente, enlace_nota) por separado — el badge abre el
+    bullet y 'nota →' cierra como invitación al lector; el sitio
+    original solo se alcanza desde dentro de /nota."""
     if not n or not n.get("u"):
-        return ""
-    u = html.escape(n["u"], quote=True)
+        return "", ""
     t = html.escape(n.get("t", ""), quote=True)
     fnt = html.escape(n.get("f", ""))
-    est = ("font-size:.72rem;color:#1a237e;text-decoration:none;"
-           "white-space:nowrap")
-    return (f" <a href='/nota?u={quote(n['u'], safe='')}' title='{t}'"
-            f" style='{est}'>nota</a>"
-            f"<span style='font-size:.7rem;color:#bbb'>·</span>"
-            f"<a href='{u}' target='_blank' title='{t}'"
-            f" style='{est}'>↗ {fnt}</a>")
+    badge = (f"<span class='chip-fuente' title='{t}'"
+             f" style='font-size:.6rem;padding:1px 6px;"
+             f"margin-right:.35rem'>{fnt}</span>")
+    link = (f" <a href='/nota?u={quote(n['u'], safe='')}' title='{t}'"
+            f" style='font-size:.72rem;color:#1a237e;text-decoration:"
+            f"none;white-space:nowrap'>nota&nbsp;→</a>")
+    return badge, link
 
 
 def _link_nota(bullet: str, notas_ref: list) -> str:
@@ -4799,13 +5361,108 @@ def _link_nota(bullet: str, notas_ref: list) -> str:
         j = len(toks & tn) / max(len(toks | tn), 1)
         if j > mejor_j:
             mejor, mejor_j = n, j
-    return _chip_nota(mejor) if mejor else ""
+    return _chip_nota(mejor) if mejor else ("", "")
+
+
+def _cuerpo_sintesis(texto: str, notas_ref: list) -> str:
+    """Renderiza el texto de una síntesis a HTML: encabezados de
+    sección, bullets con chip de fuente y párrafos — compartido por
+    la tarjeta del dashboard y el reporte imprimible."""
+    cuerpo = ""
+    _toks_vistos = []   # dedup de bullets al render — las síntesis
+    # viejas repiten la misma nota en 2-3 secciones
+    for p in texto.split("\n"):
+        p = p.strip()
+        if not p:
+            continue
+        sec = re.fullmatch(r"\*\*(.+?)\*\*", p)
+        if sec or (p.isupper() and len(p) > 3):
+            cuerpo += (f"<h3 style='margin:1rem 0 .4rem;color:#1a237e;"
+                       f"font-size:.95rem;letter-spacing:.05em'>"
+                       f"{html.escape(sec.group(1) if sec else p)}"
+                       f"</h3>")
+        elif re.match(
+                r"^no (hay|se (tienen|encuentran|han|mencionan|"
+                r"presentan|detectaron|incluye))", p, flags=re.I):
+            continue   # relleno del modelo — sección sin material
+        elif re.match(r"^[•*\-—]\s|^[•*\-—]?\s*•", p):
+            plano = re.sub(r"^[•\-—]\s*", "", p)
+            # [N#], [N#|cat|fuente] o (N#) al final → chip
+            m_id = re.search(
+                r"[\[(]N(\d+)(?:\|[^\])]*)?[\])]\s*$", plano)
+            nota_idx = None
+            if m_id:
+                plano = plano[:m_id.start()].rstrip()
+                k = int(m_id.group(1)) - 1
+                if 0 <= k < len(notas_ref):
+                    nota_idx = notas_ref[k]
+            toks = _norm_titulo(plano)
+            if any(len(toks & v) / max(len(toks | v), 1) >= 0.7
+                   for v in _toks_vistos):
+                continue   # bullet repetido — se omite
+            _toks_vistos.append(toks)
+            txt = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>",
+                         html.escape(plano))
+            txt = txt.replace("**", "")   # asteriscos huérfanos
+            txt = _resaltar_interes(txt)
+            badge_n, link_n = (_chip_nota(nota_idx) if nota_idx
+                               else _link_nota(p, notas_ref))
+            cuerpo += (f"<p style='margin:.3rem 0;padding-left:1rem;"
+                       f"border-left:3px solid #e0e0e0'>• {badge_n}"
+                       f"{txt}{link_n}</p>")
+        else:
+            # párrafos también pueden cerrar con [N#] o (N#)
+            m_id = re.search(
+                r"[\[(]N(\d+)(?:\|[^\])]*)?[\])]\s*$", p)
+            nota_idx = None
+            if m_id:
+                p = p[:m_id.start()].rstrip()
+                k = int(m_id.group(1)) - 1
+                if 0 <= k < len(notas_ref):
+                    nota_idx = notas_ref[k]
+            txt = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>",
+                         html.escape(p))
+            badge_n, link_n = (_chip_nota(nota_idx) if nota_idx
+                               else _link_nota(p, notas_ref))
+            cuerpo += (f"<p style='margin:.35rem 0'>{badge_n}"
+                       f"{_resaltar_interes(txt)}{link_n}</p>")
+    return cuerpo
 
 
 def vista_resumenes(email: str, msg: str = "") -> str:
     """Síntesis ejecutivas generadas con Ollama (9:00, 15:00 y 21:00)."""
-    entradas = sorted(leer_jsonl(SINTESIS),
-                      key=lambda e: e.get("fecha", ""), reverse=True)
+    cfg_r = json.loads(CONFIG.read_text())
+    admin_v = es_admin(email, cfg_r)
+    # nombre de fuente → (categoría, tipo) para el cuadro por medio
+    cat_f = {}
+    for f in cfg_r.get("fuentes", []):
+        cat_f[f["nombre"].lower()] = (f.get("categoria", "prensa"),
+                                      f.get("tipo", "rss"))
+
+    def _cat_fuente(nombre: str) -> tuple:
+        n = nombre.lower()
+        if nombre.startswith("@"):
+            return ("x", "x")          # posts X → fuente=@autor
+        if n in cat_f:
+            return cat_f[n]
+        for nom, ct in cat_f.items():
+            if nom in n or n in nom:
+                return ct
+        return ("prensa", "rss")
+    entradas = leer_jsonl(SINTESIS)
+    # orden de tarjetas por rango horario (la poda ya dejó 1 x franja):
+    # noche → cierre, nocturna, matutina, vespertina
+    # mañana → matutina, vespertina, nocturna, cierre
+    # tarde  → vespertina, nocturna, cierre, matutina
+    h = datetime.now().hour
+    if 9 <= h < 15:
+        orden = ["matutina", "vespertina", "nocturna", "cierre"]
+    elif 15 <= h < 21:
+        orden = ["vespertina", "nocturna", "cierre", "matutina"]
+    else:
+        orden = ["cierre", "nocturna", "matutina", "vespertina"]
+    entradas.sort(key=lambda e: orden.index(e.get("franja"))
+                  if e.get("franja") in orden else 99)
     cards = ""
     for e in entradas[:30]:
         fecha = e.get("fecha", "")[:16].replace("T", " ")
@@ -4815,62 +5472,7 @@ def vista_resumenes(email: str, msg: str = "") -> str:
                  + {"cierre": "CIERRE DIARIO"}.get(
                      franja, franja.upper()) + "</span>")
         notas_ref = e.get("notas", [])
-        cuerpo = ""
-        _toks_vistos = []   # dedup de bullets al render — las síntesis
-        # viejas repiten la misma nota en 2-3 secciones
-        for p in e.get("texto", "").split("\n"):
-            p = p.strip()
-            if not p:
-                continue
-            sec = re.fullmatch(r"\*\*(.+?)\*\*", p)
-            if sec or (p.isupper() and len(p) > 3):
-                cuerpo += (f"<h3 style='margin:1rem 0 .4rem;color:#1a237e;"
-                           f"font-size:.95rem;letter-spacing:.05em'>"
-                           f"{html.escape(sec.group(1) if sec else p)}"
-                           f"</h3>")
-            elif re.match(
-                    r"^no (hay|se (tienen|encuentran|han|mencionan|"
-                    r"presentan|detectaron|incluye))", p, flags=re.I):
-                continue   # relleno del modelo — sección sin material
-            elif re.match(r"^[•*\-—]\s|^[•*\-—]?\s*•", p):
-                plano = re.sub(r"^[•\-—]\s*", "", p)
-                # [N#] o [N#|cat|fuente] al final → chip a esa nota
-                m_id = re.search(r"\[N(\d+)(?:\|[^\]]*)?\]\s*$", plano)
-                nota_idx = None
-                if m_id:
-                    plano = plano[:m_id.start()].rstrip()
-                    k = int(m_id.group(1)) - 1
-                    if 0 <= k < len(notas_ref):
-                        nota_idx = notas_ref[k]
-                toks = _norm_titulo(plano)
-                if any(len(toks & v) / max(len(toks | v), 1) >= 0.7
-                       for v in _toks_vistos):
-                    continue   # bullet repetido — se omite
-                _toks_vistos.append(toks)
-                txt = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>",
-                             html.escape(plano))
-                txt = txt.replace("**", "")   # asteriscos huérfanos
-                txt = _resaltar_interes(txt)
-                chip = (_chip_nota(nota_idx) if nota_idx
-                        else _link_nota(p, notas_ref))
-                cuerpo += (f"<p style='margin:.3rem 0;padding-left:1rem;"
-                           f"border-left:3px solid #e0e0e0'>• {txt}"
-                           f"{chip}</p>")
-            else:
-                # párrafos también pueden cerrar con [N#] (monólogo)
-                m_id = re.search(r"\[N(\d+)(?:\|[^\]]*)?\]\s*$", p)
-                nota_idx = None
-                if m_id:
-                    p = p[:m_id.start()].rstrip()
-                    k = int(m_id.group(1)) - 1
-                    if 0 <= k < len(notas_ref):
-                        nota_idx = notas_ref[k]
-                txt = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>",
-                             html.escape(p))
-                chip = (_chip_nota(nota_idx) if nota_idx
-                        else _link_nota(p, notas_ref))
-                cuerpo += (f"<p style='margin:.35rem 0'>"
-                           f"{_resaltar_interes(txt)}{chip}</p>")
+        cuerpo = _cuerpo_sintesis(e.get("texto", ""), notas_ref)
         fuentes = sorted({n.get("f", "") for n in notas_ref} - {""})
         detalle = ""
         if fuentes:
@@ -4880,23 +5482,289 @@ def vista_resumenes(email: str, msg: str = "") -> str:
                        f"{'…' if len(fuentes) > 8 else ''}</p>")
         chips = (f"{e.get('n_notas', 0)} notas de interés"
                  + (f" · {len(fuentes)} fuentes" if fuentes else ""))
+        ctrl = ""
+        if admin_v:
+            ffecha = html.escape(e.get("fecha", ""), quote=True)
+            ctrl = (
+                f"<details style='margin-top:.6rem'>"
+                f"<summary class='meta' style='cursor:pointer'>"
+                f"editar / borrar</summary>"
+                f"<form method='post' action='/resumenes/editar' "
+                f"style='margin-top:.5rem'>"
+                f"<input type='hidden' name='fecha' value='{ffecha}'>"
+                f"<textarea name='texto' rows='9' style='width:100%;"
+                f"font-size:.85rem'>{html.escape(e.get('texto', ''))}"
+                f"</textarea>"
+                f"<button name='accion' value='guardar'>Guardar"
+                f"</button> "
+                f"<button class='btn-rojo' name='accion' value='borrar' "
+                f"onclick=\"return confirm('¿Borrar esta síntesis?')\">"
+                f"Borrar</button></form></details>")
+            # publicar en X — solo admin (ni paolo): el post_x viene
+            # pre-generado con el cierre, editable antes de publicar;
+            # publicado = marca, no re-publicable
+            if franja == "cierre":
+                ffecha2 = html.escape(e.get("fecha", ""), quote=True)
+                if _x_publicado(e.get("fecha", "")):
+                    ctrl += ("<p class='meta' style='color:#2e7d32'>"
+                             "✓ publicado en X</p>")
+                else:
+                    px = html.escape(e.get("post_x", ""))
+                    ctrl += (
+                        f"<details style='margin-top:.6rem'>"
+                        f"<summary class='meta' style='cursor:pointer'>"
+                        f"publicar en X</summary>"
+                        f"<form method='post' "
+                        f"action='/resumenes/publicar-x' "
+                        f"style='margin-top:.5rem'>"
+                        f"<input type='hidden' name='fecha' "
+                        f"value='{ffecha2}'>"
+                        f"<textarea name='texto' rows='3' maxlength='280' "
+                        f"style='width:100%;font-size:.85rem' "
+                        f"placeholder='post para X (≤280)'>"
+                        f"{px}</textarea>"
+                        f"<button onclick=\"return confirm("
+                        f"'¿Publicar en @elpolidelanoche?')\">"
+                        f"Publicar</button></form></details>")
+        # imprimir/PDF por tarjeta — para todos los registrados: el
+        # reporte imprimible ya existía pero solo con checkboxes y
+        # solo para admin; ahora cada tarjeta lleva su atajo directo
+        imp = (f"<a class='btn-imp' "
+               f"href='/resumenes/reporte?"
+               f"sel={quote(e.get('fecha', ''), safe='')}' "
+               f"target='_blank'>imprimir / PDF</a>")
         cards += (f"<div class='card'><div class='meta'>{badge} {fecha} · "
-                  f"{chips}</div>{cuerpo}{detalle}</div>")
+                  f"{chips}</div>{imp}{cuerpo}{detalle}{ctrl}</div>")
+    # cuadro general al tope — conteo por tipo de medio de TODAS las
+    # tarjetas vigentes (estilo síntesis ejecutiva); 'redes' queda en
+    # 0 hasta que jalemos notas de FB — hoy solo sirven para portadas
+    def _grupo(ct: tuple) -> str:
+        c, tipo = ct
+        if c == "x" or tipo == "x":
+            return "X"
+        if tipo == "fb" or c in ("redes", "facebook", "instagram"):
+            return "Facebook"
+        if c == "columnas":
+            return "Columnas"
+        return "Portales de Internet"
+    conteo_g = Counter(_grupo(_cat_fuente(n.get("f", "")))
+                       for e in entradas for n in e.get("notas", []))
+    cuadro_g = ""
+    if conteo_g:
+        td_e = "style='border:1px solid #c5cae9;padding:4px 14px'"
+        td_n = ("style='border:1px solid #c5cae9;padding:4px 14px;"
+                "text-align:center;font-weight:600'")
+        filas = "".join(
+            f"<tr><td {td_e}>{g}</td>"
+            f"<td {td_n}>{conteo_g.get(g, 0):02d}</td></tr>"
+            for g in ("Portales de Internet", "Facebook", "X",
+                      "Columnas"))
+        cuadro_g = (
+            f"<table style='border-collapse:collapse;font-size:.74rem;"
+            f"margin:.4rem 0 1rem;width:260px'>"
+            f"<tr><th style='background:#1a237e;color:#fff;padding:5px "
+            f"14px;text-align:left;border:1px solid #1a237e'>Medio</th>"
+            f"<th style='background:#1a237e;color:#fff;padding:5px 14px;"
+            f"border:1px solid #1a237e'>Notas</th></tr>"
+            f"{filas}</table>")
+    # selector descargar/imprimir — solo admin (paolo entrega el reporte)
+    selector = ""
+    if admin_v and entradas:
+        opts = "".join(
+            f"<label class='fuente-check' style='display:block'>"
+            f"<input type='checkbox' name='sel' checked "
+            f"value='{html.escape(e.get('fecha', ''), quote=True)}'> "
+            f"{e.get('franja', '').upper() or 'SÍNTESIS'} · "
+            f"{e.get('fecha', '')[:16].replace('T', ' ')}</label>"
+            for e in entradas[:30])
+        selector = (
+            f"<details style='margin:0 0 1rem'>"
+            f"<summary class='btn-linea' style='display:inline-block;"
+            f"cursor:pointer'>Descargar / imprimir</summary>"
+            f"<form method='get' action='/resumenes/reporte' "
+            f"target='_blank' style='margin-top:.6rem'>{opts}"
+            f"<div class='regla-pie'><button>Generar reporte</button>"
+            f"</div></form></details>")
     aviso = (f"<p class='meta' style='color:#1a237e'>{html.escape(msg)}</p>"
              if msg else "")
-    return ("<h1>Síntesis</h1>" + aviso
-            + "<p class='meta'>Resumen ejecutivo generado con IA — "
+    return (f"<h1>Síntesis Diaria "
+            f"{datetime.now().strftime('%d/%m/%y')}</h1>" + aviso
+            + "<p class='meta'>Resumen ejecutivo — "
               "matutina 9:00 h, vespertina 15:00 h y nocturna "
-              "21:00 h.</p>"
-            + ("<form method='post' action='/resumenes/generar' "
-               "style='margin-bottom:1rem;display:flex;gap:.5rem'>"
-               "<button class='btn-linea'>Generar ahora</button>"
-               "<button class='btn-linea' name='franja' value='cierre'>"
-               "Cierre diario</button></form>"
-               if es_admin(email, json.loads(CONFIG.read_text()))
-               else "")
+              "21:00 h.</p>" + cuadro_g
+            + (("<form method='post' action='/resumenes/generar' "
+                "style='margin-bottom:1rem;display:flex;gap:.5rem'>"
+                + (f"<button class='btn-linea' disabled "
+                   f"style='opacity:.45;cursor:wait'>generando…"
+                   f"</button>"
+                   f"<button class='btn-linea' disabled "
+                   f"style='opacity:.45;cursor:wait'>Cierre diario"
+                   f"</button>"
+                   f"<span class='meta' style='align-self:center'>"
+                   f"Ollama tarda ~4-5 min — la página se recarga sola"
+                   f"</span>"
+                   f"<script>setTimeout(function(){{location.reload()}},"
+                   f"30000)</script>"
+                   if _GENERANDO else
+                   "<button class='btn-linea'>Generar ahora</button>"
+                   "<button class='btn-linea' name='franja' "
+                   "value='cierre'>Cierre diario</button>")
+                + "</form>")
+               if admin_v else "")
+            + selector
             + (cards or "<p>Aún no hay síntesis — la primera sale a las "
                         "9:00 h.</p>"))
+
+
+def vista_reporte_resumenes(sel: list) -> str:
+    """Reporte imprimible de entrega: encabezado con fecha larga +
+    cuadro por tipo de medio + las síntesis elegidas (checkboxes en
+    /resumenes). El botón Imprimir/PDF usa el diálogo del navegador."""
+    cfg_r = json.loads(CONFIG.read_text())
+    cat_f = {f["nombre"].lower(): (f.get("categoria", "prensa"),
+                                   f.get("tipo", "rss"))
+             for f in cfg_r.get("fuentes", [])}
+
+    def _cat(nombre: str) -> tuple:
+        n = nombre.lower()
+        if nombre.startswith("@"):
+            return ("x", "x")
+        if n in cat_f:
+            return cat_f[n]
+        for nom, ct in cat_f.items():
+            if nom in n or n in nom:
+                return ct
+        return ("prensa", "rss")
+
+    entradas = leer_jsonl(SINTESIS)
+    if sel:
+        sel_set = set(sel)
+        entradas = [e for e in entradas if e.get("fecha") in sel_set]
+    entradas.sort(key=lambda e: {"matutina": 0, "vespertina": 1,
+                                 "nocturna": 2, "cierre": 3}
+                  .get(e.get("franja", ""), 9))
+
+    def _grupo(ct: tuple) -> str:
+        c, tipo = ct
+        if c == "x" or tipo == "x":
+            return "X"
+        if tipo == "fb" or c in ("redes", "facebook", "instagram"):
+            return "Facebook"
+        if c == "columnas":
+            return "Columnas"
+        return "Portales de Internet"
+    conteo = Counter(_grupo(_cat(n.get("f", "")))
+                     for e in entradas for n in e.get("notas", []))
+    td_e = "border:1px solid #c5cae9;padding:4px 14px"
+    filas = "".join(
+        f"<tr><td style='{td_e}'>{g}</td>"
+        f"<td style='{td_e};text-align:center;font-weight:600'>"
+        f"{conteo.get(g, 0):02d}</td></tr>"
+        for g in ("Portales de Internet", "Facebook", "X", "Columnas"))
+    cuadro = (f"<table style='border-collapse:collapse;font-size:.78rem;"
+              f"margin:.8rem 0 1.2rem;width:280px'>"
+              f"<tr><th style='background:#1a237e;color:#fff;padding:5px"
+              f" 14px;text-align:left'>Medio</th>"
+              f"<th style='background:#1a237e;color:#fff;padding:5px "
+              f"14px'>Notas</th></tr>{filas}</table>") if conteo else ""
+
+    meses = ("enero febrero marzo abril mayo junio julio agosto "
+             "septiembre octubre noviembre diciembre").split()
+    hoy = datetime.now()
+    fecha_larga = f"{hoy.day} de {meses[hoy.month - 1]} de {hoy.year}"
+    secciones = ""
+    for e in entradas:
+        fr = {"cierre": "CIERRE DIARIO"}.get(
+            e.get("franja", ""), e.get("franja", "").upper()) \
+            or "SÍNTESIS"
+        secciones += (
+            f"<section style='margin-bottom:1.6rem'>"
+            f"<h2 style='color:#1a237e;border-bottom:2px solid #1a237e;"
+            f"padding-bottom:.2rem;font-size:1rem'>{fr} · "
+            f"{e.get('fecha', '')[:16].replace('T', ' ')} h</h2>"
+            + _cuerpo_sintesis(e.get("texto", ""),
+                               e.get("notas", []))
+            + "</section>")
+    qs = "&".join("sel=" + quote(s, safe="") for s in sel)
+    return f"""<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<title>Síntesis ejecutiva — {fecha_larga}</title>
+<style>
+  body {{ font-family: Georgia, 'Times New Roman', serif; margin: 0;
+         padding: 2rem; max-width: 800px; color: #111; font-size: .95rem;
+         line-height: 1.55; }}
+  h1 {{ font-size: 1.35rem; color: #1a237e; margin: 0; }}
+  .sub {{ color: #555; font-size: .82rem; margin: .2rem 0 .8rem; }}
+  .toolbar {{ position: sticky; top: 0; background: #f4f4f8;
+    padding: .6rem; margin: -2rem -2rem 1rem; border-bottom:
+    1px solid #ddd; display: flex; gap: .6rem; }}
+  .toolbar button {{ font: inherit; padding: .35rem 1rem;
+    border: 1px solid #1a237e; background: #fff; color: #1a237e;
+    cursor: pointer; border-radius: 4px; }}
+  mark {{ background: #fff3a0; padding: 0 .1em; }}
+  a {{ color: #1a237e; }}
+  @media print {{ .toolbar {{ display: none }}
+                  body {{ padding: 0 }} }}
+  @page {{ margin: 1.8cm; }}
+</style></head><body>
+<div class="toolbar">
+  <button onclick="window.print()">Imprimir / guardar PDF</button>
+  <a href="/resumenes/reporte?{qs}&fmt=png"><button>Descargar PNG</button></a>
+</div>
+<h1>SÍNTESIS EJECUTIVA DEL {fecha_larga.upper()}</h1>
+<p class="sub">Monitor de medios — matutina 9:00 h, vespertina 15:00 h,
+nocturna 21:00 h · {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
+{cuadro}
+{secciones or "<p>Sin síntesis seleccionadas.</p>"}
+</body></html>"""
+
+
+def _reporte_png(doc_html: str) -> bytes:
+    """Renderiza el reporte a PNG con Playwright (chucky no — es solo
+    un render local, sin sesión)."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            br = _launch(p)
+            pg = br.new_page(viewport={"width": 900})
+            pg.set_content(doc_html, wait_until="load")
+            pg.wait_for_timeout(400)
+            png = pg.screenshot(full_page=True)
+            br.close()
+            return png
+    except Exception as e:
+        print(f"[reporte] png falló: {e}")
+        return b""
+
+
+def _agujas_buscar(q: str) -> list:
+    """Parte la consulta en agujas: frases 'entre comillas' son substring
+    exacto; palabras sueltas hacen AND en cualquier orden.
+    'german "garcia serrano" tabasco' → ['german','garcia serrano','tabasco']"""
+    return [normalizar(m.group(1) or m.group(2))
+            for m in re.finditer(r'"([^"]+)"|(\S+)', q)
+            if (m.group(1) or m.group(2)).strip()]
+
+
+_BUSCAR_CACHE: dict = {}
+
+
+def _notas_texto(vis: set) -> list:
+    """(nota, texto_normalizado) de todas las noticias, cacheado por
+    mtime del jsonl — antes cada búsqueda re-leía y re-normalizaba
+    ~50k notas; el texto se recalcula solo cuando cambia el archivo."""
+    global _BUSCAR_CACHE
+    mt = NOTICIAS.stat().st_mtime if NOTICIAS.exists() else 0
+    if _BUSCAR_CACHE.get("mt") != mt:
+        notas = leer_jsonl(NOTICIAS, limite=0)
+        textos = {n["link"]: normalizar(
+            n["titulo"] + " " + n["fuente"] + " "
+            + (n.get("autor") or "") + " "
+            + (n.get("resumen") or "")) for n in notas}
+        _BUSCAR_CACHE = {"mt": mt, "notas": notas, "textos": textos}
+    return [(n, _BUSCAR_CACHE["textos"].get(n["link"], ""))
+            for n in _BUSCAR_CACHE["notas"]
+            if n["fuente"] in vis or n.get("via") in vis]
 
 
 def busqueda_viva_wp(q: str, cfg: dict, ya: set) -> list:
@@ -4923,7 +5791,7 @@ def busqueda_viva_wp(q: str, cfg: dict, ya: set) -> list:
         nom = nom_por_dom.get(dom)
         if nom:
             doms.append((h, nom))
-    terms = normalizar(q).split()
+    terms = _agujas_buscar(q)
     if not terms:
         return []
 
@@ -4933,7 +5801,7 @@ def busqueda_viva_wp(q: str, cfg: dict, ya: set) -> list:
             r = requests.get(
                 f"https://{host}/wp-json/wp/v2/search",
                 params={"search": q, "per_page": 10},
-                timeout=4, headers={"User-Agent": "Mozilla/5.0"})
+                timeout=2.5, headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code != 200:
                 return []
             data = r.json()
@@ -4956,19 +5824,19 @@ def busqueda_viva_wp(q: str, cfg: dict, ya: set) -> list:
 
 
 def vista_buscar(q: str, email: str) -> str:
-    terms = normalizar(q).split()          # AND de palabras, cualquier orden
+    agujas = _agujas_buscar(q)      # AND; "frase entre comillas" exacta
     cfg = json.loads(CONFIG.read_text())
     vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
-    noticias = [n for n in leer_jsonl(NOTICIAS, limite=0) if n["fuente"] in vis or n.get("via") in vis]
+    notas_txt = _notas_texto(vis)   # cache mtime — la parte lenta
+    noticias = [n for n, _ in notas_txt]
     alertas = [a for a in leer_jsonl(ALERTAS)
                if not a.get("usuario") or a["usuario"] == email]
-    hits_n = [n for n in noticias if all(
-        t in normalizar(n["titulo"] + " " + n["fuente"]
-                        + " " + (n.get("autor") or "")
-                        + " " + (n.get("resumen") or "")) for t in terms)]
+    hits_n = [n for n, txt in notas_txt
+              if all(t in txt for t in agujas)]
     hits_a = [a for a in alertas if all(
         t in normalizar(a["titulo"] + " " + a["reglas"]
-                        + " " + (a.get("autor") or "")) for t in terms)]
+                        + " " + (a.get("autor") or ""))
+        for t in agujas)]
     # si la alerta ya está como noticia en resultados, no duplicar
     links_n = {n["link"] for n in hits_n}
     hits_a = [a for a in hits_a if a["link"] not in links_n]
@@ -4987,7 +5855,8 @@ def vista_buscar(q: str, email: str) -> str:
     trending = f"<div class='trending'>{regresar}{chips}</div>" if chips else ""
     return (f"<h1>Buscar: {html.escape(q)}</h1>"
             f"{trending}"
-            f"<p class='meta'>{len(hits_n)} notas · {len(hits_a)} alertas</p>"
+            f"<p class='meta'>{len(hits_n)} notas · {len(hits_a)} alertas"
+            f" · frase exacta: \"entre comillas\"</p>"
             + "".join(tarjeta_alerta(a, colores) for a in
                       sorted(hits_a, key=lambda a: a["fecha"], reverse=True))
             + "".join(tarjeta_noticia(n) for n in
@@ -5081,10 +5950,13 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
         f = nota.get("fuente", "")
         img = nota.get("imagen", "")
         res = nota.get("resumen", "")
+        aut = nota.get("autor", "")
         return ("<div class='lector'>"
                 "<a href='javascript:history.back()'>← Regresar</a>"
                 f"<h1>{html.escape(t or 'Nota vía Google News')}</h1>"
-                f"<div class='meta'>Fuente: {html.escape(f)} · vía Google News</div>"
+                f"<div class='meta'>Fuente: {html.escape(f)}"
+                + (f" · Por {html.escape(aut)}" if aut else "")
+                + " · vía Google News</div>"
                 + (f"<img class='hero' src='{html.escape(url_https(img))}' "
                    f"onerror='this.remove()'>" if img else "")
                 + (f"<p class='lede'>{html.escape(res[:600])}</p>" if res else "")
@@ -5095,9 +5967,20 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
                 {"titulo": t, "imagen": img,
                  "desc": "Nota vía Google News", "dominio": dominio})
     try:
-        r = requests.get(link, timeout=12,
+        # (4s conexión, 8s por lectura) + tope 1.5MB: un medio que
+        # entrega el body a gotas podía colgar el lector minutos —
+        # timeout=12 solo acotaba CADA op de socket, no el total
+        r = requests.get(link, timeout=(4, 8), stream=True,
                          headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
+        trozos, total = [], 0
+        for chunk in r.iter_content(65536, decode_unicode=False):
+            trozos.append(chunk)
+            total += len(chunk)
+            if total >= 1_500_000:
+                break
+        r.close()
+        r._content = b"".join(trozos)
     except Exception as e:
         # el medio bloquea al servidor (403/WAF) — mostrar lo que tenemos
         # guardado de la nota en vez de una pantalla vacía
@@ -5106,10 +5989,14 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
         t = nota.get("titulo", "")
         img = nota.get("imagen", "")
         res = nota.get("resumen", "")
+        aut = nota.get("autor", "")
         return ("<div class='lector'>"
                 "<a href='javascript:history.back()'>← Regresar</a>"
                 f"<h1>{html.escape(t or 'No se pudo cargar la nota')}</h1>"
-                f"<div class='meta'>Fuente original: {html.escape(dominio)}</div>"
+                f"<div class='meta'>Fuente: "
+                f"{html.escape(nota.get('fuente') or dominio)}"
+                + (f" · Por {html.escape(aut)}" if aut else "")
+                + "</div>"
                 + (f"<img class='hero' src='{html.escape(url_https(img))}' "
                    f"onerror='this.remove()'>" if img else "")
                 + (f"<p class='lede'>{html.escape(res[:600])}</p>" if res else "")
@@ -5137,6 +6024,23 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
     meta = {"titulo": titulo, "imagen": imagen, "desc": desc,
             "dominio": dominio}
 
+    # byline: autor que vino en el feed → si no, metas de la página
+    # (article:author / author / twitter:creator) — muchos medios
+    # publican 'Redacción' o nada: se muestra lo que haya
+    nota_guardada = next((n for n in leer_jsonl(NOTICIAS)
+                          if n["link"] == link), {})
+    autor = (nota_guardada.get("autor")
+             or _meta(r.text, "article:author")
+             or _meta(r.text, "author")
+             or _meta(r.text, "twitter:creator")
+             or "")
+    autor = re.sub(r"^(por|by)\s+", "", autor, flags=re.I).strip()
+    datos = f"Fuente: {html.escape(nota_guardada.get('fuente') or dominio)}"
+    if autor:
+        datos += f" · Por {html.escape(autor)}"
+    if nota_guardada.get("fecha"):
+        datos += f" · {fmt_fecha(nota_guardada['fecha'])}"
+
     # párrafos del cuerpo: filtrar menús/pies (textos cortos) y duplicados
     # — primero limpiar <script>/<style>: los ads los meten dentro de <p>
     #   y el regex los volcaba como texto plano (googletag de Crónica)
@@ -5147,9 +6051,21 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
     for p in re.findall(r"<p[^>]*>(.*?)</p>", doc_p, re.S | re.I):
         txt = re.sub(r"<[^>]+>", " ", p)
         txt = html.unescape(re.sub(r"\s+", " ", txt)).strip()
-        if len(txt) > 60 and txt not in vistos_p:
-            paras.append(txt)
-            vistos_p.add(txt)
+        if len(txt) <= 60 or txt in vistos_p:
+            continue
+        # nav/footer: párrafos que son casi puros <a> (menús de WP se
+        # meten en <p>) o boilerplate editorial — no son cuerpo
+        links_txt = " ".join(re.findall(
+            r"<a[^>]*>(.*?)</a>", p, re.S | re.I))
+        links_txt = re.sub(r"<[^>]+>", " ", links_txt)
+        links_txt = len(html.unescape(re.sub(r"\s+", " ", links_txt)).strip())
+        if links_txt / len(txt) > 0.45:
+            continue
+        if re.search(r"derechos reservados|©\s*\d{4}|todos los derechos",
+                     txt, re.I):
+            continue
+        paras.append(txt)
+        vistos_p.add(txt)
         if len(paras) >= 15:
             break
 
@@ -5159,8 +6075,6 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
         cuerpo = ("<p class='meta'>El sitio no permitió extraer el texto.</p>")
 
     # fuente paywalled → avisar que solo hay lede
-    nota_guardada = next((n for n in leer_jsonl(NOTICIAS)
-                          if n["link"] == link), {})
     if nota_guardada.get("paywall"):
         cuerpo += ("<p class='meta' style='color:#b45309;font-weight:600'>"
                    "SUSCRIPCIÓN REQUERIDA — el medio solo publica el "
@@ -5175,7 +6089,7 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
         "<div class='lector'>"
         f"<a href='javascript:history.back()'>← Regresar</a>"
         f"<h1>{html.escape(titulo)}</h1>"
-        f"<div class='meta'>Fuente original: {html.escape(dominio)}</div>"
+        f"<div class='meta'>{datos}</div>"
         + (f"<img class='hero' src='{html.escape(url_https(imagen))}' "
            f"onerror='this.remove()'>" if imagen else "")
         + cuerpo
@@ -5740,7 +6654,7 @@ def vista_fuentes(email: str, msg: str = "") -> str:
     cats = sorted({f.get("categoria", "prensa") for f in cfg["fuentes"]}
                   | {"prensa", "prensa_independiente", "nacional",
                      "deportes", "internacional", "oficial",
-                     "quintana_roo"})
+                     "quintana_roo", "columnas", "redes", "x"})
 
     # --- lista unificada: checkbox (mi feed) + dropdown de edición (admin) ---
     # los inputs de edición llevan form='sf{i}' → se envían con su propio
@@ -5782,6 +6696,10 @@ def vista_fuentes(email: str, msg: str = "") -> str:
            value="{html.escape(f['url'], quote=True)}" required>
     <label>Categoría</label>
     <select form="sf{i}" name="categoria" style="width:100%">{opciones}</select>
+    <label>Página de Facebook <span class="meta">(opcional — chucky raspa sus posts)</span></label>
+    <input form="sf{i}" type="text" name="fb" inputmode="url"
+           placeholder="https://www.facebook.com/pagina"
+           value="{html.escape(f.get('fb', ''), quote=True)}">
     <label>Filtro — solo notas que mencionen (vacío = pasa todo)</label>
     <input form="sf{i}" type="text" name="filtro" placeholder="tabasco, villahermosa"
            value="{html.escape(', '.join(f.get('solo_si_menciona', [])), quote=True)}">
@@ -5831,7 +6749,7 @@ y Buscar.</p>
   <label class="fuente-check master"><input type="checkbox" id="sel-todo"
       {'checked' if not ocultas else ''}
       onclick="document.querySelectorAll('input[name=ver], .cat-check').forEach(c=>c.checked=this.checked)">
-    <span class="meta">todas</span></label>
+    <span class="meta">todas ({len(cfg['fuentes'])})</span></label>
   {filas}
   <p><button name="accion" value="seleccion">Guardar mi selección</button></p>
 </form>
@@ -5875,8 +6793,10 @@ function soloCat(cat) {
   <form method="post" action="/fuentes">
     <label>Nombre del medio</label>
     <input type="text" name="nombre" placeholder="Ej: Mural" required>
-    <label>URL del RSS <span class="meta">(o la portada — se autodetecta; o <code>gn:tema</code> para Google News por búsqueda)</span></label>
-    <input type="text" name="url" placeholder="https://…  o  gn:efraín tabasco" inputmode="url" required>
+    <label>URL del RSS <span class="meta">(o la portada — se autodetecta; o <code>gn:tema</code>; o página de <b>Facebook</b> → la raspa chucky)</span></label>
+    <input type="text" name="url" placeholder="https://…  o  gn:efraín tabasco  o  https://facebook.com/pagina" inputmode="url" required>
+    <label>Página de Facebook <span class="meta">(opcional — si además del sitio tiene página)</span></label>
+    <input type="text" name="fb" inputmode="url" placeholder="https://www.facebook.com/pagina">
     <label>Categoría</label>
     <select name="categoria" style="width:100%">{opciones_nueva}</select>
     <label>Filtro — solo notas que mencionen (opcional)</label>
@@ -6344,7 +7264,8 @@ def render_pagina(contenido: str, q: str = "", base: str = "",
                   if usuario and es_admin(usuario, cfg) else "")
     # guests (demo 24h): solo noticias/alertas/portadas — el producto
     # judicial (interés, columnas, síntesis, fuentes) es de pago
-    tabs_reg = ('<a href="/columnas">Columnas</a>'
+    tabs_reg = ('<a href="/x">X</a>'
+                '<a href="/columnas">Columnas</a>'
                 '<a href="/interes">Interés</a>'
                 '<a href="/resumenes">Resúmenes</a>'
                 '<a href="/fuentes">Fuentes</a>'
@@ -6389,6 +7310,15 @@ def aplicar_accion_fuentes(form: dict, email: str):
             "tipo": "rss",
             "categoria": form.get("categoria", ["prensa"])[0],
         }
+        fb = form.get("fb", [""])[0].strip()
+        if "facebook.com" in f["url"]:
+            f["tipo"] = "fb"           # fuente que ES la página de FB
+        elif f["url"].lower().startswith("x:") \
+                or re.match(r"^https?://(www\.)?(x|twitter)\.com/",
+                            f["url"]):
+            f["tipo"] = "x"            # timeline de X vía Nitter
+        elif fb and "facebook.com" in fb:
+            f["fb"] = fb               # página FB complementaria
         filtro = [p.strip() for p in form.get("filtro", [""])[0].split(",") if p.strip()]
         if filtro:
             f["solo_si_menciona"] = filtro
@@ -6397,30 +7327,53 @@ def aplicar_accion_fuentes(form: dict, email: str):
     error = ""
     if accion == "agregar":
         f = datos_fuente()
-        if f["nombre"] and f["url"].startswith("http"):
-            url_ok, tipo, error = resolver_feed(f["url"])
-            if url_ok and url_ok in {x["url"] for x in cfg["fuentes"]}:
-                error = "esa fuente ya está en el catálogo"
-                url_ok = None
-            if url_ok:
-                f["url"], f["tipo"] = url_ok, tipo
-                cfg["fuentes"].append(f)
+        if f["nombre"] and (f["url"].startswith("http")
+                            or f["url"].lower().startswith("x:")):
+            if f["tipo"] == "fb":
+                # página FB — no hay feed que resolver; chucky la raspa
+                if f["url"] in {x["url"] for x in cfg["fuentes"]}:
+                    error = "esa fuente ya está en el catálogo"
+                else:
+                    cfg["fuentes"].append(f)
+            else:
+                url_ok, tipo, error = resolver_feed(f["url"])
+                if url_ok and url_ok in {x["url"] for x in cfg["fuentes"]}:
+                    error = "esa fuente ya está en el catálogo"
+                    url_ok = None
+                if url_ok:
+                    f["url"], f["tipo"] = url_ok, tipo
+                    cfg["fuentes"].append(f)
+            if f.get("tipo") == "x" and url_ok != "x:home":
+                # el handle entra a la lista blanca del tab /x — los
+                # posts se atribuyen a @autor y sin esto no se ven
+                h = _handle_x(url_ok or f["url"])
+                if h and h not in cfg.setdefault("x_permitidos", []):
+                    cfg["x_permitidos"].append(h)
         else:
             error = "nombre y URL http(s) obligatorios"
     elif accion == "editar":
         try:
             idx = int(form.get("idx", ["-1"])[0])
             f = datos_fuente()
-            if f["nombre"] and f["url"].startswith("http"):
-                url_ok, tipo, error = resolver_feed(f["url"])
-                if url_ok and url_ok in {
-                        x["url"] for j, x in enumerate(cfg["fuentes"])
-                        if j != idx}:
-                    error = "esa fuente ya está en el catálogo"
-                    url_ok = None
-                if url_ok:
-                    f["url"], f["tipo"] = url_ok, tipo
-                    cfg["fuentes"][idx] = f
+            if f["nombre"] and (f["url"].startswith("http")
+                                or f["url"].lower().startswith("x:")):
+                if f["tipo"] == "fb":
+                    if f["url"] in {
+                            x["url"] for j, x in enumerate(cfg["fuentes"])
+                            if j != idx}:
+                        error = "esa fuente ya está en el catálogo"
+                    else:
+                        cfg["fuentes"][idx] = f
+                else:
+                    url_ok, tipo, error = resolver_feed(f["url"])
+                    if url_ok and url_ok in {
+                            x["url"] for j, x in enumerate(cfg["fuentes"])
+                            if j != idx}:
+                        error = "esa fuente ya está en el catálogo"
+                        url_ok = None
+                    if url_ok:
+                        f["url"], f["tipo"] = url_ok, tipo
+                        cfg["fuentes"][idx] = f
         except (ValueError, IndexError):
             pass
     elif accion == "borrar":
@@ -6681,6 +7634,9 @@ def servir_web(puerto: int):
                     p = 1
                 self._html(render_pagina(vista_noticias(email, p), base=base,
                                          usuario=email))
+            elif ruta.path == "/x":
+                self._html(render_pagina(vista_x(email), base=base,
+                                         usuario=email))
             elif ruta.path == "/buscar":
                 q = params.get("q", [""])[0]
                 self._html(render_pagina(vista_buscar(q, email), q=q,
@@ -6734,6 +7690,32 @@ def servir_web(puerto: int):
                 self._html(render_pagina(vista_resumenes(
                     email, params.get("msg", [""])[0]),
                     base=base, usuario=email))
+            elif ruta.path == "/resumenes/reporte":
+                # reporte imprimible: para todos los registrados —
+                # paolo imprime las tarjetas para su entrega diaria;
+                # fuera solo demo/anónimo
+                if not email or "@demo.local" in email:
+                    self.send_response(303)
+                    self.send_header("Location", "/resumenes")
+                    self.end_headers()
+                    return
+                doc = vista_reporte_resumenes(params.get("sel", []))
+                if params.get("fmt", [""])[0] == "png":
+                    png = _reporte_png(doc)
+                    if png:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "image/png")
+                        self.send_header(
+                            "Content-Disposition",
+                            'attachment; filename="sintesis_'
+                            + datetime.now().strftime("%Y%m%d_%H%M")
+                            + '.png"')
+                        self.end_headers()
+                        self.wfile.write(png)
+                    else:
+                        self._html(doc)   # fallback al HTML imprimible
+                else:
+                    self._html(doc)
             elif ruta.path == "/portadas":
                 sec = params.get("sec", ["nacional"])[0]
                 self._html(render_pagina(
@@ -6927,6 +7909,61 @@ def servir_web(puerto: int):
                 self.end_headers()
                 return
 
+            if ruta.path == "/resumenes/editar":
+                email = self._usuario()
+                cfg_e = json.loads(CONFIG.read_text())
+                if not email or not es_admin(email, cfg_e):
+                    self.send_response(303)
+                    self.send_header("Location", "/resumenes")
+                    self.end_headers()
+                    return
+                fecha_t = form.get("fecha", [""])[0]
+                accion = form.get("accion", [""])[0]
+                out = []
+                for l in SINTESIS.read_text(
+                        encoding="utf-8").splitlines():
+                    try:
+                        e = json.loads(l)
+                    except Exception:
+                        out.append(l)
+                        continue
+                    if e.get("fecha") == fecha_t:
+                        if accion == "guardar":
+                            e["texto"] = form.get("texto", [""])[0].strip()
+                            out.append(json.dumps(e, ensure_ascii=False))
+                        # 'borrar' → la línea simplemente no vuelve
+                    else:
+                        out.append(l)
+                SINTESIS.write_text("\n".join(out) + "\n",
+                                    encoding="utf-8")
+                self.send_response(303)
+                self.send_header("Location", "/resumenes")
+                self.end_headers()
+                return
+
+            if ruta.path == "/resumenes/publicar-x":
+                email = self._usuario()
+                cfg_x = json.loads(CONFIG.read_text())
+                if not email or not es_admin(email, cfg_x):
+                    self.send_response(303)
+                    self.send_header("Location", "/resumenes")
+                    self.end_headers()
+                    return
+                texto_x = form.get("texto", [""])[0].strip()[:280]
+                fecha_x = form.get("fecha", [""])[0]
+                ok = texto_x and not _x_publicado(fecha_x) \
+                    and _post_x(texto_x)
+                with open(X_POSTS, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(
+                        {"fecha": fecha_x, "texto": texto_x, "ok": ok,
+                         "ts": datetime.now().isoformat(
+                             timespec="seconds")},
+                        ensure_ascii=False) + "\n")
+                self.send_response(303)
+                self.send_header("Location", "/resumenes")
+                self.end_headers()
+                return
+
             if ruta.path == "/resumenes/generar":
                 email = self._usuario()
                 if not email or "@demo.local" in email:
@@ -6941,16 +7978,24 @@ def servir_web(puerto: int):
                     self.end_headers()
                     return
                 if form.get("franja", [""])[0] == "cierre":
-                    threading.Thread(target=generar_cierre,
-                                     args=(cfg_s,), daemon=True,
-                                     name="cierre").start()
+                    if "cierre" not in _GENERANDO:
+                        _GENERANDO.add("cierre")
+                        threading.Thread(target=_gen_bg,
+                                         args=(generar_cierre, "cierre",
+                                               cfg_s),
+                                         daemon=True, name="cierre").\
+                            start()
                 else:
                     h = datetime.now().hour
                     franja = ("matutina" if h < 9 else
                               "vespertina" if h < 15 else "nocturna")
-                    threading.Thread(target=generar_sintesis,
-                                     args=(cfg_s, franja), daemon=True,
-                                     name="sintesis").start()
+                    if franja not in _GENERANDO:
+                        _GENERANDO.add(franja)
+                        threading.Thread(target=_gen_bg,
+                                         args=(generar_sintesis, franja,
+                                               cfg_s, franja),
+                                         daemon=True, name="sintesis").\
+                            start()
                 self.send_response(303)
                 self.send_header(
                     "Location",
@@ -7080,6 +8125,11 @@ def main():
                     threading.Thread(target=generar_sintesis,
                                      args=(cfg, franja), daemon=True,
                                      name=f"sintesis-{franja}").start()
+            # chucky: posts de las fuentes tipo fb, cada 4 h
+            if toca_fb_posts():
+                threading.Thread(target=scrapear_posts_fb,
+                                 args=(cfg,), daemon=True,
+                                 name="fb-posts").start()
             with _LOCK_REVISAR:
                 revisar(cfg, args.todo, args.resumir)
             # siesta adaptativa: en la ventana portadas (00:10→07:00)
