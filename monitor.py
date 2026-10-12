@@ -108,17 +108,32 @@ DEMO_HORAS = 24  # cuánto dura el perfil de invitado
 
 def cargar_usuarios() -> dict:
     """{email: {'reglas': [...], 'fuentes_ocultas': [...], 'expira': ts}}"""
-    if not USUARIOS.exists():
-        return {}
-    try:
-        datos = json.loads(USUARIOS.read_text())
-        return datos if isinstance(datos, dict) else {}
-    except Exception:
-        return {}
+    for path in (USUARIOS, USUARIOS.with_suffix(".json.bak")):
+        if not path.exists():
+            continue
+        try:
+            datos = json.loads(path.read_text())
+            if isinstance(datos, dict):
+                return datos   # .bak rescata si el principal truncó
+        except Exception:
+            continue
+    return {}
 
 
 def guardar_usuarios(usuarios: dict):
-    USUARIOS.write_text(json.dumps(usuarios, ensure_ascii=False, indent=2))
+    """Write atómico + .bak del último estado — un restart a mitad de
+    write_text() dejaba el JSON truncado y cargar_usuarios devolvía {}
+    (padrón 'borrado': los usuarios perdían la contraseña)."""
+    txt = json.dumps(usuarios, ensure_ascii=False, indent=2)
+    try:
+        if USUARIOS.exists():
+            USUARIOS.with_suffix(".json.bak").write_text(
+                USUARIOS.read_text())
+    except Exception:
+        pass
+    tmp = USUARIOS.with_suffix(".tmp")
+    tmp.write_text(txt)
+    tmp.replace(USUARIOS)
 
 
 def es_admin(email: str, cfg: dict) -> bool:
@@ -1318,7 +1333,8 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
         print(f"[{datetime.now():%H:%M:%S}] {fuente['nombre']}: {nuevas} notas nuevas")
 
     guardar_vistos(vistos)
-    ESTADO_FUENTES.write_text(json.dumps(estado, ensure_ascii=False, indent=0))
+    _escribir_json(ESTADO_FUENTES, estado)
+    _escribir_json(CONFIG, cfg)
     alertas += detectar_desarrollo(cfg, resumir)
     purgar()
     purgar_usuarios()
@@ -1638,7 +1654,7 @@ def _post_x(texto: str) -> bool:
             print(f"[x] post {'enviado' if ok else 'NO confirmado'}"
                   f" — {len(texto)} chars")
             return ok
-    except Exception as e:
+    except Exception:
         print(f"[x] error posteando: {e}")
         return False
 
@@ -2074,6 +2090,67 @@ def scrapear_posts_fb(cfg: dict):
                         break
                     pg.wait_for_timeout(5000)
                     prev = -1
+                    posts_dict = {}
+                    textos_vistos = set()
+                    _JS_EXTRACT = """() => {
+                        // desde cada permalink limpio hacia ARRIBA hasta
+                        // el contenedor con timestamp ('19 h', 'hace')
+                        // — los posts aquí NO son role=article (eso es
+                        // el comment); el grid de 'Fotos' no tiene
+                        // timestamp y muere solo
+                        const out = [], seen = new Set();
+                        for (const a of document.querySelectorAll(
+                                'a[href*="/posts/"],'
+                              + 'a[href*="story_fbid"],'
+                              + 'a[href*="/permalink/"],'
+                              + 'a[href*="/photo/?fbid="],'
+                              + 'a[href*="/videos/"],'
+                              + 'a[href*="/reel/"],'
+                              + 'a[href*="pfbid"]')) {
+                            const h = a.href;
+                            if (h.includes('comment_id')) continue;
+                            // '/reel/?s=tab' es nav — permalink de reel
+                            // lleva ID numérico o pfbid
+                            if (h.includes('/reel/')
+                                    && !/reel\\/(\\d|pfbid)/.test(h))
+                                continue;
+                            if (seen.has(h)) continue;
+                            let n = a.closest('[role="article"]');
+                            if (!n) {
+                                let c = a;
+                                for (let i = 0; i < 10 && c; i++) {
+                                    c = c.parentElement;
+                                    if (!c) break;
+                                    const t = c.innerText || '';
+                                    if (/\\b\\d+\\s*(min|h|d)\\b|hace/i
+                                            .test(t)
+                                            && t.length > 60) {
+                                        n = c; break;
+                                    }
+                                    if (t.length > 3000) break;
+                                }
+                            }
+                            if (!n) continue;
+                            seen.add(h);
+                            let owner = '';
+                            for (const o of n.querySelectorAll(
+                                    'a[href*="facebook.com/"]')) {
+                                const seg = new URL(o.href).pathname
+                                    .split('/').filter(Boolean);
+                                if (seg.length === 1 &&
+                                    !/posts|photos|photo|reels|watch|groups|hashtag|permalink|reel|videos/
+                                    .test(seg[0])) {
+                                    owner = seg[0]; break;
+                                }
+                            }
+                            const lines = (n.innerText || '')
+                                .split(String.fromCharCode(10))
+                                .map(s => s.trim())
+                                .filter(Boolean).slice(0, 20);
+                            out.push({href: h, owner, lines});
+                        }
+                        return out;
+                    }"""
                     for _ in range(10):
                         pg.evaluate(
                             "for (const el of "
@@ -2083,51 +2160,20 @@ def scrapear_posts_fb(cfg: dict):
                         pg.wait_for_timeout(1300)
                         n = pg.evaluate(
                             "document.querySelectorAll("
-                            "'a[href*=\"/posts/\"],a[href*=\"pfbid\"],"
-                            "a[href*=\"/permalink/\"]').length")
+                            "'a[href*=\"/posts/\"]"
+                            ",a[href*=\"pfbid\"]"
+                            ",a[href*=\"/photo/?fbid=\"]"
+                            ",a[href*=\"/reel/\"]"
+                            ").length")
+                        # FB virtualiza el DOM — los articles vienen y
+                        # van; acumular en cada paso o la ventana final
+                        # puede quedar VACÍA (10 scrolls → 0 posts)
+                        for post in pg.evaluate(_JS_EXTRACT):
+                            posts_dict.setdefault(post["href"], post)
                         if n == prev:
                             break
                         prev = n
-                    posts = pg.evaluate("""() => {
-                        // en perfiles personales role=article son
-                        // COMENTARIOS (href con comment_id) — el post
-                        // se agarra por su permalink puro
-                        const out = [], seen = new Set();
-                        for (const a of document.querySelectorAll(
-                                'a[href*="/posts/"],'
-                              + 'a[href*="story_fbid"],'
-                              + 'a[href*="/permalink/"],'
-                              + 'a[href*="pfbid"]')) {
-                            const h = a.href;
-                            if (h.includes('comment_id')) continue;
-                            if (seen.has(h)) continue; seen.add(h);
-                            let n = a, txt = '';
-                            for (let i = 0; i < 12 && n; i++) {
-                                n = n.parentElement; if (!n) break;
-                                const t = n.innerText || '';
-                                if (t.length > txt.length) txt = t;
-                                if (t.length > 300) break;
-                            }
-                            let owner = '';
-                            if (n) {
-                                for (const o of n.querySelectorAll(
-                                        'a[href*="facebook.com/"]')) {
-                                    const seg = new URL(o.href).pathname
-                                        .split('/').filter(Boolean);
-                                    if (seg.length === 1 &&
-                                        !/posts|photos|photo|reels|watch|groups|hashtag|permalink/
-                                        .test(seg[0])) {
-                                        owner = seg[0]; break;
-                                    }
-                                }
-                            }
-                            out.push({href: h, owner,
-                                lines: txt.split(String.fromCharCode(10))
-                                    .map(s => s.trim())
-                                    .filter(Boolean).slice(0, 20)});
-                        }
-                        return out;
-                    }""")
+                    posts = list(posts_dict.values())
                     for post in posts[:15]:
                         href = post["href"].split("?")[0].rstrip("/") \
                             if "/photo" in post["href"] \
@@ -2138,10 +2184,16 @@ def scrapear_posts_fb(cfg: dict):
                         if slug and post.get("owner") \
                                 and normalizar(post["owner"]) != slug:
                             continue   # post sugerido de otra página
+                        # lines[0] es el encabezado-autor del article
+                        # (nombre público de la página — no el caption)
                         titulo, cuerpo = _texto_post(
-                            post["lines"], fuente["nombre"])
+                            post["lines"][1:] or [], fuente["nombre"])
                         if len(titulo) < 25:
                             continue   # post sin texto útil
+                        clave_t = normalizar(titulo)[:80]
+                        if clave_t in textos_vistos:
+                            continue   # mismo post por otro permalink
+                        textos_vistos.add(clave_t)
                         links_vistos.add(post["href"])
                         links_vistos.add(href)
                         guardar_noticia({
@@ -3642,7 +3694,7 @@ def escribir_schedule_portadas(cfg: dict):
             f"width:16px;height:16px;margin-left:-8px;border-radius:50%;"
             f"background:{color}'></div>"
             f"<span style='position:absolute;left:{_pct(mm_pdf):.2f}%;"
-            f"top:228px;transform:translateX(-50%);font-size:.68rem;"
+            f"top:{228}px;transform:translateX(-50%);font-size:.68rem;"
             f"color:#666'>{mm_pdf//60:02d}:{mm_pdf%60:02d} PDF</span>")
     # pines: solo capturas logradas — eventos cercanos (≤10 min) se
     # agrupan en UN cluster: etiqueta compacta HH:MM ×N (los nombres en
@@ -3726,8 +3778,8 @@ def escribir_schedule_portadas(cfg: dict):
     dia_tl = _dir_dia()
     tardia_tl = ahora_m >= _hhmm(port, "hora_web", "05:45")
     listos = {m["nombre"] for m in medios
-              if _tiene_img_hoy(dia_tl / _slug_portada(m["nombre"])
-                                ) or (dia_tl / f"{_slug_portada(m['nombre'])}-web.png").exists()}
+              if _tiene_img_hoy(dia_tl / _slug_portada(m["nombre"]))
+              or (dia_tl / f"{_slug_portada(m['nombre'])}-web.png").exists()}
     pend = [m["nombre"] for m in medios
             if _en_ventana(m, port, ahora_m)
             and m["nombre"] not in listos]
@@ -4104,7 +4156,7 @@ def aplicar_accion_horarios(form: dict) -> str:
             nuevo["regla"] = r[:200]
         medios.append(nuevo)
 
-    CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+    _escribir_json(CONFIG, cfg)
     escribir_schedule_portadas(cfg)
     return f"Guardado ({borrados} borrados)"
 
@@ -4528,6 +4580,15 @@ fetch("/badge").then(r => r.json()).then(d => {{
 }}).catch(() => {{}});
 </script>
 </body></html>"""
+
+
+def _escribir_json(path: Path, data):
+    """Write atómico (tmp + replace) — el bug que 'borró' usuarios.json:
+    write_text() a medias tras un restart/corte dejaba el archivo
+    truncado y el lector devolvía default como si estuviera vacío."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    tmp.replace(path)
 
 
 def cargar_json(path: Path, default):
@@ -7553,7 +7614,7 @@ def aplicar_accion_fuentes(form: dict, email: str):
             del cfg["fuentes"][int(form.get("idx", ["-1"])[0])]
         except (ValueError, IndexError):
             pass
-    CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+    _escribir_json(CONFIG, cfg)
     # alta/cambio de fuente → ciclo inmediato para verla ya en el feed
     if not error:
         threading.Thread(target=ciclo_ahora, daemon=True).start()
