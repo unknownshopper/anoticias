@@ -40,7 +40,7 @@ import urllib.robotparser as robotparser
 
 import feedparser
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 socket.setdefaulttimeout(20)  # feedparser no trae timeout; evita que se cuelgue
 
