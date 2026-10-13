@@ -5016,7 +5016,13 @@ def _interes_listas() -> dict:
         except Exception:
             ext = {}
         def L(base, clave):
-            return list(base) + [str(t) for t in ext.get(clave, [])]
+            # 'quitar_<clave>' resta términos base — edición desde el
+            # panel /interes sin tocar código
+            q = {normalizar(t)
+                 for t in ext.get("quitar_" + clave, [])}
+            return [t for t in list(base)
+                    + [str(x) for x in ext.get(clave, [])]
+                    if normalizar(t) not in q]
         d = {
             "fuertes": L(INTERES_FUERTES, "fuertes"),
             "debiles_tema": L(INTERES_DEBILES_TEMA, "debiles_tema"),
@@ -5027,10 +5033,16 @@ def _interes_listas() -> dict:
         # siglas tabasqueñas inequívocas — \b obligatorio ('tet' como
         # substring colaría 'teta'); TET = Tribunal Electoral de Tabasco,
         # OSFE = órgano estatal de fiscalización
-        sig_f = [re.escape(t) for t in
-                 list(ext.get("siglas_fuertes", [])) or ["tet", "osfe"]]
-        sig_t = [re.escape(t) for t in
-                 list(ext.get("siglas_tema", [])) or ["tdj"]]
+        def S(clave, default):
+            q = {normalizar(t)
+                 for t in ext.get("quitar_" + clave, [])}
+            return [str(t) for t in (ext.get(clave) or default)
+                    if normalizar(t) not in q]
+        sig_f_raw = S("siglas_fuertes", ["tet", "osfe"])
+        sig_t_raw = S("siglas_tema", ["tdj"])
+        d["siglas_fuertes"], d["siglas_tema"] = sig_f_raw, sig_t_raw
+        sig_f = [re.escape(t) for t in sig_f_raw]
+        sig_t = [re.escape(t) for t in sig_t_raw]
         d["rx_fuertes"] = re.compile(r"\b(?:" + "|".join(
             re.escape(t) for t in d["fuertes"]) + r")\b")
         d["rx_siglas_f"] = re.compile(r"\b(?:" + "|".join(sig_f) + r")\b")
@@ -5624,11 +5636,54 @@ def vista_interes(email: str, pagina: int = 1) -> str:
                if pagina < total_paginas else "<span>Siguiente →</span>")
         nav = (f"<div class='paginacion'>{ant} "
                f"<span class='pag-info'>{info}</span> {sig}</div>")
+    # panel admin: catálogo editable de palabras de interés —
+    # colapsable; × quita (base→lista 'quitar_', extra→se borra) y el
+    # input agrega; efecto inmediato vía cache-mtime
+    panel = ""
+    if es_admin(email, cfg):
+        li = _interes_listas()
+        grupos = [("fuertes", "Fuertes — bastan solos"),
+                  ("siglas_fuertes", "Siglas fuertes"),
+                  ("debiles_actor", "Actores — prensa local"),
+                  ("debiles_tema", "Temas — requieren ancla Tabasco"),
+                  ("siglas_tema", "Siglas tema"),
+                  ("tabasco", "Ancla geográfica"),
+                  ("ajenos", "Otros estados — excluyen")]
+        bloques = ""
+        for clave, titulo in grupos:
+            chips_w = "".join(
+                f"<form method='post' action='/interes/palabras' "
+                f"style='display:inline'>"
+                f"<input type='hidden' name='lista' value='{clave}'>"
+                f"<input type='hidden' name='accion' value='quitar'>"
+                f"<button name='termino' "
+                f"value='{html.escape(t, quote=True)}' "
+                f"class='chip-fuente' style='cursor:pointer;margin:2px' "
+                f"title='quitar'>{html.escape(t)} ×</button></form>"
+                for t in li[clave])
+            bloques += (
+                f"<p class='meta' style='margin:.6rem 0 .2rem'>"
+                f"<b>{titulo}</b></p><div>{chips_w}"
+                f"<form method='post' action='/interes/palabras' "
+                f"style='display:inline;margin-left:.3rem'>"
+                f"<input type='hidden' name='lista' value='{clave}'>"
+                f"<input type='hidden' name='accion' value='agregar'>"
+                f"<input name='termino' placeholder='agregar…' "
+                f"style='font-size:.75rem;width:150px;padding:2px 6px'>"
+                f"<button style='font-size:.75rem'>＋</button>"
+                f"</form></div>")
+        panel = (
+            f"<details style='margin-bottom:1rem'>"
+            f"<summary class='btn-linea' style='display:inline-block;"
+            f"cursor:pointer'>Palabras de interés — administrar</summary>"
+            f"<div class='card' style='margin-top:.5rem'>{bloques}"
+            f"<p class='meta'>clic en una palabra la quita · los cambios "
+            f"aplican al instante</p></div></details>")
     return (f"<h1>Notas de interés</h1>"
             f"<p class='meta'>{info} notas · poder judicial y "
-            "actores del TSJ Tabasco</p>"
-            f"{nav}{cards}{nav}" if cards
-            else "<h1>Notas de interés</h1>"
+            "actores del TSJ Tabasco</p>" + panel
+            + f"{nav}{cards}{nav}" if cards
+            else "<h1>Notas de interés</h1>" + panel +
                  "<p>Aún no cae ninguna nota de la lista.</p>")
 
 
@@ -8287,6 +8342,39 @@ def servir_web(puerto: int):
                                     encoding="utf-8")
                 self.send_response(303)
                 self.send_header("Location", "/resumenes")
+                self.end_headers()
+                return
+
+            if ruta.path == "/interes/palabras":
+                email = self._usuario()
+                cfg_i = json.loads(CONFIG.read_text())
+                if email and es_admin(email, cfg_i):
+                    lista = form.get("lista", [""])[0]
+                    term = form.get("termino", [""])[0].strip()
+                    accion = form.get("accion", [""])[0]
+                    listas_ok = {"fuertes", "siglas_fuertes",
+                                 "debiles_tema", "siglas_tema",
+                                 "debiles_actor", "tabasco", "ajenos"}
+                    if lista in listas_ok and term:
+                        inter = cfg_i.setdefault("interes", {})
+                        extras = inter.setdefault(lista, [])
+                        quitar = inter.setdefault("quitar_" + lista, [])
+                        n_t = normalizar(term)
+                        if accion == "agregar":
+                            quitar[:] = [t for t in quitar
+                                         if normalizar(t) != n_t]
+                            if all(normalizar(t) != n_t
+                                   for t in extras):
+                                extras.append(term)
+                        elif accion == "quitar":
+                            if any(normalizar(t) == n_t for t in extras):
+                                extras[:] = [t for t in extras
+                                             if normalizar(t) != n_t]
+                            else:
+                                quitar.append(term)
+                        _escribir_json(CONFIG, cfg_i)
+                self.send_response(303)
+                self.send_header("Location", "/interes")
                 self.end_headers()
                 return
 
