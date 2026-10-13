@@ -5629,15 +5629,32 @@ def vista_interes(email: str, pagina: int = 1) -> str:
     # va al final; lo que toca otros términos de interés va primero
     ordenadas = sorted(noticias, key=lambda n: n["fecha"], reverse=True)
     ordenadas.sort(key=_solo_may)   # estable: fecha ya va desc
-    total = len(ordenadas)
+    # agrupar cobertura del mismo tema: 8 medios contando lo mismo
+    # colapsan a una tarjeta — 'encontró' dice los términos y 'N
+    # medios' el tamaño del cluster
+    grupos = []                     # [(toks, [notas])]
+    for n in ordenadas:
+        toks = _norm_titulo(n["titulo"])
+        for g in grupos:
+            if len(toks & g[0]) / max(len(toks | g[0]), 1) >= 0.5:
+                g[1].append(n)
+                break
+        else:
+            grupos.append([toks, [n]])
+    planos = []
+    for toks, ns in grupos:
+        extra = "encontró: " + ", ".join(_interes_match(ns[0]))
+        if len(ns) > 1:
+            extra += f" · {len(ns)} medios"
+        planos.append((ns[0], extra))
+    total = len(planos)
     por_pagina = 100
     total_paginas = max(1, (total + por_pagina - 1) // por_pagina)
     pagina = max(1, min(pagina, total_paginas))
     inicio = (pagina - 1) * por_pagina
     fin = min(inicio + por_pagina, total)
-    cards = "".join(tarjeta_noticia(
-        n, "encontró: " + ", ".join(_interes_match(n)))
-        for n in ordenadas[inicio:fin])
+    cards = "".join(tarjeta_noticia(n, extra)
+                    for n, extra in planos[inicio:fin])
     info = f"{inicio + 1}-{fin} de {total}" if total else "0"
     nav = ""
     if total_paginas > 1:
