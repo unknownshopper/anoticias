@@ -580,6 +580,19 @@ def generar_sintesis(cfg: dict, franja: str) -> str:
     sel = _sel_interes_extendida(desde)
     if not sel:
         return ""
+    # jerarquía institucional: Magistrado Presidente primero, luego
+    # Gobernador, luego lo demás del TSJT — numerar [N#] en ese orden
+    # guía al modelo a escribir en orden de relevancia
+    def _prio(n: dict) -> int:
+        t = normalizar(n["titulo"] + " " + (n.get("resumen") or ""))
+        if re.search(r"resendez|magistrad[oa]\s+presidente", t):
+            return 0
+        if re.search(r"javier may|gobernador", t):
+            return 1
+        if re.search(r"tsjt|poder judicial|tribunal superior", t):
+            return 2
+        return 3
+    sel.sort(key=_prio)
     lineas = "\n".join(
         f"- [N{i+1}|{n.get('categoria', '')}|{n['fuente']}] "
         f"{n['titulo']}"
@@ -609,6 +622,9 @@ def generar_sintesis(cfg: dict, franja: str) -> str:
         "- Cada bullet TERMINA con el identificador de la nota que lo "
         "sustenta: [N#]. Si un tema junta varias notas, usa la "
         "principal.\n"
+        "- PRIORIDAD de agenda: primero lo del Magistrado Presidente "
+        "del TSJT (Efraín Reséndez) y del Poder Judicial del Estado; "
+        "después el Gobernador (Javier May); luego el resto.\n"
         "- REGLA DURA: usa SOLO los hechos literales de las notas. "
         "PROHIBIDO inventar citas textuales, usuarios de redes "
         "(@alguien), cifras, nombres o hechos. No escribas 'no se "
