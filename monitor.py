@@ -4467,6 +4467,12 @@ PAGINA = """<!DOCTYPE html>
   .chip-fuente {{ display: inline-block; background: #1a237e; color: #fff;
       font-size: .66rem; font-weight: 700; text-transform: uppercase;
       letter-spacing: .06em; padding: .22rem .55rem; border-radius: 10px; }}
+  .ico-origen {{ display: inline-block; font-size: .56rem; font-weight: 700;
+      line-height: 1; padding: 2px 4px; border-radius: 3px; margin-left: 3px;
+      vertical-align: middle; }}
+  .ico-x {{ background: #000; color: #fff; }}
+  .ico-fb {{ background: #1877f2; color: #fff; }}
+  .ico-web {{ background: #eceff1; color: #78909c; }}
   .tabs-cat {{ display: flex; gap: .5rem; margin: .5rem 0 1rem;
       flex-wrap: wrap; }}
   .tab-cat {{ padding: .45rem .95rem; border-radius: 20px; font-size: .85rem;
@@ -4788,6 +4794,17 @@ def _autor_limpio(n: dict) -> str:
     return f" · {html.escape(au)}"
 
 
+def _ico_origen(n: dict) -> str:
+    """Mini-glyph del canal junto al badge del medio: 𝕏 / f / web."""
+    if (n.get("categoria") == "x"
+            or str(n.get("fuente", "")).startswith("@")):
+        return "<span class='ico-origen ico-x' title='X'>𝕏</span>"
+    if n.get("categoria") == "redes":
+        return "<span class='ico-origen ico-fb' title='Facebook'>f</span>"
+    return ("<span class='ico-origen ico-web' title='Web / RSS'>"
+            "web</span>")
+
+
 def tarjeta_alerta(a: dict, colores: dict) -> str:
     """Tarjeta completa = link; badge de regla con su color; borde del mismo."""
     autor = _autor_limpio(a)
@@ -4799,7 +4816,7 @@ def tarjeta_alerta(a: dict, colores: dict) -> str:
         + (f"<img class='thumb' src='{html.escape(url_https(a['imagen']))}' loading='lazy' "
            f"onerror='this.remove()'>" if a.get("imagen") else "")
         + f"<div class='meta2'><span class='chip-fuente'>"
-        f"{html.escape(a['fuente'])}</span>"
+        f"{html.escape(a['fuente'])}</span>{_ico_origen(a)}"
         f"<span class='meta'>{fmt_fecha(a['fecha'])}{autor}</span></div>"
         f"{badge_regla(a['reglas'], colores)} "
         f"<span class='titulo'>{html.escape(a['titulo'])}</span>"
@@ -4900,7 +4917,7 @@ def tarjeta_destacada(rep: dict, cluster: list) -> str:
     fuentes = sorted({n["fuente"] for n in cluster})
     variantes = "".join(
         f"<a class='variante meta' href='/nota?u={quote(n['link'], safe='')}'>"
-        f"<span class='chip-fuente'>{html.escape(n['fuente'])}</span> "
+        f"<span class='chip-fuente'>{html.escape(n['fuente'])}</span>{_ico_origen(n)} "
         f"{fmt_fecha(n['fecha'])} · {html.escape(n['titulo'][:110])}</a>"
         for n in sorted(cluster, key=lambda n: n["fecha"], reverse=True)
     )
@@ -4932,7 +4949,7 @@ def tarjeta_noticia(n: dict, extra: str = "") -> str:
         f">"+ (f"<img class='thumb' src='{html.escape(url_https(img))}' loading='lazy' "
            f"onerror='this.remove()'>" if img else "")
         + f"<div class='meta2'><span class='chip-fuente'>"
-        f"{html.escape(n['fuente'])}</span>"
+        f"{html.escape(n['fuente'])}</span>{_ico_origen(n)}"
         f"<span class='meta'>{fmt_fecha(n['fecha'])}{autor}</span></div>"
         f"<span class='titulo'>{html.escape(n['titulo'])}</span>"
         + (f"<p style='font-size:.68rem;color:#2e7d32;margin:.2rem 0 0'>"
@@ -5297,7 +5314,7 @@ def tarjeta_grupo_alerta(regla: str, items: list, colores: dict,
 
     def variante(n):
         return (f"<a class='variante meta' href='/nota?u={quote(n['link'], safe='')}'>"
-                f"<span class='chip-fuente'>{html.escape(n['fuente'])}</span> "
+                f"<span class='chip-fuente'>{html.escape(n['fuente'])}</span>{_ico_origen(n)} "
                 f"{fmt_fecha(n['fecha'])} · {html.escape(n['titulo'][:95])}</a>")
 
     hits_html = "".join(variante(a) for a in
