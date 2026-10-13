@@ -6334,10 +6334,10 @@ def vista_buscar(q: str, email: str) -> str:
             f"{trending}"
             f"<p class='meta'>{len(hits_n)} notas · {len(hits_a)} alertas"
             f" · frase exacta: \"entre comillas\"</p>"
-            + "".join(tarjeta_alerta(a, colores) for a in
-                      sorted(hits_a, key=lambda a: a["fecha"], reverse=True))
-            + "".join(tarjeta_noticia(n) for n in
-                      sorted(hits_n, key=lambda n: n["fecha"], reverse=True))
+            + "".join(card for _, card in sorted(
+                [(a["fecha"], tarjeta_alerta(a, colores)) for a in hits_a]
+                + [(n["fecha"], tarjeta_noticia(n)) for n in hits_n],
+                key=lambda x: x[0], reverse=True))
             + (f"<h2>En el archivo de los medios ({len(vivos)})</h2>"
                + vivo_html if vivos else ""))
 
