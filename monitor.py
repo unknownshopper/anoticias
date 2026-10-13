@@ -5034,9 +5034,12 @@ def _interes_listas() -> dict:
         # substring colaría 'teta'); TET = Tribunal Electoral de Tabasco,
         # OSFE = órgano estatal de fiscalización
         def S(clave, default):
+            # defaults + extras mezclados — antes ext.get() or default
+            # y al agregar una sigla desaparecían tet/osfe
             q = {normalizar(t)
                  for t in ext.get("quitar_" + clave, [])}
-            return [str(t) for t in (ext.get(clave) or default)
+            return [str(t) for t in list(default)
+                    + [str(x) for x in ext.get(clave, [])]
                     if normalizar(t) not in q]
         sig_f_raw = S("siglas_fuertes", ["tet", "osfe"])
         sig_t_raw = S("siglas_tema", ["tdj"])
