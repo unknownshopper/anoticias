@@ -5622,16 +5622,9 @@ def vista_interes(email: str, pagina: int = 1) -> str:
                 and coincide_interes(n)]
     _MAY = {"javier may", "gobernador", "javier may rodriguez",
             "may rodriguez"}
-    def _solo_may(n: dict) -> int:
-        m = set(_interes_match(n))
-        return 1 if m and m <= _MAY else 0
-    # May está en todas las notas del gobernador — si solo matchea él
-    # va al final; lo que toca otros términos de interés va primero
     ordenadas = sorted(noticias, key=lambda n: n["fecha"], reverse=True)
-    ordenadas.sort(key=_solo_may)   # estable: fecha ya va desc
     # agrupar cobertura del mismo tema: 8 medios contando lo mismo
-    # colapsan a una tarjeta — 'encontró' dice los términos y 'N
-    # medios' el tamaño del cluster
+    # colapsan a una tarjeta con <details> expandible
     grupos = []                     # [(toks, [notas])]
     for n in ordenadas:
         toks = _norm_titulo(n["titulo"])
@@ -5641,20 +5634,40 @@ def vista_interes(email: str, pagina: int = 1) -> str:
                 break
         else:
             grupos.append([toks, [n]])
+    def _es_may(g) -> bool:
+        m = set(_interes_match(g[1][0]))
+        return bool(m) and m <= _MAY
+    temas = [g for g in grupos if not _es_may(g)]
+    may_g = [g for g in grupos if _es_may(g)]
+    # relevancia: temas de interés primero, May intercalado 2:1 —
+    # sale desde la primera página pero no tapa los otros temas
+    pares = [temas[i:i + 2] for i in range(0, len(temas), 2)]
+    mezcla = []
+    for i, par in enumerate(pares):
+        mezcla += par
+        if i < len(may_g):
+            mezcla.append(may_g[i])
+    mezcla += may_g[len(pares):]
     planos = []
-    for toks, ns in grupos:
+    for toks, ns in mezcla:
         extra = "encontró: " + ", ".join(_interes_match(ns[0]))
         if len(ns) > 1:
             extra += f" · {len(ns)} medios"
-        planos.append((ns[0], extra))
+        card = tarjeta_noticia(ns[0], extra)
+        if len(ns) > 1:
+            sub = "".join(tarjeta_noticia(x) for x in ns[1:])
+            card += (f"<details style='margin-top:-4px'>"
+                     f"<summary class='meta' style='cursor:pointer'>"
+                     f"▸ {len(ns) - 1} medios más cubrieron esto"
+                     f"</summary>{sub}</details>")
+        planos.append(card)
     total = len(planos)
     por_pagina = 100
     total_paginas = max(1, (total + por_pagina - 1) // por_pagina)
     pagina = max(1, min(pagina, total_paginas))
     inicio = (pagina - 1) * por_pagina
     fin = min(inicio + por_pagina, total)
-    cards = "".join(tarjeta_noticia(n, extra)
-                    for n, extra in planos[inicio:fin])
+    cards = "".join(planos[inicio:fin])
     info = f"{inicio + 1}-{fin} de {total}" if total else "0"
     nav = ""
     if total_paginas > 1:
