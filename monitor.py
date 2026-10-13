@@ -337,11 +337,20 @@ def enviar_correo(cfg: dict, alerta: dict):
         )
         msg = MIMEText(cuerpo, "plain", "utf-8")
         msg["Subject"] = f"[Monitor] {alerta['reglas']}: {alerta['titulo'][:80]}"
-        msg["From"] = correo["usuario"]
+        msg["From"] = correo.get("remitente", correo["usuario"])
         msg["To"] = destinatario
-        with smtplib.SMTP_SSL(correo["smtp_host"], correo.get("smtp_port", 465), timeout=20) as s:
-            s.login(correo["usuario"], correo["password"])
-            s.send_message(msg)
+        puerto = correo.get("smtp_port", 465)
+        if puerto == 587:   # STARTTLS (Brevo)
+            with smtplib.SMTP(correo["smtp_host"], puerto,
+                              timeout=20) as s:
+                s.starttls()
+                s.login(correo["usuario"], correo["password"])
+                s.send_message(msg)
+        else:               # SSL (Gmail 465)
+            with smtplib.SMTP_SSL(correo["smtp_host"], puerto,
+                                  timeout=20) as s:
+                s.login(correo["usuario"], correo["password"])
+                s.send_message(msg)
         print("    ✉ correo enviado")
     except Exception as e:
         print(f"    [!] correo falló: {e}")
