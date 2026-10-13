@@ -5412,6 +5412,32 @@ def vista_alertas(email: str, msg: str = "") -> str:
     for a in alertas:
         # 'Noticia en desarrollo (0→5 medios)' -> agrupa por 'Noticia en desarrollo'
         grupos.setdefault(a["reglas"].split(" (")[0], []).append(a)
+    vis = fuentes_visibles(perfil, cfg)
+    noticias = [n for n in leer_jsonl(NOTICIAS) if n["fuente"] in vis or n.get("via") in vis]
+    # coincidencias retroactivas: notas del archivo que cumplen la regla
+    # pero nunca dispararon (publicadas antes de crearla, o resumen
+    # que llegó después) — la tarjeta muestra la cobertura real
+    regs = []
+    for r in reglas:
+        pals = [[normalizar(v) for v in p.split("/")]
+                for p in r.get("requiere_todas", [])]
+        if pals:
+            regs.append((r["nombre"], pals,
+                         len(pals) if len(pals) <= 2 else len(pals) - 1))
+    if regs:
+        links_g = {nombre: {a["link"] for a in grupos.get(nombre, [])}
+                   for nombre, _, _ in regs}
+        for n in noticias:
+            t = normalizar(f"{n['titulo']} {n.get('resumen','')} "
+                           f"{n.get('autor','')}")
+            for nombre, pals, min_h in regs:
+                if (n["link"] not in links_g[nombre]
+                        and sum(1 for p in pals
+                                if any(v in t for v in p)) >= min_h):
+                    a = dict(n)
+                    a["reglas"] = nombre
+                    grupos.setdefault(nombre, []).append(a)
+                    links_g[nombre].add(n["link"])
     ordenadas = sorted(
         grupos.items(),
         key=lambda kv: max(a["fecha"] for a in kv[1]),
@@ -5419,8 +5445,6 @@ def vista_alertas(email: str, msg: str = "") -> str:
     )
     boton = ("<p><a href='/config'><button class='btn-linea'>"
              "Personalizar alertas</button></a></p>")
-    vis = fuentes_visibles(perfil, cfg)
-    noticias = [n for n in leer_jsonl(NOTICIAS) if n["fuente"] in vis or n.get("via") in vis]
     cards = "".join(
         tarjeta_grupo_alerta(regla, items, colores,
                              cobertura_relacionada(items, noticias))
