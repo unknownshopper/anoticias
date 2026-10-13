@@ -2151,6 +2151,25 @@ def scrapear_posts_fb(cfg: dict):
                         }
                         return out;
                     }"""
+                    # click a 'Ver más' solo en fuentes con expandir —
+                    # texto completo de los posts largos sin multiplicar
+                    # la interacción con FB en todas las páginas
+                    _JS_VERMAS = """() => {
+                        let n = 0;
+                        for (const art of document.querySelectorAll(
+                                'div[role="article"]'))
+                            for (const b of art.querySelectorAll(
+                                    'div[role="button"],a[role="link"]')) {
+                                const t = (b.textContent||'').trim();
+                                if ((t === 'See more' || t === 'Ver más'
+                                        || t === 'Ver mas')
+                                        && b.offsetParent) {
+                                    try { b.click(); n++; } catch(e) {}
+                                }
+                            }
+                        return n;
+                    }"""
+                    expandir = bool(fuente.get("expandir"))
                     for _ in range(10):
                         pg.evaluate(
                             "for (const el of "
@@ -2158,6 +2177,12 @@ def scrapear_posts_fb(cfg: dict):
                             "if (el.scrollHeight > el.clientHeight+50) "
                             "el.scrollTop += 2200;")
                         pg.wait_for_timeout(1300)
+                        if expandir:
+                            try:
+                                pg.evaluate(_JS_VERMAS)
+                                pg.wait_for_timeout(700)
+                            except Exception:
+                                pass
                         try:
                             n = pg.evaluate(
                                 "document.querySelectorAll("
