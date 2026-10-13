@@ -5388,12 +5388,14 @@ def trending_chips(noticias: list) -> str:
         for tema, _ in top)
 
 
-def vista_noticias(email: str, pagina: int = 1) -> str:
+def vista_noticias(email: str, pagina: int = 1, dia: str = "") -> str:
     cfg = json.loads(CONFIG.read_text())
     vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
     noticias = [n for n in leer_jsonl(NOTICIAS, limite=0)
                 if (n["fuente"] in vis or n.get("via") in vis)
-                and n.get("categoria") not in ("columnas", "x")]
+                and (dia or n.get("categoria")
+                     not in ("columnas", "x"))
+                and (not dia or n["fecha"].startswith(dia))]
     ordenadas = sorted(noticias, key=lambda n: n["fecha"], reverse=True)
     chips = trending_chips(noticias)
     trending = f"<div class='trending'>{chips}</div>" if chips else ""
@@ -5408,16 +5410,19 @@ def vista_noticias(email: str, pagina: int = 1) -> str:
     info = f"{inicio + 1}-{fin} de {total}"
     nav = ""
     if total_paginas > 1:
-        ant = (f"<a href='/noticias?p={pagina - 1}'>← Anterior</a>"
+        dia_q = f"&dia={dia}" if dia else ""
+        ant = (f"<a href='/noticias?p={pagina - 1}{dia_q}'>← Anterior</a>"
                if pagina > 1 else "<span>← Anterior</span>")
-        sig = (f"<a href='/noticias?p={pagina + 1}'>Siguiente →</a>"
+        sig = (f"<a href='/noticias?p={pagina + 1}{dia_q}'>Siguiente →</a>"
                if pagina < total_paginas else "<span>Siguiente →</span>")
         nav = (f"<div class='paginacion'>{ant} "
                f"<span class='pag-info'>{info}</span> {sig}</div>")
-    return (f"<h1>Últimas noticias</h1>"
+    tit = (f"Noticias del {dia}"
+           if dia else "Últimas noticias")
+    return (f"<h1>{tit}</h1>"
             f"<p class='meta'>{info} notas</p>"
             f"{trending}{nav}{cards}{nav}" if cards
-            else "<h1>Últimas noticias</h1><p>Sin noticias todavía.</p>")
+            else f"<h1>{tit}</h1><p>Sin noticias todavía.</p>")
 
 
 def vista_x(email: str) -> str:
@@ -7149,15 +7154,32 @@ def vista_stats() -> str:
     por_fuente = Counter(n["fuente"] for n in noticias)
     por_dia = Counter(n["fecha"][:10] for n in noticias)
 
+    # link directo al medio: @cuenta → su X, medio configurado → su sitio
+    cfg = json.loads(CONFIG.read_text())
+    url_medio = {f["nombre"]: f["url"] for f in cfg.get("fuentes", [])
+                 if not f["url"].startswith(("https://x.com/",
+                                             "https://nitter"))}
+
+    def celda_medio(fuente: str) -> str:
+        nombre = html.escape(fuente)
+        if fuente.startswith("@"):
+            return (f'<a href="https://x.com/{fuente[1:]}" '
+                    f'target="_blank">{nombre}</a>')
+        if fuente in url_medio:
+            return (f'<a href="{html.escape(url_medio[fuente])}" '
+                    f'target="_blank">{nombre}</a>')
+        return nombre
+
     filas_fuente = "".join(
-        f"<tr><td>{html.escape(fuente)}</td><td>{total}</td>"
+        f"<tr><td>{celda_medio(fuente)}</td><td>{total}</td>"
         f"<td>{estado.get(fuente, {}).get('ok', 0)}</td>"
         f"<td>{estado.get(fuente, {}).get('err', 0)}</td>"
         f"<td>{fmt_fecha(estado.get(fuente, {}).get('ultimo_ok', '') or '-')}</td></tr>"
         for fuente, total in por_fuente.most_common()
     )
     filas_dia = "".join(
-        f"<tr><td>{dia}</td><td>{total}</td></tr>"
+        f"<tr><td><a href='/noticias?dia={dia}'>{dia}</a></td>"
+        f"<td>{total}</td></tr>"
         for dia, total in sorted(por_dia.items(), reverse=True)
     )
 
@@ -7915,8 +7937,12 @@ def servir_web(puerto: int):
                     p = int(params.get("p", ["1"])[0])
                 except (ValueError, IndexError):
                     p = 1
-                self._html(render_pagina(vista_noticias(email, p), base=base,
-                                         usuario=email))
+                dia = params.get("dia", [""])[0]
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", dia):
+                    dia = ""
+                self._html(render_pagina(
+                    vista_noticias(email, p, dia), base=base,
+                    usuario=email))
             elif ruta.path == "/x":
                 self._html(render_pagina(vista_x(email), base=base,
                                          usuario=email))
