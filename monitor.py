@@ -5620,7 +5620,15 @@ def vista_interes(email: str, pagina: int = 1) -> str:
     noticias = [n for n in leer_jsonl(NOTICIAS, limite=0)
                 if (n["fuente"] in vis or n.get("via") in vis)
                 and coincide_interes(n)]
+    _MAY = {"javier may", "gobernador", "javier may rodriguez",
+            "may rodriguez"}
+    def _solo_may(n: dict) -> int:
+        m = set(_interes_match(n))
+        return 1 if m and m <= _MAY else 0
+    # May está en todas las notas del gobernador — si solo matchea él
+    # va al final; lo que toca otros términos de interés va primero
     ordenadas = sorted(noticias, key=lambda n: n["fecha"], reverse=True)
+    ordenadas.sort(key=_solo_may)   # estable: fecha ya va desc
     total = len(ordenadas)
     por_pagina = 100
     total_paginas = max(1, (total + por_pagina - 1) // por_pagina)
