@@ -967,6 +967,14 @@ def _scrapear_x_posts(handle: str) -> list:
                 const out = [], seen = new Set();
                 for (const t of document.querySelectorAll(
                         'article[data-testid="tweet"]')) {
+                    // ad promocionado: entra al feed sin seguir la
+                    // cuenta — placementTracking o etiqueta Ad/Publicidad
+                    if (t.querySelector(
+                            '[data-testid="placementTracking"]')
+                        || Array.from(t.querySelectorAll('span'))
+                            .some(s => ['Ad','Publicidad']
+                                .includes((s.textContent||'').trim())))
+                        continue;
                     const a = t.querySelector('a[href*="/status/"]');
                     const link = a ? a.href.split('?')[0] : '';
                     if (!link || seen.has(link)) continue;
