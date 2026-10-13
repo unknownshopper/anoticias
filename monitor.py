@@ -664,6 +664,11 @@ def _sel_interes_extendida(desde: datetime) -> list:
                 if n.get("categoria") in ("redes", "x")
                 and n["link"] in alertados
                 and n["link"] not in en_sel
+                # ancla local — 'noticia en desarrollo' nacional
+                # (Macron/Francia) no sirve al reporte del TSJT
+                and ("tabasco" in normalizar(
+                    n["titulo"] + " " + (n.get("resumen") or ""))
+                    or coincide_interes(n))
                 and n.get("fecha", "") >= desde.isoformat()][:4]
     return sel
 
