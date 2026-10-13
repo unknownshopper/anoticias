@@ -4058,6 +4058,36 @@ def marcar_limpia_portadas():
     _guardar_portadas(est)
 
 
+def checar_ip_correo():
+    """Una vez al día: IP pública saliente vs la autorizada en Brevo
+    (correo.ip_autorizada). Si cambió, evento rojo en la timeline de
+    /portadas — se ve ahí antes de que falle el envío de las 06:45
+    (error 525 'Unauthorized IP')."""
+    try:
+        est = cargar_json(ESTADO_PORTADAS, {})
+        hoy = datetime.now().strftime("%Y-%m-%d")
+        if est.get("ip_fecha") == hoy:
+            return
+        esperada = (json.loads(CONFIG.read_text())
+                    .get("correo", {}).get("ip_autorizada", ""))
+        if not esperada:
+            return
+        ip = requests.get("https://api.ipify.org",
+                          timeout=10).text.strip()
+        est["ip_vista"], est["ip_fecha"] = ip, hoy
+        if ip != esperada and est.get("ip_avisada") != ip:
+            est["ip_avisada"] = ip
+            est.setdefault("eventos", []).append(
+                {"d": hoy, "t": datetime.now().strftime("%H:%M"),
+                 "m": f"IP pública cambió → {ip} (Brevo autoriza "
+                      f"{esperada}) — re-autorizar o el correo falla",
+                 "ok": False})
+            print(f"[correo] IP pública cambió: {ip} ≠ {esperada}")
+        _guardar_portadas(est)
+    except Exception as e:
+        print(f"[correo] check IP falló: {e}")
+
+
 def vista_portadas(sec: str, dia: str = "") -> str:
     """Tab Portadas: grid de las capturas por sección; ?dia=oct/06
     navega subcarpetas para cotejar un día contra otro."""
@@ -8698,6 +8728,7 @@ def main():
             if toca_limpia_portadas(cfg):
                 limpiar_portadas()
                 marcar_limpia_portadas()
+            checar_ip_correo()   # 1×/día: avisa si la IP de Brevo cambió
             for franja in ("matutina", "vespertina", "nocturna"):
                 if toca_sintesis(franja):
                     threading.Thread(target=generar_sintesis,
