@@ -2028,9 +2028,12 @@ def _bajar_portada_fb(m: dict) -> list:
                 cand.append((post["href"], post["txt"]))
                 por_texto = True
                 continue
-            # fb_primero: la página sube la portada como PRIMER post con
-            # foto de la madrugada, sin texto identificable (XEVT)
-            if m.get("fb_primero") and not cand and reciente:
+            # fb_primero: la página sube la portada como primer post con
+            # foto de la madrugada sin texto identificable (XEVT) —
+            # hasta 3 frescos: si el último es un flyer la plana queda
+            # abajo y el filtro de formato decide cuál sirve
+            if m.get("fb_primero") and not por_texto \
+                    and len(cand) < 3 and reciente:
                 cand.append((post["href"], post["txt"]))
     except Exception:
         return []
@@ -3501,6 +3504,14 @@ def generar_pdfs_portadas(cfg: dict, marca: str = "pdf_fecha"):
             pdf = dia / f"portadas_{sec}_{hoy}.pdf"
             portada = _pagina_portada_pdf(sec, len(imgs))
             imgs = [portada] + imgs
+            # ancho uniforme: kiosko/shots/fb varían (800-2550px) y el
+            # PDF quedaba con páginas de tamaños distintos — la mediana
+            # del día minimiza reescalado (la mayoría ya va en su tamaño)
+            from statistics import median
+            W = int(median(im.width for im in imgs))
+            imgs = [im.resize((W, round(im.height * W / im.width)),
+                              Image.LANCZOS) if im.width != W else im
+                    for im in imgs]
             imgs[0].save(
                 pdf, save_all=True, append_images=imgs[1:],
                 title=f"Portadas {sec.capitalize()} — "
