@@ -1041,7 +1041,7 @@ def _scrapear_x_posts(handle: str) -> list:
                "_autor": "@" + p_["autor"] if p_.get("autor")
                          else ""}
         if p_.get("img"):
-            ent["media_content"] = [{"url": p_["img"]}]
+            ent["media_content"] = [{"url": html.unescape(p_["img"])}]
         out.append(ent)
     return out
 
@@ -4813,7 +4813,7 @@ def tarjeta_alerta(a: dict, colores: dict) -> str:
         f"<a class='card {html.escape(a.get('categoria', 'prensa'))}' "
         f"style='border-left-color:{color}' "
         f"href='/nota?u={quote(a['link'], safe='')}'>"
-        + (f"<img class='thumb' src='{html.escape(url_https(a['imagen']))}' loading='lazy' "
+        + (f"<img class='thumb' src='{html.escape(url_https(html.unescape(a['imagen'])))}' loading='lazy' "
            f"onerror='this.remove()'>" if a.get("imagen") else "")
         + f"<div class='meta2'><span class='chip-fuente'>"
         f"{html.escape(a['fuente'])}</span>{_ico_origen(a)}"
@@ -4944,6 +4944,7 @@ def tarjeta_noticia(n: dict, extra: str = "") -> str:
     # avatar de X (og:image = perfil) no es media del post — fuera
     if "profile_images" in img:
         img = ""
+    img = html.unescape(img)   # '&amp;' literal guardado en jsonl
     return (
         f"<a class='card nota' href='/nota?u={quote(n['link'], safe='')}'"
         f">"+ (f"<img class='thumb' src='{html.escape(url_https(img))}' loading='lazy' "
@@ -6501,6 +6502,12 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
              or _meta(r.text, "twitter:creator")
              or "")
     autor = re.sub(r"^(por|by)\s+", "", autor, flags=re.I).strip()
+    # x.com/fb no entregan og:image (login-wall) — usar la imagen que
+    # el scraper sí capturó con el post; unescape: las URLs quedaron
+    # guardadas con '&amp;' literal (innerHTML)
+    imagen = imagen or html.unescape(
+        nota_guardada.get("imagen", ""))
+    meta["imagen"] = imagen
     datos = f"Fuente: {html.escape(nota_guardada.get('fuente') or dominio)}"
     if autor:
         datos += f" · Por {html.escape(autor)}"
