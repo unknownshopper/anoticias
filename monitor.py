@@ -248,8 +248,14 @@ def iso_fecha(entrada) -> str:
     pp = entrada.get("published_parsed") or entrada.get("updated_parsed")
     if pp:
         try:
-            ts = min(calendar.timegm(pp), time.time())
-            return datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+            ts = calendar.timegm(pp)
+            # archivo republicado (SDP/Reforma re-publican notas de
+            # 2009): >30 días atrás ensucia 'Por día' y el feed — vale
+            # la fecha en que la capturamos, no la original
+            if ts > time.time() or ts < time.time() - 30 * 86400:
+                ts = time.time()
+            return datetime.fromtimestamp(ts).isoformat(
+                timespec="seconds")
         except Exception:
             pass
     return datetime.now().isoformat(timespec="seconds")
