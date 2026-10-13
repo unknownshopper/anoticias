@@ -1005,6 +1005,8 @@ def _scrapear_x_posts(handle: str) -> list:
         return []
     out = []
     for p_ in posts:
+        if (p_.get("link") or "").endswith("/analytics"):
+            continue   # ad promocionado — CTA 'view analytics'
         txt = " ".join((p_.get("txt") or "").split())
         try:
             pp = datetime.fromisoformat(
