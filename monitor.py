@@ -3568,7 +3568,7 @@ def enviar_portadas(cfg: dict, pdfs: dict, fallos: list):
     hoy = datetime.now().strftime("%d/%m/%Y")
     msg = MIMEMultipart()
     msg["Subject"] = f"[Monitor] Portadas {hoy}"
-    msg["From"] = correo["usuario"]
+    msg["From"] = correo.get("remitente", correo["usuario"])
     msg["To"] = dest
     cuerpo = (f"Primeras planas del {hoy}.\n\n"
               + (f"No respondieron: {', '.join(fallos)}." if fallos else ""))
