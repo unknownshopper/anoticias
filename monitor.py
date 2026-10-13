@@ -1087,9 +1087,18 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
     agent = cfg.get(
         "user_agent",
         "OlmecaCode-Monitor/1.0 (+mailto:the@unknownshoppers.com)")
+    # X con ritmo propio: ~6 handles × Playwright cada 15 min era
+    # mucho desgaste de sesión/CPU — pasa cada 30 min; el resto del
+    # ciclo (RSS) sigue a los 15
+    global _ULT_X
+    correr_x = now - _ULT_X >= 30 * 60
+    if correr_x:
+        _ULT_X = now
     for i, fuente in enumerate(cfg["fuentes"]):
         if fuente.get("tipo") == "fb":
             continue   # la raspa chucky cada 4h — sin feed que pedir
+        if fuente.get("tipo") == "x" and not correr_x:
+            continue
         st = estado.setdefault(fuente["nombre"], {"ok": 0, "err": 0, "ultimo_ok": ""})
         # respetar robots.txt; cachear 24h
         if "crawl_delay" not in st or now - st.get("robots_checked", 0) > 86400:
@@ -1652,6 +1661,7 @@ FB_SESSION_REDES = BASE / "fb_session_redes.json"  # chucky — posts
 X_SESSION = BASE / "x_session.json"              # X — timeline
 X_POSTS = BASE / "x_posts.jsonl"               # log de publicados
 _ULT_FB_POSTS = 0.0        # epoch de la última pasada de chucky
+_ULT_X = 0.0               # epoch de la última pasada de fuentes tipo x
 _FB_POSTS_CORRIENDO = False
 
 
@@ -5012,9 +5022,10 @@ def _interes_listas() -> dict:
         m = 0.0
     if _INTERES_RX["m"] != m:
         try:
-            ext = json.loads(CONFIG.read_text()).get("interes", {})
+            _cfg = json.loads(CONFIG.read_text())
+            ext = _cfg.get("interes", {})
         except Exception:
-            ext = {}
+            _cfg, ext = {}, {}
         def L(base, clave):
             # 'quitar_<clave>' resta términos base — edición desde el
             # panel /interes sin tocar código
@@ -5046,6 +5057,15 @@ def _interes_listas() -> dict:
         d["siglas_fuertes"], d["siglas_tema"] = sig_f_raw, sig_t_raw
         sig_f = [re.escape(t) for t in sig_f_raw]
         sig_t = [re.escape(t) for t in sig_t_raw]
+        # handles X configurados = voces locales (XEVT, TabascoHOY,
+        # columnistas) — sus posts cuentan como prensa local para el
+        # ancla de los términos débiles; x:home es el radar, no
+        d["x_locales"] = {
+            _handle_x(f.get("url", "")).lower()
+            for f in _cfg.get("fuentes", [])
+            if f.get("tipo") == "x"
+            and not str(f.get("url", "")).lower().startswith(
+                "x:home")} - {""}
         d["rx_fuertes"] = re.compile(r"\b(?:" + "|".join(
             re.escape(t) for t in d["fuertes"]) + r")\b")
         d["rx_siglas_f"] = re.compile(r"\b(?:" + "|".join(sig_f) + r")\b")
@@ -5118,6 +5138,11 @@ def _interes_match(nota: dict) -> list:
     # menciona Tabasco/TSJ o un nombre de la lista, no por su tribunal
     li = _interes_listas()
     local = nota.get("categoria") in ("prensa", "oficial")
+    fnt = str(nota.get("fuente") or "")
+    if not local and fnt.startswith("@"):
+        # post de un handle X configurado = prensa local — su propio
+        # timeline es el ancla Tabasco
+        local = fnt[1:].lower() in li.get("x_locales", ())
     hay_tab = any(c in texto_ctx for c in li["tabasco"])
     hits = li["rx_fuertes"].findall(texto)
     hits += li["rx_siglas_f"].findall(texto)
@@ -5139,7 +5164,7 @@ def _interes_match(nota: dict) -> list:
         return ["tsj"]
     hits = [t for t in li["debiles_tema"] if t in texto]
     hits += li["rx_siglas_t"].findall(texto)
-    if hits and hay_tab:
+    if hits and (hay_tab or local):
         return hits
     hits = [t for t in li["debiles_actor"] if t in texto]
     if hits and (hay_tab or local):
