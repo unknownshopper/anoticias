@@ -5622,8 +5622,10 @@ def _chip_nota(n: dict) -> tuple:
              f" style='font-size:.6rem;padding:1px 6px;"
              f"margin-right:.35rem'>{fnt}</span>")
     link = (f" <a href='/nota?u={quote(n['u'], safe='')}' title='{t}'"
-            f" style='font-size:.72rem;color:#1a237e;text-decoration:"
-            f"none;white-space:nowrap'>nota&nbsp;→</a>")
+            f" style='font-size:.7rem;font-weight:600;color:#b03a2e;"
+            f"background:#fdecea;border:1px solid #f0b8b3;"
+            f"border-radius:10px;padding:1px 8px;text-decoration:none;"
+            f"white-space:nowrap'>nota&nbsp;→</a>")
     return badge, link
 
 
