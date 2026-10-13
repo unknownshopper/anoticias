@@ -7490,13 +7490,21 @@ def icono_png() -> bytes:
 
 
 MANIFEST = json.dumps({
+    "id": "/",
     "name": "@noticias",
     "short_name": "@noticias",
+    "description": "Monitor de prensa: noticias, alertas y portadas",
+    "lang": "es-MX",
     "start_url": "/",
+    "scope": "/",
     "display": "standalone",
+    "display_override": ["standalone"],
     "background_color": "#f6f7f9",
     "theme_color": "#1a237e",
+    "prefer_related_applications": False,
     "icons": [
+        {"src": "/icon3.png", "sizes": "192x192", "type": "image/png",
+         "purpose": "any"},
         {"src": "/icon3.png", "sizes": "512x512", "type": "image/png",
          "purpose": "any"},
         {"src": "/icon3.png", "sizes": "512x512", "type": "image/png",
