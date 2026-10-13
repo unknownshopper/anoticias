@@ -3579,10 +3579,18 @@ def enviar_portadas(cfg: dict, pdfs: dict, fallos: list):
                          filename=pdf.name)
         msg.attach(parte)
     try:
-        with smtplib.SMTP_SSL(correo["smtp_host"],
-                              correo.get("smtp_port", 465), timeout=30) as s:
-            s.login(correo["usuario"], correo["password"])
-            s.send_message(msg)
+        puerto = correo.get("smtp_port", 465)
+        if puerto == 587:   # STARTTLS (Brevo, etc.)
+            with smtplib.SMTP(correo["smtp_host"], puerto,
+                              timeout=30) as s:
+                s.starttls()
+                s.login(correo["usuario"], correo["password"])
+                s.send_message(msg)
+        else:               # SSL directo (Gmail 465)
+            with smtplib.SMTP_SSL(correo["smtp_host"], puerto,
+                                  timeout=30) as s:
+                s.login(correo["usuario"], correo["password"])
+                s.send_message(msg)
     except Exception as e:
         print(f"[portadas] correo falló: {e}")
 
