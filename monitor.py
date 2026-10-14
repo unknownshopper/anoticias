@@ -4194,12 +4194,16 @@ def vista_portadas(sec: str, dia: str = "") -> str:
                if img_f.exists()
                else "<p class='meta'>Sin captura todavía — "
                     "se genera cada mañana.</p>")
+        # medios solo-FB (El Sol del Sureste) no tienen 'url' — el
+        # link apunta a su fanpage; sin ninguna fuente se omite
+        url_m = m.get("url") or m.get("fb") or ""
+        link_m = (f"<a href='{html.escape(url_m)}' target='_blank' "
+                  "rel='noopener' class='meta' "
+                  "style='display:block;margin:.15rem 0'>"
+                  "abrir en el medio ↗</a>" if url_m else "")
         cards += (f"<div class='card' style='border-left-color:#7b1fa2'>"
                   f"<b>{html.escape(m['nombre'])}</b>"
-                  f"<a href='{html.escape(m['url'])}' target='_blank' "
-                  "rel='noopener' class='meta' "
-                  "style='display:block;margin:.15rem 0'>abrir en el medio ↗</a>"
-                  f"{img}</div>")
+                  f"{link_m}{img}</div>")
     pdf_block = (f"<p class='meta'>PDFs: {links_pdf}</p>"
                  if links_pdf
                  else "<p class='meta'>Sin PDFs todavía — "
