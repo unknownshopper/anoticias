@@ -3926,7 +3926,8 @@ def escribir_schedule_portadas(cfg: dict):
                 ok_h.setdefault((e["m"], e["d"]),
                                 str(e.get("t", ""))[:5])
         cab = "".join(
-            f"<th style='min-width:3.2rem'>{d[8:10]}/{d[5:7]}</th>"
+            f"<th style='min-width:3.2rem;text-align:center'>"
+            f"{d[8:10]}/{d[5:7]}</th>"
             for d in dias_h)
         filas = ""
         for m in medios:
