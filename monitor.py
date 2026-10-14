@@ -323,6 +323,9 @@ def enviar_correo(cfg: dict, alerta: dict):
     correo = cfg.get("correo", {})
     if not correo.get("habilitado"):
         return
+    if alerta.get("categoria") == "desarrollo":
+        return   # cluster que crece → un correo por ciclo = spam;
+                 # es señal de dashboard, no regla del usuario
     # alertas de un usuario van a SU correo; las globales al destinatario fijo
     destinatario = alerta.get("usuario") or correo.get("destinatario", "")
     if not destinatario or "@" not in destinatario:
@@ -2043,9 +2046,11 @@ def _bajar_portada_fb(m: dict) -> list:
             # fb_primero: la página sube la portada como primer post con
             # foto de la madrugada sin texto identificable (XEVT) —
             # hasta 3 frescos: si el último es un flyer la plana queda
-            # abajo y el filtro de formato decide cuál sirve
-            if m.get("fb_primero") and not por_texto \
-                    and len(cand) < 3 and reciente:
+            # abajo y el filtro de formato decide cuál sirve.
+            # fb_texto (CORAT/Ahora/Índigo): la página publica bait sin
+            # caption — sin la palabra 'portada/edición' no se acepta
+            if m.get("fb_primero") and not m.get("fb_texto") \
+                    and not por_texto and len(cand) < 3 and reciente:
                 cand.append((post["href"], post["txt"]))
     except Exception:
         return []
