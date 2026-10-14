@@ -4408,14 +4408,14 @@ PAGINA = """<!DOCTYPE html>
 <link rel="apple-touch-icon" href="/icon3.png">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="@noticias">
-<meta property="og:title" content="@noticias — Síntesis de prensa con alertas">
-<meta property="og:description" content="Monitor de medios en tiempo real: destacadas, alertas por tema, noticias y estadísticas. Powered by Olmeca Code.">
+<meta property="og:title" content="{og_title}">
+<meta property="og:description" content="{og_desc}">
 <meta property="og:image" content="{base}/og.png">
 <meta property="og:image:width" content="1376">
 <meta property="og:image:height" content="768">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="@noticias — Síntesis de prensa con alertas">
-<meta name="twitter:description" content="Monitor de medios en tiempo real. Powered by Olmeca Code.">
+<meta name="twitter:title" content="{og_title}">
+<meta name="twitter:description" content="{og_desc}">
 <meta name="twitter:image" content="{base}/og.png">
 <title>@noticias — Síntesis de prensa</title>
 <style>
@@ -7883,7 +7883,8 @@ def vista_analitica() -> str:
 
 
 def render_pagina(contenido: str, q: str = "", base: str = "",
-                  usuario: str = "") -> bytes:
+                  usuario: str = "", og_title: str = "",
+                  og_desc: str = "") -> bytes:
     cfg = json.loads(CONFIG.read_text())
     admin_tabs = ('<a href="/horarios">Horarios</a>'
                   '<a href="/stats">Stats</a>'
@@ -7910,7 +7911,13 @@ def render_pagina(contenido: str, q: str = "", base: str = "",
     return PAGINA.format(contenido=contenido, q=html.escape(q),
                          base=base, admin_tabs=admin_tabs,
                          tabs_reg=tabs_reg, usuario=html.escape(usuario),
-                         usuario_html=html.escape(nombre_u)).encode()
+                         usuario_html=html.escape(nombre_u),
+                         og_title=html.escape(og_title or
+                             "@noticias — Síntesis de prensa con alertas"),
+                         og_desc=html.escape(og_desc or
+                             "Monitor de medios en tiempo real: destacadas, "
+                             "alertas por tema, noticias y estadísticas. "
+                             "Powered by Olmeca Code.")).encode()
 
 
 def aplicar_accion_fuentes(form: dict, email: str):
@@ -8351,7 +8358,10 @@ def servir_web(puerto: int):
                 sec = params.get("sec", ["nacional"])[0]
                 self._html(render_pagina(
                     vista_portadas(sec, params.get("dia", [""])[0]),
-                    base=base, usuario=email))
+                    base=base, usuario=email,
+                    og_title="Portadas de prensa — Nacional y Tabasco",
+                    og_desc="Primeras planas de diarios nacionales y de "
+                            "Tabasco, actualizadas cada mañana."))
             elif ruta.path.startswith("/portadas/"):
                 p = (PORTADAS_DIR / ruta.path.split("/", 2)[2]).resolve()
                 tipos = {".png": "image/png", ".jpg": "image/jpeg",
