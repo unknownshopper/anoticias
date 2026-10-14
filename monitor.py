@@ -3448,7 +3448,7 @@ def _pagina_portada_pdf(sec: str, n_medios: int):
         except Exception:
             fb = fm = fs = ImageFont.load_default()
         navy = (43, 57, 79)      # azul pizarra de la tipografía de la pieza
-        cy = arte.height + (H - arte.height) * 0.42
+        cy = arte.height + (H - arte.height) * 0.55
         dr.text((W / 2, cy - 80), sec.upper(), font=fb, fill=navy,
                 anchor="mm")
         dr.text((W / 2, cy), f"{dia_sem}, {fecha}", font=fm,
