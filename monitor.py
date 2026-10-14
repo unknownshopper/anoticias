@@ -3904,7 +3904,20 @@ def escribir_schedule_portadas(cfg: dict):
     n_nac = sum(1 for m in medios
                 if m.get("seccion") == "nacional"
                 and m["nombre"] in listos)
-    tl += "</div>"
+    tl += ("<p style='font-size:.9rem;margin:6px 0 2px;font-weight:600'>"
+           f"<b style='color:#0a7a2f'>{len(listos)} de {len(medios)}</b> "
+           f"medios capturados — {n_nac} nacionales · {n_tab} tabasco"
+           "</p>")
+    tl += ("</div><p style='font-size:.75rem;color:#666;margin:0 0 12px'>"
+           "corrida <b style='color:#0a7a2f'>●</b> hecha · "
+           "<b style='color:#9ca3af'>●</b> pendiente · "
+           "<b style='color:#d97706'>●</b> sin eventos aún · "
+           "pin <b style='color:#2563eb'>●</b> portada capturada "
+           "(hora real)</p>")
+    if pend:
+        tl += ("<p style='font-size:.8rem;margin:0 0 12px'>"
+               "<b style='color:#dc2626'>Pendientes:</b> "
+               + ", ".join(html.escape(n) for n in pend) + "</p>")
 
     html_doc = (
         "<!DOCTYPE html>\n<html lang=\"es\"><head><meta charset=\"utf-8\">\n"
