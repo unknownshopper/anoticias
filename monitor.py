@@ -2127,7 +2127,7 @@ def scrapear_posts_fb(cfg: dict):
     Dedup por link; filtro de autor (posts 'sugeridos' de páginas
     ajenas se descartan); una instancia a la vez."""
     global _ULT_FB_POSTS, _FB_POSTS_CORRIENDO
-    if _FB_POSTS_CORRIENDO:
+    if _FB_POSTS_CORRIENDO or cfg.get("fb_posts_pausa"):
         return
     _FB_POSTS_CORRIENDO = True
     _ULT_FB_POSTS = time.time()
@@ -2175,7 +2175,7 @@ def scrapear_posts_fb(cfg: dict):
                               + 'a[href*="/videos/"],'
                               + 'a[href*="/reel/"],'
                               + 'a[href*="pfbid"]')) {
-                            const h = a.href;
+                            let h = a.href;
                             if (h.includes('comment_id')) continue;
                             // '/reel/?s=tab' es nav — permalink de reel
                             // lleva ID numérico o pfbid
@@ -2200,6 +2200,16 @@ def scrapear_posts_fb(cfg: dict):
                             }
                             if (!n) continue;
                             seen.add(h);
+                            // permalink del post dentro del contenedor:
+                            // el anchor que nos trajo puede ser el
+                            // /photo de la imagen — ese abre el visor,
+                            // no la publicación
+                            const canon = n.querySelector(
+                                'a[href*="/posts/"],a[href*="pfbid"],'
+                              + 'a[href*="/permalink/"]');
+                            if (canon) {
+                                h = canon.href;
+                            }
                             let owner = '';
                             for (const o of n.querySelectorAll(
                                     'a[href*="facebook.com/"]')) {
@@ -2295,6 +2305,11 @@ def scrapear_posts_fb(cfg: dict):
                             post["lines"][1:] or [], fuente["nombre"])
                         if len(titulo) < 25:
                             continue   # post sin texto útil
+                        req = fuente.get("requiere")
+                        if req and normalizar(req) not in normalizar(
+                                f"{titulo} {cuerpo}"):
+                            continue   # la página mezcla columnas —
+                            # solo las marcadas (ej. 'templo mayor')
                         clave_t = normalizar(titulo)[:80]
                         if clave_t in textos_vistos:
                             continue   # mismo post por otro permalink
@@ -4194,10 +4209,13 @@ def vista_portadas(sec: str, dia: str = "") -> str:
             "loading='lazy' "
             "style='width:100%;border-radius:6px;margin:.15rem 0 .4rem'>"
             if p.exists() else "")
-        img = (tag(img_f, "Impresa") + tag(web_f, "Web")
-               if img_f.exists()
-               else "<p class='meta'>Sin captura todavía — "
-                    "se genera cada mañana.</p>")
+        es_hoy = dia_sel == str(_dir_dia().relative_to(PORTADAS_DIR))
+        if not img_f.exists():
+            if not es_hoy:
+                continue   # días pasados: medio sin portada no aporta
+            img = "<p class='meta'>Aún sin publicar.</p>"
+        else:
+            img = tag(img_f, "Impresa") + tag(web_f, "Web")
         # medios solo-FB (El Sol del Sureste) no tienen 'url' — el
         # link apunta a su fanpage; sin ninguna fuente se omite
         url_m = m.get("url") or m.get("fb") or ""
