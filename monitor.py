@@ -2277,6 +2277,18 @@ def scrapear_posts_fb(cfg: dict):
                         if slug and post.get("owner") \
                                 and normalizar(post["owner"]) != slug:
                             continue   # post sugerido de otra página
+                        # card de presentación de la página: bio
+                        # (seguidores/hablando de esto) sin timestamp —
+                        # los links /photo del módulo intro trepan a él
+                        _ls = post.get("lines", [])
+                        if any(re.search(
+                                r"seguidores|hablando de esto|"
+                                r"informaci[oó]n de contacto", l,
+                                re.I) for l in _ls) and not any(
+                                re.search(
+                                    r"\b\d+\s*(min|h|d)\b|hace\b|ayer",
+                                    l, re.I) for l in _ls):
+                            continue
                         # lines[0] es el encabezado-autor del article
                         # (nombre público de la página — no el caption)
                         titulo, cuerpo = _texto_post(
