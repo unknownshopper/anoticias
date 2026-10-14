@@ -3914,6 +3914,35 @@ def escribir_schedule_portadas(cfg: dict):
                "<b style='color:#dc2626'>Pendientes:</b> "
                + ", ".join(html.escape(n) for n in pend) + "</p>")
 
+    # historial: matriz medio × día con la hora de la captura ok —
+    # portadas_estado.json conserva ~7 días de eventos
+    hist_tbl = ""
+    dias_h = sorted({e.get("d", "") for e in evs_tl})[-7:]
+    if dias_h:
+        ok_h = {}
+        for e in evs_tl:
+            if e.get("ok"):
+                ok_h.setdefault((e["m"], e["d"]),
+                                str(e.get("t", ""))[:5])
+        cab = "".join(
+            f"<th style='min-width:3.2rem'>{d[8:10]}/{d[5:7]}</th>"
+            for d in dias_h)
+        filas = ""
+        for m in medios:
+            filas += ("<tr><td style='white-space:nowrap'>"
+                      f"{html.escape(m['nombre'])}</td>")
+            for d in dias_h:
+                hh = ok_h.get((m["nombre"], d))
+                filas += (f"<td style='text-align:center;color:#0a7a2f'>"
+                          f"{hh}</td>" if hh else
+                          "<td style='text-align:center;color:#ddd'>"
+                          "&#183;</td>")
+            filas += "</tr>"
+        hist_tbl = (f"<h2>Historial — {len(dias_h)} días</h2>"
+                    "<table style='font-size:.75rem'>"
+                    f"<thead><tr><th>Medio</th>{cab}</tr></thead>"
+                    f"<tbody>{filas}</tbody></table>")
+
     html_doc = (
         "<!DOCTYPE html>\n<html lang=\"es\"><head><meta charset=\"utf-8\">\n"
         "<title>Horario de captura — Portadas</title>\n"
@@ -3963,6 +3992,7 @@ def escribir_schedule_portadas(cfg: dict):
         "<button style='margin:1rem 0;padding:.5rem 1.5rem;background:"
         "#b03a2e;color:#fff;border:0;border-radius:6px;font-size:1rem'>"
         "Agregar fuente</button></form>"
+        + hist_tbl +
         "<script>"
         # el editor vive en el dashboard (:8080) — el archivo servido
         # por otro puerto/file redirige ahí para que la cookie valga
