@@ -2020,10 +2020,13 @@ def _bajar_portada_fb(m: dict) -> list:
                 continue        # post 'sugerido' de otra página
             txt = normalizar(post["txt"])
             # el plugin renderiza en EN ó ES según locale del CDN —
-            # "3 hours ago"/"3h" vale igual que "hace 3 horas"
+            # "3 hours ago"/"3h" vale igual que "hace 3 horas"; pero
+            # >8h ya es el post de AYER (las portadas se suben 4-6am)
+            _h = re.search(r"(\d+)\s*(?:h|hr|hrs|hora|horas)\b", txt)
             reciente = bool(re.search(
                 r"hace|\bago\b|\d+\s*(h|hr|hrs|hora|horas|min|minute)s?\b",
-                txt)) and not re.search(r"d[ií]a|day|yesterday|ayer", txt)
+                txt)) and not re.search(r"d[ií]a|day|yesterday|ayer", txt) \
+                and (not _h or int(_h.group(1)) <= 8)
             fechas = (normalizar(fecha_txt),              # 5 de octubre
                       normalizar(fecha_txt.replace(
                           str(hoy.day), f"{hoy.day:02d}")))  # 05 de octubre
@@ -2075,7 +2078,7 @@ def _bajar_portada_fb(m: dict) -> list:
         # portada. Si el post dijo 'portada/boletín/edición + hoy',
         # confiamos en el texto aunque la imagen sea 0.8
         imgs = [b for b in imgs
-                if _es_portada(b, 1.15) and _texto_denso(b)]
+                if _es_portada(b, 1.15, 1.6) and _texto_denso(b)]
     return imgs
 
 
@@ -3167,15 +3170,18 @@ def _es_vertical(b: bytes) -> bool:
         return False
 
 
-def _es_portada(b: bytes, r_min: float = 1.3) -> bool:
-    """Vertical Y angosta — proporción de primera plana (~0.55–0.77 
-w/h).                                                                    
-    Un flyer vertical 4:5 o cuadrado (600x750 = 0.8, posts de evento)
-    NO es portada aunque sea alto. r_min menor (1.15) sirve para
-    descartar solo lo landscape (fotos de nota en estrategia edicion)."""
+def _es_portada(b: bytes, r_min: float = 1.3,
+                r_max: float = 0) -> bool:
+    """Vertical Y angosta — proporción de primera plana (~0.55–0.77
+    w/h). Un flyer vertical 4:5 o cuadrado (600x750 = 0.8, posts de
+    evento) NO es portada aunque sea alto; ni tampoco un reel
+    DEMASIADO alto (h/w>1.6 = stories/bait, no plana impresa).
+    r_min menor (1.15) descarta solo lo landscape; r_max=0 desactiva
+    el techo."""
     try:
         im = Image.open(io.BytesIO(b))
-        return im.height >= im.width * r_min
+        r = im.height / im.width
+        return r >= r_min and (not r_max or r <= r_max)
     except Exception:
         return False
 
