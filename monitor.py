@@ -8231,8 +8231,9 @@ def servir_web(puerto: int):
             if not email and not (
                     ruta.path in ("/icon.png", "/icon3.png", "/og.png",
                                   "/manifest.webmanifest", "/nota",
-                                  "/instructivo", "/captura", "/propuesta")
-                    or ruta.path.startswith("/shots/")):
+                                  "/instructivo", "/captura", "/propuesta",
+                                  "/portadas")
+                    or ruta.path.startswith(("/shots/", "/portadas/"))):
                 # sin sesión: cualquier ruta muestra el login
                 self._html(vista_login(base))
                 return
