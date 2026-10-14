@@ -1990,7 +1990,22 @@ def _bajar_portada_fb(m: dict) -> list:
                             owner = seg.length === 1 ? seg[0] : '';
                         }
                     }
+                    // img del feed dentro del post — respaldo cuando
+                    // el visor del permalink no entrega nada (res
+                    // menor, ~600px, pero pasa los filtros)
+                    let feed_img = '';
+                    if (n) {
+                        for (const im of n.querySelectorAll(
+                                'img[src*="scontent"],'
+                              + 'img[src*="fbcdn"]')) {
+                            if (im.naturalWidth >= 400
+                                    && !im.src.includes('emoji')) {
+                                feed_img = im.src; break;
+                            }
+                        }
+                    }
                     out.push({href: a.href, owner: owner,
+                              img: feed_img,
                               txt: txt.split(NL).join(' ').slice(0, 300)});
                 }
                 return out;
@@ -2080,6 +2095,21 @@ def _bajar_portada_fb(m: dict) -> list:
         for b in _imagenes_fb_post(u):
             if len(imgs) < 4 and b not in imgs:
                 imgs.append(b)
+    if not imgs:
+        # el visor del permalink falló → img ya renderizada en el
+        # feed del post candidato (menor res pero sirve de respaldo)
+        feed = {p_["href"]: p_.get("img") for p_ in posts}
+        for u in cands[:6]:
+            src = feed.get(u)
+            if not src:
+                continue
+            try:
+                r = requests.get(html.unescape(src), timeout=15,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code == 200 and len(r.content) > 30000:
+                    imgs.append(r.content)
+            except Exception:
+                pass
     if imgs and m.get("fb_primero") and not por_texto:
         # fallback sin texto identificable: exigir formato angosto de
         # primera plana — flyers verticales (donación ISSET 0.8) no son
@@ -2087,6 +2117,43 @@ def _bajar_portada_fb(m: dict) -> list:
         # confiamos en el texto aunque la imagen sea 0.8
         imgs = [b for b in imgs
                 if _es_portada(b, 1.15, 1.6) and _texto_denso(b)]
+    return imgs
+
+
+def _bajar_portada_x(m: dict) -> list:
+    """X: media del tweet de HOY (@xevtfm publica su plana ahí cuando
+    su FB tarda). Sesión x_session.json; la img del DOM viene chica —
+    pedir name=large. published_parsed es UTC → fecha local."""
+    handle = str(m.get("x", "")).lstrip("@").strip()
+    if not handle or not X_SESSION.exists():
+        return []
+    try:
+        posts = _scrapear_x_posts(handle)
+    except Exception:
+        return []
+    hoy = datetime.now().date()
+    imgs = []
+    for p_ in posts:
+        if p_.get("_autor", "").lower() != f"@{handle}".lower():
+            continue                    # retweets/ads
+        pp = p_.get("published_parsed")
+        if not pp or datetime.fromtimestamp(
+                calendar.timegm(pp)).date() != hoy:
+            continue                    # solo tweets de hoy
+        for mc in p_.get("media_content") or []:
+            u = html.unescape(mc["url"])
+            u = re.sub(r"name=\w+", "name=large", u) \
+                if "name=" in u else \
+                u + ("&" if "?" in u else "?") + "name=large"
+            try:
+                r = requests.get(u, timeout=15)
+            except Exception:
+                continue
+            if r.status_code == 200 and len(r.content) > 30000 \
+                    and r.content not in imgs:
+                imgs.append(r.content)
+        if len(imgs) >= 3:
+            break
     return imgs
 
 
@@ -3007,6 +3074,12 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
             if not data:
                 print(f"[fb] {m['nombre']}: sin portada usable "
                       "(sin post de hoy o 0 imágenes bajadas)")
+        if m.get("x") and not data:
+            data = _bajar_portada_x(m)
+            src_fb = bool(data)   # media social: mismo filtro
+            if not data:
+                print(f"[x] {m['nombre']}: sin portada usable "
+                      "(sin tweet de hoy con media)")
         if m.get("calameo") and not data:
             data = _portada_calameo(m)
         if m.get("issuu") and not data:
