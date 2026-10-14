@@ -3917,10 +3917,11 @@ def escribir_schedule_portadas(cfg: dict):
     # historial: matriz medio × día con la hora de la captura ok —
     # portadas_estado.json conserva ~7 días de eventos
     hist_tbl = ""
-    dias_h = sorted({e.get("d", "") for e in evs_tl})[-7:]
+    evs_all = est_tl.get("eventos", [])
+    dias_h = sorted({e.get("d", "") for e in evs_all})[-7:]
     if dias_h:
         ok_h = {}
-        for e in evs_tl:
+        for e in evs_all:
             if e.get("ok"):
                 ok_h.setdefault((e["m"], e["d"]),
                                 str(e.get("t", ""))[:5])
