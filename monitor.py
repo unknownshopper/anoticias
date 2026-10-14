@@ -54,7 +54,7 @@ ESTADO_FUENTES = BASE / "fuentes_estado.json"  # salud por feed (stats)
 USUARIOS = BASE / "usuarios.json"    # reglas + fuentes ocultas + expira, por email
 ACTIVIDAD = BASE / "actividad.jsonl"  # {ts, email, ruta} por cada página vista
 SECRET = BASE / "secret.txt"    # llave HMAC para firmar cookies de sesión
-OG_PNG = BASE / "brand" / "port02.jpeg"  # tarjeta de preview para compartir links
+OG_PNG = BASE / "brand" / "02port.jpg"  # tarjeta de preview para compartir links
 PORTADAS_DIR = BASE / "portadas"  # PNGs del día + PDFs por sección
 ESTADO_PORTADAS = BASE / "portadas_estado.json"  # {"fecha": YYYY-MM-DD}
 MAX_NOTICIAS = 2000
@@ -3420,49 +3420,41 @@ def _guardar_portadas(est: dict):
 
 
 def _pagina_portada_pdf(sec: str, n_medios: int):
-    """Página de portada del PDF — brand/port01.jpeg con fecha y conteo
-    dinámicos en la columna vacía; la nacional repinta el título sobre el
-    fondo crema. Sin el asset, portada institucional generada."""
+    """Página de portada del PDF — brand/02port.jpg arriba (la pieza ya
+    dice PORTADAS · NACIONAL|TABASCO) y sobre papel muestreado de la
+    propia imagen: sección, fecha y conteo. Sin el asset, portada
+    institucional generada."""
     from PIL import ImageDraw, ImageFont
     hoy = datetime.now()
     fecha = f"{hoy.day} de {_MESES_PORTADA[hoy.month - 1]} de {hoy.year}"
     dia_sem = _DIAS_PORTADA[hoy.weekday()].capitalize()
-    asset = BASE / "brand" / "port01.jpeg"
+    asset = BASE / "brand" / "02port.jpg"
     if asset.exists():
-        img = Image.open(asset).convert("RGB")
-        img = img.resize((1240, int(img.height * 1240 / img.width)),
-                         Image.LANCZOS)
-        W, H = img.size
+        arte = Image.open(asset).convert("RGB")
+        arte = arte.resize((1240, int(arte.height * 1240 / arte.width)),
+                           Image.LANCZOS)
+        W, H = 1240, 1754   # proporción carta/vertical
+        fondo = arte.getpixel((12, arte.height - 12))  # crema de la pieza
+        img = Image.new("RGB", (W, H), fondo)
+        img.paste(arte, (0, 0))
         dr = ImageDraw.Draw(img)
         try:
-            ft = ImageFont.truetype("DejaVuSans-Bold.ttf",
-                                    int(W * 0.072))
+            fb = ImageFont.truetype("DejaVuSans-Bold.ttf",
+                                    int(W * 0.052))
             fm = ImageFont.truetype("DejaVuSans.ttf",
-                                    int(W * 0.036))
+                                    int(W * 0.032))
             fs = ImageFont.truetype("DejaVuSans.ttf",
-                                    int(W * 0.027))
+                                    int(W * 0.026))
         except Exception:
-            ft = fm = fs = ImageFont.load_default()
-        negro, gris = (26, 26, 26), (105, 100, 92)
-        if sec == "nacional":
-            # la pieza dice TABASCO — cubrir el título con el color
-            # promedio del área (el fondo JPEG tiene degradado) y
-            # repintar PORTADAS / NACIONAL
-            zona = img.crop((0, 0, int(W * 0.62), int(H * 0.205)))
-            claro = [p for p in zona.getdata()
-                     if sum(p) / 3 > 200]
-            crema = tuple(int(sum(c[i] for c in claro) / len(claro))
-                          for i in range(3)) if claro else (244, 240, 228)
-            dr.rectangle((0, 0, int(W * 0.62), int(H * 0.19)),
-                         fill=crema)
-            dr.text((W * 0.05, H * 0.078), "PORTADAS",
-                    font=ft, fill=negro)
-            dr.text((W * 0.05, H * 0.132), "NACIONAL",
-                    font=ft, fill=negro)
-        x = W * 0.05
-        dr.text((x, H * 0.60), dia_sem, font=fm, fill=gris)
-        dr.text((x, H * 0.645), fecha, font=fm, fill=negro)
-        dr.text((x, H * 0.69), f"{n_medios} medios", font=fs, fill=gris)
+            fb = fm = fs = ImageFont.load_default()
+        navy = (43, 57, 79)      # azul pizarra de la tipografía de la pieza
+        cy = arte.height + (H - arte.height) * 0.42
+        dr.text((W / 2, cy - 80), sec.upper(), font=fb, fill=navy,
+                anchor="mm")
+        dr.text((W / 2, cy), f"{dia_sem}, {fecha}", font=fm,
+                fill=navy, anchor="mm")
+        dr.text((W / 2, cy + 60), f"{n_medios} medios", font=fs,
+                fill=navy, anchor="mm")
         return img
     W, H = 1240, 1754   # proporción carta/vertical como las portadas
     img = Image.new("RGB", (W, H), (250, 250, 250))
@@ -4419,8 +4411,8 @@ PAGINA = """<!DOCTYPE html>
 <meta property="og:title" content="@noticias — Síntesis de prensa con alertas">
 <meta property="og:description" content="Monitor de medios en tiempo real: destacadas, alertas por tema, noticias y estadísticas. Powered by Olmeca Code.">
 <meta property="og:image" content="{base}/og.png">
-<meta property="og:image:width" content="1200">
-<meta property="og:image:height" content="630">
+<meta property="og:image:width" content="1376">
+<meta property="og:image:height" content="768">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="@noticias — Síntesis de prensa con alertas">
 <meta name="twitter:description" content="Monitor de medios en tiempo real. Powered by Olmeca Code.">
@@ -4809,8 +4801,8 @@ LOGIN = """<!DOCTYPE html>
 <meta property="og:title" content="@noticias — Síntesis de prensa con alertas">
 <meta property="og:description" content="Monitor de medios en tiempo real: destacadas, alertas por tema, noticias y estadísticas.">
 <meta property="og:image" content="{base}/og.png">
-<meta property="og:image:width" content="1200">
-<meta property="og:image:height" content="630">
+<meta property="og:image:width" content="1376">
+<meta property="og:image:height" content="768">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="{base}/og.png">
 <title>@noticias — Entrar</title>
