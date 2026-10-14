@@ -2026,10 +2026,13 @@ def _bajar_portada_fb(m: dict) -> list:
             # "3 hours ago"/"3h" vale igual que "hace 3 horas"; pero
             # >8h ya es el post de AYER (las portadas se suben 4-6am)
             _h = re.search(r"(\d+)\s*(?:h|hr|hrs|hora|horas)\b", txt)
+            # fb_horas: XEVA sube la plana la tarde anterior (~14h);
+            # el tope default de 8h es para portadas de la madrugada
             reciente = bool(re.search(
                 r"hace|\bago\b|\d+\s*(h|hr|hrs|hora|horas|min|minute)s?\b",
                 txt)) and not re.search(r"d[ií]a|day|yesterday|ayer", txt) \
-                and (not _h or int(_h.group(1)) <= 8)
+                and (not _h
+                     or int(_h.group(1)) <= m.get("fb_horas", 8))
             fechas = (normalizar(fecha_txt),              # 5 de octubre
                       normalizar(fecha_txt.replace(
                           str(hoy.day), f"{hoy.day:02d}")))  # 05 de octubre
