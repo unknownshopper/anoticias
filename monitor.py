@@ -12,6 +12,7 @@ Uso:
 """
 
 import argparse
+import base64
 import calendar
 import hashlib
 import hmac
@@ -211,9 +212,15 @@ def perfil_usuario(email: str, cfg: dict) -> dict:
 
 def fuentes_visibles(perfil: dict, cfg: dict) -> set:
     """Fuentes que el usuario ve en su feed: todas menos las que ocultó.
-    (modelo por exclusión: una fuente nueva del admin aparece sola)"""
+    (modelo por exclusión: una fuente nueva del admin aparece sola)
+    EXCEPTO 'deportes': esa categoría es opt-in — apagada por default,
+    solo entran las que el usuario marcó expresamente."""
     ocultas = set(perfil.get("fuentes_ocultas", []))
-    return {f["nombre"] for f in cfg["fuentes"] if f["nombre"] not in ocultas}
+    dep_on = set(perfil.get("deportes_visibles", []))
+    return {f["nombre"] for f in cfg["fuentes"]
+            if f["nombre"] not in ocultas
+            and (f.get("categoria") != "deportes"
+                 or f["nombre"] in dep_on)}
 
 
 def registrar_actividad(email: str, ruta: str, nota_u: str = "",
@@ -510,28 +517,67 @@ def fetch_telegram(canal: str) -> list:
     return entradas
 
 
-def resumir_ollama(cfg: dict, titulo: str, resumen: str) -> str:
-    """Pide a Ollama un resumen de una línea (opcional, --resumir)."""
-    prompt = (
-        "Resume en una sola frase en español esta noticia. "
-        "Solo el resumen, sin comillas ni introducción.\n\n"
-        f"Título: {titulo}\nTexto: {resumen[:1500]}"
-    )
+def _gemini_key(cfg: dict) -> str:
+    return cfg.get("gemini", {}).get("api_key", "")
+
+
+def _llm(cfg: dict, prompt: str, timeout: int = 120) -> str:
+    """Gemini (AI Studio, free tier) si hay api_key en config; si no,
+    o si falla, Ollama local. El guard de RAM solo aplica al modelo
+    local — la API no carga nada en la NUC."""
+    if _gemini_key(cfg):
+        modelo = cfg["gemini"].get("modelo", "gemini-3.1-flash-lite")
+        for intento in range(2):
+            try:
+                r = requests.post(
+                    "https://generativelanguage.googleapis.com/v1beta/"
+                    f"models/{modelo}:generateContent",
+                    params={"key": _gemini_key(cfg)},
+                    json={"contents": [{"parts": [{"text": prompt}]}]},
+                    timeout=timeout)
+                # modelos "thinking": parts puede traer el
+                # pensamiento primero — tomar el último con texto
+                parts = (r.json()["candidates"][0]["content"]
+                         .get("parts") or [])
+                txt = "".join(
+                    p.get("text", "") for p in parts
+                    if not p.get("thought")).strip()
+                if txt:
+                    return txt
+                print("[llm] gemini vacío")
+            except Exception as e:
+                print(f"[llm] gemini intento {intento+1}: {e}")
+            if intento == 0:
+                time.sleep(15)   # 503 por saturación — un respiro
+        print("[llm] gemini agotado — caigo a ollama")
+    if _mem_disponible_gb() < 4:
+        return ""   # solo ollama come RAM — API no necesita margen
     try:
         r = requests.post(
             cfg["ollama"]["url"],
-            json={"model": cfg["ollama"]["modelo"], "prompt": prompt, "stream": False},
-            timeout=120,
-        )
+            json={"model": cfg["ollama"]["modelo"], "prompt": prompt,
+                  "stream": False},
+            timeout=timeout)
         return r.json().get("response", "").strip()
     except Exception as e:
         return f"(no se pudo resumir: {e})"
 
 
+def resumir_ollama(cfg: dict, titulo: str, resumen: str) -> str:
+    """Pide al LLM un resumen de una línea (opcional, --resumir)."""
+    prompt = (
+        "Resume en una sola frase en español esta noticia. "
+        "Solo el resumen, sin comillas ni introducción.\n\n"
+        f"Título: {titulo}\nTexto: {resumen[:1500]}"
+    )
+    return _llm(cfg, prompt, timeout=120)
+
+
 def resumir_ollama_seguro(cfg, titulo, resumen) -> str:
     """resumir_ollama con guard de memoria: evita cargar llama3.2 con
-    RAM al límite (el NUC se congeló así). Devuelve "" si no hay margen."""
-    if _mem_disponible_gb() < 4:
+    RAM al límite (el NUC se congeló así). Devuelve "" si no hay margen.
+    Con Gemini configurado el guard no aplica — la API no usa RAM."""
+    if not _gemini_key(cfg) and _mem_disponible_gb() < 4:
         return ""
     return resumir_ollama(cfg, titulo, resumen)
 
@@ -574,17 +620,46 @@ def _dedup_notas(notas: list, umbral: float = 0.7) -> list:
     return out
 
 
+def _prio_interes(n: dict) -> int:
+    """Jerarquía del usuario (15/oct): 1º Reséndez Y todo el Poder
+    Judicial de Tabasco (TSJT, magistrados, juzgados, actores de la
+    lista); 2º Javier May y actividades de gobierno; 3º el resto.
+    Ordena [N#] y guía al modelo al protagonista."""
+    t = normalizar(n["titulo"] + " " + (n.get("resumen") or ""))
+    if re.search(r"resendez|magistrad[oa]\s+presidente", t):
+        return 0
+    # poder judicial Tabasco: siglas, institución y nombres de la
+    # lista de interés — 'fiscalía' NO: es órgano del ejecutivo
+    if re.search(r"\btsjt?\b|poder judicial|tribunal superior|"
+                 r"consejo de la judicatura|judicatura|juzgad|"
+                 r"magistrad|sindicato del tribunal|"
+                 r"voluntariado del tribunal|oficial mayor|"
+                 r"osfe|\btet\b|balcazar|donaciano|quen|"
+                 r"rabago|orrico|garcia mollinedo|german garcia|"
+                 r"glori|paola hernandez", t):
+        return 1
+    # gobierno del estado: gobernador, palacio, municipios
+    if re.search(r"javier may|gobernador|gobierno del estado|"
+                 r"palacio de gobierno|secretaria de gobierno|"
+                 r"gobierno de tabasco|ayuntamiento|municipal|"
+                 r"fiscal[ií]a|\bsspc\b", t):
+        return 2
+    return 3
+
+
 def generar_sintesis(cfg: dict, franja: str) -> str:
-    """Síntesis ejecutiva de la franja con Ollama (llama3.2):
+    """Síntesis ejecutiva de la franja (Gemini API → Ollama fallback):
     'matutina' cubre 21:00 de ayer → 09:00; 'vespertina' 09:00 →
     15:00; 'nocturna' 15:00 → 21:00. Solo notas de la lista de
     interés judicial (tope ~60 para no reventar el contexto del 3B)."""
-    if _mem_disponible_gb() < 4:
+    if not _gemini_key(cfg) and _mem_disponible_gb() < 4:
         return ""   # sin margen para el modelo — reintenta en otro ciclo
     ahora = datetime.now()
     if franja == "matutina":
         desde = (ahora - timedelta(days=1)).replace(
             hour=21, minute=0, second=0)
+    elif franja == "mediodia":
+        desde = ahora.replace(hour=0, minute=0, second=0)
     elif franja == "nocturna":
         desde = ahora.replace(hour=15, minute=0, second=0)
     else:   # vespertina
@@ -592,25 +667,16 @@ def generar_sintesis(cfg: dict, franja: str) -> str:
     sel = _sel_interes_extendida(desde)
     if not sel:
         return ""
-    # jerarquía institucional: Magistrado Presidente primero, luego
-    # Gobernador, luego lo demás del TSJT — numerar [N#] en ese orden
-    # guía al modelo a escribir en orden de relevancia
-    def _prio(n: dict) -> int:
-        t = normalizar(n["titulo"] + " " + (n.get("resumen") or ""))
-        if re.search(r"resendez|magistrad[oa]\s+presidente", t):
-            return 0
-        if re.search(r"javier may|gobernador", t):
-            return 1
-        if re.search(r"tsjt|poder judicial|tribunal superior", t):
-            return 2
-        return 3
-    sel.sort(key=_prio)
+    # jerarquía institucional: numerar [N#] en ese orden guía al
+    # modelo a escribir por relevancia — Reséndez siempre arriba
+    sel.sort(key=_prio_interes)
     lineas = "\n".join(
         f"- [N{i+1}|{n.get('categoria', '')}|{n['fuente']}] "
         f"{n['titulo']}"
         + (f" — {n['resumen'][:280]}" if n.get("resumen") else "")
         for i, n in enumerate(sel))
     nombre = {"matutina": "matutina (lo ocurrido desde ayer 21:00)",
+              "mediodia": "de mediodía (hoy 00:00 a 12:00)",
               "vespertina": "vespertina (hoy 09:00 a 15:00)",
               "nocturna": "nocturna — cierre del día "
                           "(hoy 15:00 a 21:00)"}.get(
@@ -642,21 +708,23 @@ def generar_sintesis(cfg: dict, franja: str) -> str:
         "(@alguien), cifras, nombres o hechos. No escribas 'no se "
         "tienen noticias' — si una sección no tiene material, omítela.\n"
         "- Sin introducción ni cierre.\n\n" + lineas)
-    try:
-        r = requests.post(
-            cfg["ollama"]["url"],
-            json={"model": cfg["ollama"]["modelo"], "prompt": prompt,
-                  "stream": False},
-            timeout=480)
-        texto = r.json().get("response", "").strip()
-    except Exception:
-        return ""
+    texto = _llm(cfg, prompt, timeout=480)
     if not texto or texto.startswith("(no se pudo"):
         return ""
+    # perspectiva nacional-vs-Tabasco: la vespertina cierra el medio
+    # día — el post del poli sale de aquí; el cierre nocturno genera
+    # la suya aparte
+    perspectiva = ""
+    if franja == "vespertina":
+        try:
+            perspectiva = _perspectiva_dia(cfg, ahora)
+        except Exception as exc:
+            print(f"[síntesis] perspectiva falló ({exc})")
     with SINTESIS.open("a") as f:
         f.write(json.dumps({
             "fecha": ahora.isoformat(timespec="seconds"),
             "franja": franja, "texto": texto,
+            "perspectiva": perspectiva,
             "n_notas": len(sel),
             "notas": [{"f": n.get("fuente", ""),
                        "t": n.get("titulo", ""),
@@ -664,6 +732,118 @@ def generar_sintesis(cfg: dict, franja: str) -> str:
             ensure_ascii=False) + "\n")
     _poda_sintesis()           # la nueva desbanca a la anterior
     return texto
+
+
+def _perspectiva_dia(cfg: dict, ahora: datetime) -> str:
+    """'Perspectiva' para @elpolidelanoche: el LLM elige la nota de
+    mayor impacto nacional vs la de mayor impacto en Tabasco y las
+    contrasta en un post ≤280 — voz de observador externo (sin firma
+    institucional). El Jaccard de titulares no sirve aquí: cada medio
+    redacta distinto la misma historia, así que la selección de
+    'impacto' la hace el modelo leyendo la agenda del día."""
+    # ventana 24h: historias de ayer que siguen vigentes compiten —
+    # el modelo ve la fecha de cada titular y valora continuidad
+    desde = (ahora - timedelta(hours=24)).isoformat()
+    notas = [n for n in leer_jsonl(NOTICIAS, limite=0)
+             if n.get("fecha", "") >= desde]
+    # piezas fijas no son 'impacto': crucigramas, programas diarios,
+    # columnas firmadas, parte meteorológico — y timestamps crudos
+    # que el scraper traga como título ("hace aproximadamente...")
+    fijo = re.compile(
+        r"crucigrama|hor[oó]scopo|sudoku|cartelera|jugar|loter[ií]a|"
+        r"latinus|programaci[oó]n|dosis|editorial del d[ií]a|escribe|"
+        r"chubascos|pron[oó]stico|onda tropical|clima|frente fr[ií]o|"
+        r"lluvia|pasarela|concierto|festival|"
+        r"mlb|nfl|liga|liga mx|serie mundial|deport|remonta|f[uú]tbol|"
+        r"^(hace |aproximadamente|hace \d)")
+
+    def _agenda(cats, tope):
+        pool = [n for n in notas
+                if n.get("categoria") in cats
+                and not fijo.search(normalizar(n.get("titulo", "")))]
+        pool = _dedup_notas(pool)
+        # cobertura: cuántos tokens del titular aparecen en otros
+        # titulares del pool — la nota grande la republican varios
+        # medios con redacciones distintas (bloqueo, imss, paseo...);
+        # una agenda de nota única puntúa bajo
+        df = {}
+        toks = []
+        for n in pool:
+            t = {w for w in normalizar(n.get("titulo", "")).split()
+                 if len(w) >= 5}
+            toks.append(t)
+            for w in t:
+                df[w] = df.get(w, 0) + 1
+        cub = [sum(1 for w in t if df[w] >= 3) for t in toks]
+        # bonus institucional: el núcleo del producto es judicial
+        # (tsjt, poder judicial, fiscalía); 'efraín' solo suma con
+        # contexto judicial — el técnico de Pumas también se llama
+        # Efraín Juárez y está en la agenda nacional
+        inst = re.compile(
+            r"tsjt|tribunal|poder judicial|fiscal[ií]a|iepc|magistrad")
+        efr = re.compile(r"efra[ií]n")
+        for i, n in enumerate(pool):
+            nt = normalizar(n.get("titulo", ""))
+            if inst.search(nt):
+                cub[i] += 3 + (2 if efr.search(nt) else 0)
+        # sort estable: pre-orden por fecha conserva 'reciente
+        # primero' dentro del mismo score de cobertura
+        par = sorted(zip(cub, pool),
+                     key=lambda c: c[1].get("fecha", ""), reverse=True)
+        par.sort(key=lambda c: -c[0])
+        pool = [p for _, p in par]
+        # reparto por bloques de 6 h: con cientos de notas al día,
+        # un corte de 'más recientes' nunca llega a la historia de
+        # ayer que sigue vigente — cada bloque aporta su agenda y
+        # el modelo decide el impacto con la fecha a la vista
+        por_bloque = max(4, tope // 4)
+        vistos_b = {}
+        sel = []
+        for n in pool:
+            try:
+                b = int((ahora - datetime.fromisoformat(
+                    n["fecha"])).total_seconds() // 21600)
+            except ValueError:
+                b = 0
+            if vistos_b.get(b, 0) >= por_bloque:
+                continue
+            vistos_b[b] = vistos_b.get(b, 0) + 1
+            sel.append(n)
+            if len(sel) >= tope:
+                break
+        sel.sort(key=lambda n: n.get("fecha", ""), reverse=True)
+        return "\n".join(
+            f"- [{n['fecha'][5:16].replace('T', ' ')}] {n['titulo']}"
+            for n in sel)
+
+    ag_nac = _agenda({"nacional", "internacional"}, 24)
+    # Tabasco real: solo prensa local + voceros oficiales —
+    # quintana_roo trae cable/farándula genérico y seguimiento
+    # mete scraps de perfiles (hasta timestamps como titular)
+    ag_reg = _agenda({"prensa", "oficial"}, 28)
+    if not ag_nac or not ag_reg:
+        return ""
+    txt = _llm(cfg,
+               "Escribe UN post de X (máximo 270 caracteres) para una "
+               "cuenta de observación política independiente. De las "
+               "listas de titulares de las últimas 24 h (cada uno con "
+               "su fecha), elige UNA noticia de mayor impacto nacional "
+               "y UNA de mayor impacto en Tabasco — descarta "
+               "pronósticos, deportes y piezas de opinión; una historia "
+               "de ayer que sigue activa vale como continuidad de la "
+               "agenda de hoy. Contrástalas: qué acapara allá vs "
+               "aquí.\n\n"
+               "TITULARES NACIONALES/INTERNACIONALES:\n" + ag_nac +
+               "\n\nTITULARES TABASCO:\n" + ag_reg + "\n\n"
+               "Reglas: tono de analista sobrio, tercera persona, sin "
+               "emojis, sin hashtags, sin firmas ni @menciones, sin "
+               "inventar datos que no estén en los titulares. Devuelve "
+               "SOLO el post.",
+               timeout=240)
+    txt = re.sub(r'^["\']|["\']$', "", txt.strip())
+    if len(txt) > 280:
+        txt = txt[:277].rsplit(" ", 1)[0] + "…"
+    return txt
 
 
 def _sel_interes_extendida(desde: datetime) -> list:
@@ -738,12 +918,13 @@ def generar_cierre(cfg: dict) -> str:
     """CIERRE DIARIO — solo on-demand (botón admin, /resumenes).
     Monólogo de host repasando lo de interés del día; cada segmento
     cierra con [N#] → misma trazabilidad que la síntesis."""
-    if _mem_disponible_gb() < 4:
-        print("[cierre] memoria <4GB — abortado")
+    if not _gemini_key(cfg) and _mem_disponible_gb() < 4:
+        print("[cierre] RAM insuficiente para ollama — se omite")
         return ""
     ahora = datetime.now()
-    sel = _sel_interes_extendida(ahora.replace(hour=0, minute=0,
-                                             second=0))[:15]
+    sel = sorted(_sel_interes_extendida(ahora.replace(
+        hour=0, minute=0, second=0)),
+        key=_prio_interes)[:15]   # Reséndez entra aunque haya >15
     if not sel:
         print("[cierre] sin notas de interés hoy — abortado")
         return ""
@@ -764,6 +945,10 @@ def generar_cierre(cfg: dict) -> str:
         "- Estilo: informe asertivo que expone hechos y resalta la "
         "labor de las instituciones y sus titulares; frases que un "
         "vocero pueda leer textualmente ante un superior.\n"
+        "- TITULAR: si entre las notas hay actividad del Magistrado "
+        "Presidente Efraín Reséndez Bocanegra o del Tribunal Superior "
+        "de Justicia, el briefing ABRE con ella — es el tema rector "
+        "del día, no un punto más.\n"
         "- PROHIBIDAS las acotaciones escénicas: nada de (risas), "
         "(aplausos), (pausa) ni similares.\n"
         "- PROHIBIDO inventar datos, citas, cifras o personajes que no "
@@ -778,52 +963,44 @@ def generar_cierre(cfg: dict) -> str:
         "Termina con un cierre sobrio de una línea, sin despedida "
         "personal."
     )
-    try:
-        r = requests.post(
-            cfg["ollama"]["url"],
-            json={"model": cfg["ollama"]["modelo"], "prompt": prompt,
-                  "stream": False},
-            timeout=480)
-        texto = r.json().get("response", "").strip()
-    except Exception as exc:
-        print(f"[cierre] ollama falló: {exc}")
-        return ""
+    texto = _llm(cfg, prompt, timeout=480)
     if not texto or texto.startswith("(no se pudo"):
-        print("[cierre] respuesta vacía de ollama")
+        print("[cierre] respuesta vacía del LLM")
         return ""
     # versión para X: la CONCLUSIÓN de la tarjeta adaptada a un post
     # ≤280 (el primer post real salió así y es el formato deseado) —
     # el modelo sigue caliente (KEEP_ALIVE), costo ~2s
     post_x = ""
     try:
-        r2 = requests.post(
-            cfg["ollama"]["url"],
-            json={"model": cfg["ollama"]["modelo"],
-                  "prompt": "Este briefing institucional termina con una "
-                            "conclusión ('En conclusion…' o similar). "
-                            "Reescríbela como UN post de X de máximo "
-                            "270 caracteres: tono sobrio, tercera "
-                            "persona, sin hashtags inventados, sin "
-                            "emojis, sin nombres que no estén en el "
-                            "texto. Si menciona al Poder Judicial del "
-                            "Estado de Tabasco, firma @tsj_tabasco. "
-                            "Devuelve SOLO el post, nada más.\n\n"
-                            + texto[-2500:],
-                  "stream": False},
-            timeout=240)
-        post_x = r2.json().get("response", "").strip()
+        post_x = _llm(cfg,
+                      "Este briefing institucional termina con una "
+                      "conclusión ('En conclusion…' o similar). "
+                      "Reescríbela como UN post de X de máximo "
+                      "270 caracteres: tono sobrio, tercera "
+                      "persona, sin hashtags inventados, sin "
+                      "emojis, sin nombres que no estén en el "
+                      "texto. Si menciona al Poder Judicial del "
+                      "Estado de Tabasco, firma @tsj_tabasco. "
+                      "Devuelve SOLO el post, nada más.\n\n"
+                      + texto[-2500:],
+                      timeout=240)
         post_x = re.sub(r'^["\']|["\']$', "", post_x.strip())
         if len(post_x) > 280:
             post_x = post_x[:277].rsplit(" ", 1)[0] + "…"
     except Exception as exc:
         print(f"[cierre] post_x falló ({exc}) — no se guarda")
         post_x = ""
+    try:
+        perspectiva = _perspectiva_dia(cfg, ahora)
+    except Exception as exc:
+        print(f"[cierre] perspectiva falló ({exc})")
+        perspectiva = ""
     with open(SINTESIS, "a", encoding="utf-8") as f:
         print(f"[cierre] guardado — {len(texto)} chars")
         f.write(json.dumps(
             {"fecha": ahora.isoformat(timespec="seconds"),
              "franja": "cierre", "texto": texto,
-             "post_x": post_x,
+             "post_x": post_x, "perspectiva": perspectiva,
              "n_notas": len(sel),
              "notas": [{"f": n.get("fuente", ""),
                         "t": n.get("titulo", ""),
@@ -833,13 +1010,69 @@ def generar_cierre(cfg: dict) -> str:
     return texto
 
 
+def enviar_cierre_mail(cfg: dict, texto_cierre: str):
+    """Correo del cierre del día (programado 21:03): el briefing más
+    las síntesis matutina, vespertina y nocturna — 24 h completas."""
+    correo = cfg.get("correo", {})
+    if not correo.get("habilitado"):
+        return
+    destinatario = correo.get("destinatario", "")
+    if not destinatario or "@" not in destinatario:
+        return
+    ultimas = {}
+    for e in leer_jsonl(SINTESIS):
+        if e.get("franja") in ("matutina", "vespertina", "nocturna"):
+            ultimas[e["franja"]] = e
+    partes = [f"CIERRE DEL DÍA — {datetime.now():%d/%m/%Y %H:%M}",
+              "=" * 52, "", texto_cierre]
+    for fr in ("matutina", "vespertina", "nocturna"):
+        e = ultimas.get(fr)
+        if not e:
+            continue
+        partes += ["", "=" * 52,
+                   f"SÍNTESIS {fr.upper()} — {e['fecha'][:16]}",
+                   "=" * 52, "", e.get("texto", "")]
+    try:
+        msg = MIMEText("\n".join(partes), "plain", "utf-8")
+        msg["Subject"] = (f"[Monitor] Cierre del día "
+                          f"{datetime.now():%d/%m/%Y}")
+        msg["From"] = correo.get("remitente", correo["usuario"])
+        msg["To"] = destinatario
+        puerto = correo.get("smtp_port", 465)
+        if puerto == 587:   # STARTTLS (Brevo)
+            with smtplib.SMTP(correo["smtp_host"], puerto,
+                              timeout=20) as s:
+                s.starttls()
+                s.login(correo["usuario"], correo["password"])
+                s.send_message(msg)
+        else:               # SSL (Gmail 465)
+            with smtplib.SMTP_SSL(correo["smtp_host"], puerto,
+                                  timeout=20) as s:
+                s.login(correo["usuario"], correo["password"])
+                s.send_message(msg)
+        print("[cierre] ✉ mail enviado")
+    except Exception as e:
+        print(f"[cierre] mail falló: {e}")
+
+
+def _cierre_programado(cfg: dict) -> str:
+    """Cierre automático de las 21:03 = generar + mail. El botón
+    manual llama generar_cierre directo — sin mail (re-pruebas)."""
+    texto = generar_cierre(cfg)
+    if texto:
+        enviar_cierre_mail(cfg, texto)
+    return texto
+
+
 def toca_sintesis(franja: str) -> bool:
     """True si pasó la hora de la franja y aún no hay síntesis de hoy."""
     ahora = datetime.now()
-    # minutos desde medianoche — el cierre va 5 min tras la nocturna,
-    # no a las 23:00 (demasiado tarde para publicar en X)
-    hora = {"matutina": 9 * 60, "vespertina": 15 * 60,
-            "nocturna": 21 * 60, "cierre": 21 * 60 + 5}.get(
+    # minutos desde medianoche — cierre 21:03, mismo tick que suele
+    # disparar la nocturna (≥21:00): si esperara 21:05 se iría a la
+    # siguiente pasada del loop (~15 min tarde)
+    hora = {"matutina": 9 * 60, "mediodia": 11 * 60 + 55,
+            "vespertina": 15 * 60,
+            "nocturna": 21 * 60, "cierre": 21 * 60 + 3}.get(
         franja, 9 * 60)
     if ahora.hour * 60 + ahora.minute < hora:
         return False
@@ -1023,9 +1256,12 @@ def _scrapear_x_posts(handle: str) -> list:
                         'div[data-testid="tweetText"]');
                     const tm = t.querySelector('time');
                     // media real del post (foto adjunta) — el avatar
-                    // NO (og:image de X siempre devuelve el perfil)
+                    // NO (og:image de X siempre devuelve el perfil);
+                    // fallback: card del link compartido (img del
+                    // artículo, ej. 'De xevt.com')
                     const ph = t.querySelector(
-                        'div[data-testid="tweetPhoto"] img');
+                        'div[data-testid="tweetPhoto"] img,'
+                      + 'div[data-testid="card.wrapper"] img');
                     out.push({link: link,
                               autor: (link.split('/')[3] || ''),
                               txt: tt ? tt.innerText : '',
@@ -1037,6 +1273,12 @@ def _scrapear_x_posts(handle: str) -> list:
             br.close()
     except Exception:
         return []
+    if posts:
+        _aviso_x_sesion(ok=True)   # sesión viva — levanta el flag
+    else:
+        # login ok pero 0 articles: layout cambió o rate-limit —
+        # sin esto un feed vacío pasa por 'todo bien'
+        print(f"[x] @{handle}: 0 posts extraídos")
     out = []
     for p_ in posts:
         if (p_.get("link") or "").endswith("/analytics"):
@@ -1107,6 +1349,8 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
     if correr_x:
         _ULT_X = now
     for i, fuente in enumerate(cfg["fuentes"]):
+        if fuente.get("activa") is False:
+            continue   # apagada en catálogo (ej. bloque QRoo en esta instancia)
         if fuente.get("tipo") == "fb":
             continue   # la raspa chucky cada 4h — sin feed que pedir
         if fuente.get("tipo") == "x" and not correr_x:
@@ -1351,7 +1595,7 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
             } if autor else False
             hits_usuario = []
             for email, perfil in usuarios.items():
-                if fuente["nombre"] in set(perfil.get("fuentes_ocultas", [])):
+                if fuente["nombre"] not in fuentes_visibles(perfil, cfg):
                     continue
                 hits = [r["nombre"] for r in perfil.get("reglas", [])
                         if coincide(texto, r)]
@@ -1493,7 +1737,7 @@ def wp_scan_reglas(cfg: dict):
                 base = doms.get(dom, {"nombre": dom, "categoria": "prensa"})
                 hits_usuario = []
                 for email, perfil in usuarios.items():
-                    if base["nombre"] in set(perfil.get("fuentes_ocultas", [])):
+                    if base["nombre"] not in fuentes_visibles(perfil, cfg):
                         continue
                     hits = [r["nombre"] for r in perfil.get("reglas", [])
                             if all(normalizar(w) in texto
@@ -1719,9 +1963,12 @@ def _post_x(texto: str) -> bool:
         return False
 
 
-def _x_publicado(fecha: str) -> bool:
-    """¿La síntesis con esta fecha ya se posteó en X?"""
+def _x_publicado(fecha: str, tipo: str = "cierre") -> bool:
+    """¿La síntesis con esta fecha ya se posteó en X? `tipo` distingue
+    el post institucional (default 'cierre') de la perspectiva del
+    poli — entradas viejas del log sin tipo cuentan como cierre."""
     return any(p.get("fecha") == fecha and p.get("ok")
+               and p.get("tipo", "cierre") == tipo
                for p in leer_jsonl(X_POSTS))
 
 
@@ -1758,6 +2005,35 @@ def _aviso_fb_sesion():
             "resumen_ia": "Corre `.venv/bin/python fb_login.py` para "
                           "renovar fb_session.json. Mientras, las "
                           "capturas FB salen anónimas (~600px)."})
+    except Exception:
+        pass
+
+
+def _aviso_x_sesion(ok: bool = False):
+    """Sesión X: ok=False marca caída (login-wall visto) con aviso
+    diario como FB; ok=True limpia el flag al volver a extraer
+    posts — el estado vive en portadas_estado.json → /salud."""
+    try:
+        hoy = datetime.now().strftime("%Y-%m-%d")
+        est = cargar_json(ESTADO_PORTADAS, {})
+        if ok:
+            if est.pop("x_sesion", None):
+                _guardar_portadas(est)
+            return
+        if est.get("x_sesion", {}).get("alertado") == hoy:
+            return
+        est["x_sesion"] = {"estado": "caida", "alertado": hoy}
+        _guardar_portadas(est)
+        cfg = cargar_json(CONFIG, {})
+        enviar_correo(cfg, {
+            "reglas": "X sesión caduca",
+            "fuente": "portadas",
+            "fecha": hoy,
+            "titulo": "La sesión de X (@elpolidelanoche) cayó al login",
+            "link": "",
+            "resumen_ia": "Corre `.venv/bin/python x_login.py` para "
+                          "renovar x_session.json. Mientras: radar X "
+                          "vacío y portada de XEVT sin captura."})
     except Exception:
         pass
 
@@ -1952,8 +2228,53 @@ def _bajar_portada_fb(m: dict) -> list:
                 if n == prev:
                     break
                 prev = n
+            # por ARTÍCULO primero: su innerText es el post real — el
+            # barrido global de anchors atrapa también el grid
+            # 'Photos See all photos' y ese texto inútil ganaba la
+            # dedup por href (Ahora Noticias 15/oct: su plana de hoy
+            # existía pero solo se veía el módulo de fotos)
             posts = pg.evaluate("""() => {
                 const NL = String.fromCharCode(10), seen = new Set(), out = [];
+                for (const art of document.querySelectorAll(
+                        'div[role="article"]')) {
+                    const t = art.innerText || '';
+                    if (t.length < 40) continue;
+                    const canon = art.querySelector(
+                        'a[href*="/posts/"],a[href*="story_fbid"],'
+                        + 'a[href*="/permalink/"]')
+                        || art.querySelector('a[href*="/photo"]');
+                    if (!canon || seen.has(canon.href)) continue;
+                    seen.add(canon.href);
+                    const own = art.querySelector(
+                        'a[href*="facebook.com/"]'
+                        + ':not([href*="/posts/"]):not([href*="/photos/"])'
+                        + ':not([href*="/photo?"]):not([href*="/reels"])'
+                        + ':not([href*="/watch"]):not([href*="/groups"])'
+                        + ':not([href*="/hashtag"])');
+                    let owner = '';
+                    if (own) {
+                        const seg = own.pathname.split('/')
+                            .filter(Boolean);
+                        owner = seg.length === 1 ? seg[0] : '';
+                    }
+                    let feed_img = '';
+                    for (const im of art.querySelectorAll(
+                            'img[src*="scontent"],'
+                          + 'img[src*="fbcdn"]')) {
+                        if (im.naturalWidth >= 400
+                                && !im.src.includes('emoji')) {
+                            feed_img = im.src; break;
+                        }
+                    }
+                    out.push({href: canon.href, owner: owner,
+                              img: feed_img,
+                              txt: t.split(NL).join(' ').slice(0, 300)});
+                }
+                return out;
+            }""")
+            posts += pg.evaluate("""() => {
+                const NL = String.fromCharCode(10), seen = new Set(
+                    window.__vistos || []), out = [];
                 for (const a of document.querySelectorAll(
                         'a[href*="/posts/"], a[href*="/photos/"], '
                     + 'a[href*="/photo"], a[href*="story_fbid"]')) {
@@ -2010,6 +2331,13 @@ def _bajar_portada_fb(m: dict) -> list:
                 }
                 return out;
             }""")
+        # dedup por href — la entrada de artículo va primero y su
+        # texto es el del post; el anchor suelto del grid de fotos
+        # comparte el mismo href y se descarta aquí
+        _vistos = set()
+        posts = [p_ for p_ in posts
+                 if not (p_["href"] in _vistos
+                         or _vistos.add(p_["href"]))]
         por_texto = False
         cand = []            # [(href, txt)] — TAD puede subir las 2
         # planas en posts SEPARADOS: no cortar en la primera
@@ -2036,16 +2364,24 @@ def _bajar_portada_fb(m: dict) -> list:
             if slug_page and post.get("owner") \
                     and normalizar(post["owner"]) != slug_page:
                 continue        # post 'sugerido' de otra página
-            txt = normalizar(post["txt"])
+            # '#' fuera: '#Jueves 15 de #Octubre' debe casar con la
+            # fecha '15 de octubre' (Ahora, 15/oct — el hashtag la
+            # partía y el post pasaba por viejo/no-fechado)
+            txt = normalizar(post["txt"]).replace("#", " ")
             # el plugin renderiza en EN ó ES según locale del CDN —
             # "3 hours ago"/"3h" vale igual que "hace 3 horas"; pero
             # >8h ya es el post de AYER (las portadas se suben 4-6am)
             _h = re.search(r"(\d+)\s*(?:h|hr|hrs|hora|horas)\b", txt)
             # fb_horas: XEVA sube la plana la tarde anterior (~14h);
-            # el tope default de 8h es para portadas de la madrugada
+            # el tope default de 8h es para portadas de la madrugada.
+            # 'día' SOLO como sello temporal ('1 día', '2d', 'a day
+            # ago', 'ayer') — la palabra en el caption ('empezar tu
+            # día', Ahora 15/oct) no puede tumbar la frescura
             reciente = bool(re.search(
                 r"hace|\bago\b|\d+\s*(h|hr|hrs|hora|horas|min|minute)s?\b",
-                txt)) and not re.search(r"d[ií]a|day|yesterday|ayer", txt) \
+                txt)) and not re.search(
+                r"\bayer\b|\byesterday\b|\b\d+\s*d[ií]as?\b"
+                r"|\b\d+\s*days?\b|\b\d+\s*d\b", txt) \
                 and (not _h
                      or int(_h.group(1)) <= m.get("fb_horas", 8))
             fechas = (normalizar(fecha_txt),              # 5 de octubre
@@ -2140,6 +2476,15 @@ def _bajar_portada_x(m: dict) -> list:
         if not pp or datetime.fromtimestamp(
                 calendar.timegm(pp)).date() != hoy:
             continue                    # solo tweets de hoy
+        # el medio tuitea titulares con foto todo el día — sin este
+        # candado entraban memes/comunicados/fotos de nota como
+        # 'portada' (16/oct: Levi's, FGET, gato). Pasa si el texto
+        # anuncia plana o la imagen misma ya luce de primera plana
+        txt = normalizar(p_.get("summary") or p_.get("title") or "")
+        dice_portada = any(
+            t in txt for t in ("portada", "edicion impresa",
+                               "edicion digital", "primera plana",
+                               "boletin", "hoy en", "contraportada"))
         for mc in p_.get("media_content") or []:
             u = html.unescape(mc["url"])
             u = re.sub(r"name=\w+", "name=large", u) \
@@ -2150,7 +2495,9 @@ def _bajar_portada_x(m: dict) -> list:
             except Exception:
                 continue
             if r.status_code == 200 and len(r.content) > 30000 \
-                    and r.content not in imgs:
+                    and r.content not in imgs and \
+                    (dice_portada or (_es_portada(r.content, 1.15, 1.6)
+                                      and _texto_denso(r.content))):
                 imgs.append(r.content)
         if len(imgs) >= 3:
             break
@@ -2206,10 +2553,43 @@ def scrapear_posts_fb(cfg: dict):
                       if f.get("tipo") == "fb"]
         if not fuentes_fb:
             return
-        links_vistos = {n.get("link", "")
+        # clave canónica del post: /photo dedup por fbid (los params
+        # __cft__/s= cambian por sesión y el mismo post colaba N veces);
+        # el resto por path sin query
+        def _clave_link(u: str) -> str:
+            m = re.search(r"[?&]fbid=(\d+)", u)
+            if m:
+                return "fbid:" + m.group(1)
+            return u.split("?")[0].rstrip("/")
+        links_vistos = {_clave_link(n.get("link", ""))
                         for n in leer_jsonl(NOTICIAS, limite=0)}
         from playwright.sync_api import sync_playwright
         nuevas = 0
+        stats_pag = {}   # página → {x: extraídos, n: nuevos, r: razones}
+
+        def _fecha_fb(lines: list):
+            """Publicación real, no hora de scrapeo: el DOM trae el
+            timestamp relativo ('19 h', '1d', 'a day ago', 'ayer') en
+            las primeras líneas del article."""
+            ahora = datetime.now()
+            for l in lines[:8]:
+                s = normalizar(l)
+                m = re.search(r"(\d+)\s*min\b", s)
+                if m:
+                    return ahora - timedelta(minutes=int(m.group(1)))
+                if re.search(r"an hour ago|hace una hora", s):
+                    return ahora - timedelta(hours=1)
+                m = re.search(r"(\d+)\s*h\b", s)
+                if m:
+                    return ahora - timedelta(hours=int(m.group(1)))
+                if re.search(r"a day ago|hace un dia|ayer", s):
+                    return ahora - timedelta(days=1)
+                m = re.search(r"(\d+)\s*d\b", s)
+                if m:
+                    return ahora - timedelta(days=min(
+                        int(m.group(1)), 14))
+            return ahora
+
         with sync_playwright() as p:
             br = _launch(p)
             pg = br.new_context(
@@ -2295,7 +2675,22 @@ def scrapear_posts_fb(cfg: dict):
                                 .split(String.fromCharCode(10))
                                 .map(s => s.trim())
                                 .filter(Boolean).slice(0, 20);
-                            out.push({href: h, owner, lines});
+                            // fotos del post: adjuntas bajo link
+                            // /photo + imgs grandes (scontent) del
+                            // contenedor — el avatar (≈40px) muere por
+                            // el filtro de tamaño
+                            const imgs = [];
+                            for (const im of n.querySelectorAll(
+                                    'a[href*="/photo"] img,'
+                                  + 'a[href*="/photos"] img,'
+                                  + 'img[src*="scontent"]')) {
+                                const r = im.getBoundingClientRect();
+                                if (r.width > 150 && im.src
+                                        && !imgs.includes(im.src))
+                                    imgs.push(im.src);
+                            }
+                            out.push({href: h, owner, lines,
+                                      imgs: imgs.slice(0, 4)});
                         }
                         return out;
                     }"""
@@ -2317,7 +2712,14 @@ def scrapear_posts_fb(cfg: dict):
                             }
                         return n;
                     }"""
-                    expandir = bool(fuente.get("expandir"))
+                    # perfiles personales también expanden 'Ver más' —
+                    # los comunicados largos (Ochoa Vidal/SUTAPJET)
+                    # llegaban cortados al primer párrafo.
+                    # 15/oct: default ON — nota a medias en Interés le
+                    # resta credibilidad al producto; expandir:false
+                    # queda como opt-out por fuente
+                    expandir = fuente.get("expandir") is not False \
+                        or bool(fuente.get("perfil"))
                     for _ in range(10):
                         pg.evaluate(
                             "for (const el of "
@@ -2341,21 +2743,27 @@ def scrapear_posts_fb(cfg: dict):
                         # FB virtualiza el DOM — los articles vienen y
                         # van; acumular en cada paso o la ventana final
                         # puede quedar VACÍA (10 scrolls → 0 posts)
+                        # última extracción gana — las pasadas
+                        # posteriores al clic en 'Ver más' traen el
+                        # texto completo, no el párrafo truncado
                         for post in pg.evaluate(_JS_EXTRACT):
-                            posts_dict.setdefault(post["href"], post)
+                            posts_dict[post["href"]] = post
                         if n == prev:
                             break
                         prev = n
                     posts = list(posts_dict.values())
-                    for post in posts[:15]:
-                        href = post["href"].split("?")[0].rstrip("/") \
-                            if "/photo" in post["href"] \
-                            else post["href"]
-                        if href in links_vistos or \
-                                post["href"] in links_vistos:
+                    st = stats_pag.setdefault(
+                        fuente["nombre"],
+                        {"x": len(posts), "n": 0, "r": Counter()})
+                    st["x"] = len(posts)
+                    for post in posts[:20]:
+                        clave = _clave_link(post["href"])
+                        if clave in links_vistos:
+                            st["r"]["visto"] += 1
                             continue
                         if slug and post.get("owner") \
                                 and normalizar(post["owner"]) != slug:
+                            st["r"]["ajeno"] += 1
                             continue   # post sugerido de otra página
                         # card de presentación de la página: bio
                         # (seguidores/hablando de esto) sin timestamp —
@@ -2368,26 +2776,52 @@ def scrapear_posts_fb(cfg: dict):
                                 re.search(
                                     r"\b\d+\s*(min|h|d)\b|hace\b|ayer",
                                     l, re.I) for l in _ls):
+                            st["r"]["bio"] += 1
                             continue
+                        # PERFIL personal: filtro duro — su timeline
+                        # mezcla compartidos de otras cuentas, módulos
+                        # sugeridos y bio-cards. Solo pasa si el header
+                        # del post comparte ≥2 tokens con el nombre de
+                        # la cuenta y ninguna línea es boilerplate
+                        if fuente.get("perfil"):
+                            hdr = normalizar(
+                                _ls[0] if _ls else "")
+                            nom = {t for t in normalizar(
+                                fuente["nombre"]).split()
+                                if len(t) > 3}
+                            if len({t for t in hdr.split()
+                                    if t in nom}) < 2:
+                                st["r"]["perfil"] += 1
+                                continue   # post compartido/ajeno
+                            if any(re.search(
+                                    r"seguidores|hablando de esto|"
+                                    r"informaci[oó]n de contacto|"
+                                    r"indicador de estado", l, re.I)
+                                    for l in _ls):
+                                st["r"]["bio"] += 1
+                                continue   # bio-card con timestamp
                         # lines[0] es el encabezado-autor del article
                         # (nombre público de la página — no el caption)
                         titulo, cuerpo = _texto_post(
                             post["lines"][1:] or [], fuente["nombre"])
                         if len(titulo) < 25:
+                            st["r"]["sin-texto"] += 1
                             continue   # post sin texto útil
                         req = fuente.get("requiere")
                         if req and normalizar(req) not in normalizar(
                                 f"{titulo} {cuerpo}"):
+                            st["r"]["requiere"] += 1
                             continue   # la página mezcla columnas —
                             # solo las marcadas (ej. 'templo mayor')
                         clave_t = normalizar(titulo)[:80]
                         if clave_t in textos_vistos:
+                            st["r"]["dup"] += 1
                             continue   # mismo post por otro permalink
                         textos_vistos.add(clave_t)
-                        links_vistos.add(post["href"])
-                        links_vistos.add(href)
+                        links_vistos.add(clave)
                         guardar_noticia({
-                            "fecha": datetime.now()
+                            "fecha": _fecha_fb(
+                                post.get("lines", []))
                             .isoformat(timespec="seconds"),
                             "fuente": fuente["nombre"],
                             "via": "", "categoria": fuente.get(
@@ -2397,14 +2831,38 @@ def scrapear_posts_fb(cfg: dict):
                             "titulo": titulo,
                             "resumen": cuerpo,
                             "link": post["href"],
-                            "imagen": ""})
+                            "imagen": (post.get("imgs")
+                                       or [""])[0]})
                         nuevas += 1
+                        st["n"] += 1
                 except Exception as e:
                     print(f"[fb-posts] {fuente['nombre']}: {e}")
                 pg.wait_for_timeout(4000)   # respiro entre páginas
             br.close()
-        print(f"[fb-posts] {nuevas} posts nuevos "
-              f"de {len(fuentes_fb)} páginas")
+        # telemetría: sin esto '0 nuevos' no distingue páginas vacías
+        # (sesión muerta) de filtros que todo lo rechazan — /salud lo
+        # muestra y el log resume los motivos dominantes
+        try:
+            vacias = [k for k, v in stats_pag.items() if not v["x"]]
+            razones = Counter()
+            for v in stats_pag.values():
+                razones.update(v["r"])
+            print(f"[fb-posts] {nuevas} posts nuevos "
+                  f"de {len(fuentes_fb)} páginas"
+                  f" ({len(vacias)} vacías"
+                  + (f", rechazos: {dict(razones)}"
+                     if razones else "") + ")")
+            est = cargar_json(ESTADO_PORTADAS, {})
+            est["fb_posts"] = {
+                "fecha": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "nuevas": nuevas, "vacias": vacias,
+                "razones": dict(razones),
+                "paginas": {k: {"x": v["x"], "n": v["n"],
+                                "r": dict(v["r"])}
+                            for k, v in stats_pag.items()}}
+            _guardar_portadas(est)
+        except Exception as e:
+            print(f"[fb-posts] telemetría: {e}")
     finally:
         _FB_POSTS_CORRIENDO = False
 
@@ -2500,16 +2958,25 @@ def _portada_fecha(m: dict) -> list:
         cands = [f"{base}/{h.year}-{h.month:02d}-{h.day:02d}/"]
         if "{" in m["edicion"]:
             # plantilla con fecha: issuu.com/lajornadaonline/
-            # docs/diario{ddmmyyyy} → diario08102026
+            # docs/diario{ddmmyyyy} → diario08102026; Momento Tabasco
+            # /uploads/{yyyy}/{mm}/TABASCO-{ddmmyy}.webp → imagen directa
             cands.insert(0, m["edicion"].format(
                 ddmmyyyy=f"{h.day:02d}{h.month:02d}{h.year}",
                 yyyymmdd=f"{h.year}{h.month:02d}{h.day:02d}",
-                ddmmaa=f"{h.day:02d}{h.month:02d}{h.year % 100:02d}"))
+                ddmmaa=f"{h.day:02d}{h.month:02d}{h.year % 100:02d}",
+                yyyy=f"{h.year}", mm=f"{h.month:02d}",
+                ddmmyy=f"{h.day:02d}{h.month:02d}{h.year % 100:02d}"))
         try:
             url_idx = cands[0] if "{" in m["edicion"] else m["edicion"]
             idx = requests.get(url_idx, timeout=15, headers=UA)
         except Exception:
             idx = None
+        # la plantilla resolvió a la imagen misma — la fecha ya va
+        # implícita en la URL (solo existe la de hoy, ayer da 404)
+        if idx is not None and idx.status_code == 200 \
+                and (idx.headers.get("content-type") or "").startswith(
+                    "image/") and len(idx.content) > 30000:
+            return [idx.content]
         if idx is not None and idx.status_code == 200:
             # 1) imagen fechada ya en la página (caso Diario de Tabasco) —
             #    aquí exigimos la fecha: el índice puede reciclar el
@@ -3046,7 +3513,8 @@ def _medio_listo(m: dict, base: Path, tardia: bool) -> bool:
     return True
 
 
-def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
+def _captura_medio(m: dict, base: Path, tardia: bool,
+                   cfg: dict = None) -> bool:
     """Intenta las estrategias del medio. `tardia` = pase cercano al
     cierre (≥ hora_web): recién ahí se tiran screenshots web — a las
     00:30 la homepage todavía muestra la portada de ayer o popups de
@@ -3103,7 +3571,9 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
             try:
                 _shot_img_mayor(m["pr"], png_pr, _tokens_fecha())
                 if _img_ok(png_pr) and png_pr.stat().st_size > 40000 \
-                        and not _misma_img_ayer(png_pr, base.name):
+                        and not _misma_img_ayer(png_pr, base.name) \
+                        and _vision_es_portada(
+                            cfg, png_pr.read_bytes()) is not False:
                     tiene_impresa = True
                 else:
                     png_pr.unlink(missing_ok=True)
@@ -3130,14 +3600,21 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
                 # forma 1.15 para fb/edicion (portadas reales llegan a
                 # 1.26 — Sol del Sureste 11/oct); fb además exige
                 # densidad de texto (memes/fotos de feed se cuelan)
-                if _img_ok(f) \
+                # visión SOLO si pasó las guardas baratas — un meme ya
+                # rechazado no debe gastar una llamada a Gemini
+                guardas = _img_ok(f) \
                         and ((not src_fb and not src_edic)
                              or _es_portada(d, 1.15)) \
                         and (not src_fb or _texto_denso(d)) \
                         and not _misma_img_ayer(f, f.stem) \
-                        and not _img_repetida_hoy(f, base.name):
+                        and not _img_repetida_hoy(f, base.name) \
+                        and not _img_repetida_propia(f, base.name)
+                vis = _vision_es_portada(cfg, d) if guardas else None
+                if guardas and vis is not False:
                     n_ok += 1
                 else:
+                    print(f"[portadas] {m['nombre']} ✗ candidata "
+                          f"descartada — guardas={guardas} visión={vis}")
                     f.unlink(missing_ok=True)
             tiene_impresa = n_ok > 0
         elif tiene_impresa:
@@ -3149,6 +3626,10 @@ def _captura_medio(m: dict, base: Path, tardia: bool) -> bool:
             # El Día cuelga el PDF de AYER hasta después de la 1am —
             # mismo guard que PR: si es la edición de ayer, no vale
             if ok and _misma_img_ayer(png, base.name):
+                png.unlink(missing_ok=True)
+                ok = False
+            if ok and _vision_es_portada(
+                    cfg, png.read_bytes()) is False:
                 png.unlink(missing_ok=True)
                 ok = False
             tiene_impresa = ok and _img_ok(png)
@@ -3334,6 +3815,69 @@ def _texto_denso(b: bytes) -> bool:
         return False
 
 
+def _img_repetida_propia(nuevo: Path, propio: str) -> bool:
+    """La misma imagen ya quedó guardada HOY del MISMO medio a otra
+    resolución — FB sirve la plana dos veces (feed + visor) y el 15/oct
+    xhvx.jpg y xhvx-3.jpg eran la misma plana. Misma comparación visual
+    64×64 de _img_repetida_hoy pero solo contra los archivos propios."""
+    try:
+        a = Image.open(nuevo).convert("L").resize((64, 64))
+        pa = list(a.getdata())
+    except Exception:
+        return False
+    for f in sorted(nuevo.parent.glob(f"{propio}*.*")):
+        if f == nuevo or f.suffix not in (".jpg", ".png"):
+            continue
+        try:
+            b = Image.open(f).convert("L").resize((64, 64))
+            diff = sum(abs(p - q) for p, q in zip(pa, b.getdata()))
+            if diff / (64 * 64) < 8:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _vision_es_portada(cfg: dict, b: bytes):
+    """Gemini vision: ¿es una primera plana? Veredicto final para TODA
+    imagen candidata — ratio + densidad no distinguen flyer de plana
+    (15/oct: flyer de Melania y comunicados SEDENA/secundaria colados
+    como portada por XHVX/XEVT). Regresa True/False; None si no se pudo
+    consultar → NO bloquea la imagen."""
+    if not cfg or not _gemini_key(cfg):
+        return None
+    mime = "image/png" if b[:4] == b"\x89PNG" else "image/jpeg"
+    try:
+        r = requests.post(
+            "https://generativelanguage.googleapis.com/v1beta/"
+            f"models/{cfg['gemini'].get('modelo', 'gemini-3.1-flash-lite')}"
+            ":generateContent",
+            params={"key": _gemini_key(cfg)},
+            json={"contents": [{"parts": [
+                {"text": "¿Esta imagen es la PORTADA o PRIMERA PLANA "
+                         "de un medio de noticias — un diario impreso "
+                         "O la portada digital de un noticiero "
+                         "(cabecera del medio, fecha o número de "
+                         "edición y varios titulares/notas)? "
+                         "Comunicados, flyers, promocionales, memes o "
+                         "fotos sueltas NO son portadas. "
+                         "Responde solo SI o NO."},
+                {"inline_data": {"mime_type": mime,
+                                 "data": base64.b64encode(b).decode()}
+                 }]}]},
+            timeout=60)
+        parts = (r.json()["candidates"][0]["content"].get("parts") or [])
+        txt = "".join(p.get("text", "") for p in parts
+                      if not p.get("thought")).strip().lower()
+        if txt.startswith(("si", "sí")):
+            return True
+        if txt.startswith("no"):
+            return False
+        return None
+    except Exception:
+        return None
+
+
 def _ultima_img_previa(nombre_base: str):
     """Última imagen de este medio en días anteriores — camina hasta 10
     días hacia atrás. Si ayer no se capturó NADA (medio sin edición el
@@ -3421,18 +3965,28 @@ def capturar_portadas(cfg: dict):
         # publicación de cada medio
         limite = (ahora - timedelta(days=7)).strftime("%Y-%m-%d")
         evs = [e for e in est.get("eventos", []) if e.get("d") >= limite]
+        stale = False
         try:
-            ok = bool(_captura_medio(m, base, tardia))
+            ok = bool(_captura_medio(m, base, tardia, cfg))
+            if ok and _img_repetida(base, ahora):
+                ok, stale = False, True
         except Exception:
             ok = False
-        evs.append({"d": hoy, "t": ahora.strftime("%H:%M"),
-                    "m": m["nombre"], "ok": ok})
+        ev = {"d": hoy, "t": ahora.strftime("%H:%M"),
+              "m": m["nombre"], "ok": ok}
+        if stale:
+            ev["stale"] = True   # kiosko&co repitieron la plana de ayer
+        evs.append(ev)
         est["eventos"] = evs[-3000:]
         _guardar_portadas(est)
         if not ok:
             fallos.append(m["nombre"])
     print(f"[portadas] corrida{' tardía' if tardia else ''}, "
           f"pendientes fallidos: {fallos or 'ninguno'}")
+    # salud de fuentes: 1 cálculo diario (recorre noticias.jsonl)
+    if est.get("salud", {}).get("fecha") != ahora.strftime("%Y-%m-%d"):
+        est["salud"] = _salud_fuentes(cfg, ahora)
+        _guardar_portadas(est)
     escribir_schedule_portadas(cfg)   # refresca línea de tiempo
 
 
@@ -3443,7 +3997,7 @@ def _cada_efectivo(m: dict, port: dict, ahora: datetime = None) -> int:
     cada = int(m.get("cada_min", 55))
     ahora = ahora or datetime.now()
     ahora_m = ahora.hour * 60 + ahora.minute
-    fin1 = _hhmm(port, "hora_pdf", "06:45")
+    fin1 = _hora_pdf_hoy(port, ahora)
     # antes del 1er PDF: rampa a tope (los lentos tienen más chances);
     # después: modo tranquilo — 30 min fijos hasta el cierre, no hace
     # falta martillar FB/kiosko cada 5 min para el 2º PDF
@@ -3455,6 +4009,70 @@ def _cada_efectivo(m: dict, port: dict, ahora: datetime = None) -> int:
     if restan <= 90:
         return min(cada, 20)
     return cada
+
+
+def _img_repetida(base: Path, ahora: datetime) -> bool:
+    """Kiosko&co sirven 'la última publicada': un medio sin edición de
+    hoy (festivo, edición tardía) regresa el archivo de ayer byte por
+    byte — Expreso guardó la de DOMINGO un lunes. True si la captura es
+    idéntica a la de ayer → se borra y el medio queda pendiente (puede
+    publicar tarde)."""
+    hoy = _portada_img(base.name, base.parent)
+    ayer = _portada_img(base.name, _dir_dia(ahora - timedelta(days=1)))
+    if not (hoy.exists() and ayer.exists()):
+        return False
+    if hoy.read_bytes() != ayer.read_bytes():
+        return False
+    print(f"[portadas] {base.name}: imagen idéntica a la de ayer — "
+          "descartada como 'sin edición de hoy'")
+    hoy.unlink()
+    return True
+
+
+def _salud_fuentes(cfg: dict, ahora: datetime) -> dict:
+    """Días sin publicar por fuente activa — una fuente callada suele
+    ser feed roto, login-wall o sitio muerto (así se descubre sin que
+    alguien la revise a mano). Umbrales: rss/html/x ≥3 días, fb ≥7
+    (sus posts se barren cada ~4 h y hay páginas que postean poco)."""
+    ult = {}
+    try:
+        for n in leer_jsonl(NOTICIAS, limite=0):
+            f, fe = n.get("fuente"), n.get("fecha") or ""
+            if f and fe > ult.get(f, ""):
+                ult[f] = fe
+    except Exception:
+        pass
+    calladas, vistos = [], set()
+    activas = [f for f in cfg.get("fuentes", [])
+               if f.get("activa") is not False]
+    # x:home atribuye sus notas al @autor — su 'última' es la más
+    # reciente de cualquier nota @
+    ult_radar = max((fe for f, fe in ult.items() if f.startswith("@")),
+                    default="")
+    for f in activas:
+        nom = f.get("nombre") or f.get("url", "")
+        if nom in vistos:        # fuentes duplicadas en cfg: 1 reporte
+            continue
+        vistos.add(nom)
+        if f.get("tipo") == "x":
+            if str(f.get("url", "")).lower().startswith("x:home"):
+                fe = ult_radar
+            else:   # las notas de un handle guardan fuente='@handle'
+                fe = ult.get("@" + _handle_x(f.get("url", "")), "")
+        else:
+            fe = ult.get(nom, "")
+        try:
+            dias = (ahora - datetime.fromisoformat(fe[:19])).days
+        except Exception:
+            dias = -1            # jamás ha dado una nota
+        umbral = 7 if f.get("tipo") == "fb" else 3
+        if dias < 0 or dias >= umbral:
+            calladas.append({"f": nom, "dias": dias,
+                             "tipo": f.get("tipo", "rss"),
+                             "ult": fe[:16] or "—"})
+    calladas.sort(key=lambda x: x["dias"])
+    return {"fecha": ahora.strftime("%Y-%m-%d"),
+            "activas": len(activas), "calladas": calladas}
 
 
 def _merge_eventos(a: list, b: list) -> list:
@@ -3726,14 +4344,19 @@ def _ventana_medio(m: dict, port: dict) -> tuple:
                   ("kiosko", "fb", "issuu", "flip", "pr", "pdf",
                    "edicion", "json", "calameo", "flowpaper"))
     desde = _min(m.get("cap_desde") or port.get("hora_desde", "00:30"))
-    hasta = _min(m.get("cap_hasta") or port.get(
-        "hora_cierre", port.get("hora_pdf", "06:45")))
+    hasta = _min(m.get("cap_hasta") or port.get("hora_cierre")
+                 or port.get("hora_pdf", "06:30"))
+    hasta = max(hasta, _hora_pdf_hoy(port))
     if not impresa:
         desde = max(desde, _hhmm(port, "hora_web", "05:45"))
     return desde, hasta
 
 
 def _en_ventana(m: dict, port: dict, ahora_m: int) -> bool:
+    # pausa de un solo día (ej. el medio no publicó hoy) — la fecha
+    # vencida queda inerte, no hay que quitarla
+    if m.get("skip_hoy") == datetime.now().strftime("%Y-%m-%d"):
+        return False
     desde, hasta = _ventana_medio(m, port)
     return desde <= ahora_m <= hasta
 
@@ -4131,18 +4754,34 @@ def _hhmm(port: dict, clave: str, default: str) -> int:
         return hh * 60 + mm
 
 
+def _dia_portadas(port: dict, ahora: datetime = None) -> bool:
+    """False los días sin corrida — dias_off=[6] apaga los domingos."""
+    ahora = ahora or datetime.now()
+    return ahora.weekday() not in (port.get("dias_off") or [])
+
+
+def _hora_pdf_hoy(port: dict, ahora: datetime = None) -> int:
+    """Minutos de la hora del PDF: sábado puede correr más tarde
+    (hora_pdf_sab) — los medios publican la impresa más tarde."""
+    ahora = ahora or datetime.now()
+    if ahora.weekday() == 5 and port.get("hora_pdf_sab"):
+        return _hhmm(port, "hora_pdf_sab", "09:00")
+    return _hhmm(port, "hora_pdf", "06:30")
+
+
 def toca_captura_portadas(cfg: dict) -> bool:
     """Ventana de recolección [hora_desde, hora_cierre): corre cada ~55 min
     mientras falte algún medio — kiosko sale de madrugada, FB a las
     00:0x, issuu/pdf cuando lo suban."""
     port = cfg.get("portadas", {})
     medios = port.get("medios", [])
-    if not medios:
+    if not medios or not _dia_portadas(port):
         return False
     ahora = datetime.now()
+    cierre = max(_hhmm(port, "hora_cierre", "08:45"),
+                 _hora_pdf_hoy(port, ahora))
     if not (_hhmm(port, "hora_desde", "00:30")
-            <= ahora.hour * 60 + ahora.minute
-            < _hhmm(port, "hora_cierre", "08:45")):
+            <= ahora.hour * 60 + ahora.minute < cierre):
         return False
     ahora_m = ahora.hour * 60 + ahora.minute
     tardia = ahora_m >= _hhmm(port, "hora_web", "05:45")
@@ -4171,14 +4810,15 @@ def marcar_captura_portadas():
 
 
 def toca_pdf_portadas(cfg: dict) -> bool:
-    """hora_pdf (06:45) → arma PDFs + envía una vez al día."""
+    """hora_pdf (06:30; sábado hora_pdf_sab) → arma PDFs + envía
+    una vez al día."""
     port = cfg.get("portadas", {})
-    if not port.get("medios"):
+    if not port.get("medios") or not _dia_portadas(port):
         return False
     ahora = datetime.now()
     est = cargar_json(ESTADO_PORTADAS, {})
     return est.get("pdf_fecha") != ahora.strftime("%Y-%m-%d") and \
-        ahora.hour * 60 + ahora.minute >= _hhmm(port, "hora_pdf", "06:45")
+        ahora.hour * 60 + ahora.minute >= _hora_pdf_hoy(port, ahora)
 
 
 def toca_pdf_portadas2(cfg: dict) -> bool:
@@ -4187,7 +4827,8 @@ def toca_pdf_portadas2(cfg: dict) -> bool:
     de hora_pdf — si el servicio estuvo caído, el 1er PDF tiene
     prioridad."""
     port = cfg.get("portadas", {})
-    if not port.get("medios") or not port.get("hora_pdf2"):
+    if not port.get("medios") or not port.get("hora_pdf2") \
+            or not _dia_portadas(port):
         return False
     ahora = datetime.now()
     hoy = ahora.strftime("%Y-%m-%d")
@@ -4201,6 +4842,8 @@ def toca_pdf_portadas2(cfg: dict) -> bool:
 def toca_limpia_portadas(cfg: dict) -> bool:
     """hora_limpia (19:00) → depura las imágenes del día."""
     port = cfg.get("portadas", {})
+    if not _dia_portadas(port):
+        return False
     ahora = datetime.now()
     est = cargar_json(ESTADO_PORTADAS, {})
     return est.get("limpia_fecha") != ahora.strftime("%Y-%m-%d") and \
@@ -4250,7 +4893,31 @@ def vista_portadas(sec: str, dia: str = "") -> str:
     port = cfg.get("portadas", {})
     medios = [m for m in port.get("medios", [])
               if m.get("seccion", "nacional") == sec]
-    ultima = cargar_json(ESTADO_PORTADAS, {}).get("pdf_fecha", "")
+    est_v = cargar_json(ESTADO_PORTADAS, {})
+    ultima = est_v.get("pdf_fecha", "")
+    # avisos de salud: sesión FB caída + fuentes calladas (cálculo
+    # diario de _salud_fuentes — así se ve sin abrir logs)
+    hoy_s = datetime.now().strftime("%Y-%m-%d")
+    avisos = ""
+    fb_st = est_v.get("fb_sesion", {})
+    if fb_st.get("estado") == "caida" and fb_st.get("alertado") == hoy_s:
+        avisos += ("<p class='meta' style='color:#b71c1c'>⚠ Sesión de "
+                   "Facebook caída — corre fb_login.py; las capturas FB "
+                   "salen anónimas mientras.</p>")
+    if est_v.get("x_sesion", {}).get("estado") == "caida":
+        avisos += ("<p class='meta' style='color:#b71c1c'>⚠ Sesión de "
+                   "X caída — corre x_login.py; XEVT queda sin portada "
+                   "y el radar X vacío.</p>")
+    sal = est_v.get("salud", {})
+    call = sal.get("calladas") or []
+    if call:
+        lista = ", ".join(
+            f"{c['f']} ({'nunca' if c['dias'] < 0 else str(c['dias']) + 'd'})"
+            for c in call[:10])
+        avisos += (f"<p class='meta' style='color:#d97706'>Fuentes "
+                   f"calladas — {len(call)} de {sal.get('activas', '?')} "
+                   f"activas sin notas: {lista}"
+                   f"{'…' if len(call) > 10 else ''}</p>")
     # día seleccionado (?dia=oct/06) — default hoy
     dia_sel = dia if re.fullmatch(r"[a-z]{3}/\d{2}", dia) \
         else str(_dir_dia().relative_to(PORTADAS_DIR))
@@ -4285,13 +4952,22 @@ def vista_portadas(sec: str, dia: str = "") -> str:
             "loading='lazy' "
             "style='width:100%;border-radius:6px;margin:.15rem 0 .4rem'>"
             if p.exists() else "")
-        es_hoy = dia_sel == str(_dir_dia().relative_to(PORTADAS_DIR))
         if not img_f.exists():
-            if not es_hoy:
-                continue   # días pasados: medio sin portada no aporta
-            img = "<p class='meta'>Aún sin publicar.</p>"
-        else:
-            img = tag(img_f, "Impresa") + tag(web_f, "Web")
+            continue   # pendientes no se muestran — al publicar, la
+            # portada aparece sola con badge RECIENTE 15 min
+        reciente = ""
+        if datetime.now().timestamp() - img_f.stat().st_mtime < 900:
+            reciente = (" <span style='background:#2e7d32;color:#fff;"
+                        "font-size:.65rem;font-weight:700;padding:1px "
+                        "7px;border-radius:9px;vertical-align:2px'>"
+                        "RECIENTE</span>")
+        img = tag(img_f, "Impresa")
+        # extras de FB/posts (segunda portada, contra, interior) —
+        # el PDF ya las lleva, la vista no las mostraba
+        for i, ex in enumerate(
+                sorted(dir_sel.glob(f"{slug}-[0-9].jpg")), 2):
+            img += tag(ex, f"Impresa {i}")
+        img += tag(web_f, "Web")
         # medios solo-FB (El Sol del Sureste) no tienen 'url' — el
         # link apunta a su fanpage; sin ninguna fuente se omite
         url_m = m.get("url") or m.get("fb") or ""
@@ -4300,7 +4976,7 @@ def vista_portadas(sec: str, dia: str = "") -> str:
                   "style='display:block;margin:.15rem 0'>"
                   "abrir en el medio ↗</a>" if url_m else "")
         cards += (f"<div class='card' style='border-left-color:#7b1fa2'>"
-                  f"<b>{html.escape(m['nombre'])}</b>"
+                  f"<b>{html.escape(m['nombre'])}</b>{reciente}"
                   f"{link_m}{img}</div>")
     pdf_block = (f"<p class='meta'>PDFs: {links_pdf}</p>"
                  if links_pdf
@@ -4310,7 +4986,134 @@ def vista_portadas(sec: str, dia: str = "") -> str:
             f"{tabs}{tabs_dia}"
             f"<p class='meta'>Capturas del {ultima or '—'} · se regeneran a "
             f"las {html.escape(port.get('hora', '06:30'))}.</p>"
-            + pdf_block + cards)
+            + avisos + pdf_block + cards)
+
+
+def vista_salud() -> str:
+    """Tab Salud (admin): diagnóstico del sistema sin abrir logs —
+    sesiones de terceros, medios de portadas que repiten/fallan y
+    fuentes de notas calladas."""
+    cfg = json.loads(CONFIG.read_text())
+    est = cargar_json(ESTADO_PORTADAS, {})
+    ahora = datetime.now()
+    hoy_s = ahora.strftime("%Y-%m-%d")
+    out = ["<h1>Salud del sistema</h1>"]
+
+    # ── sesiones de terceros ──
+    def _sesion(nom, path, extra=""):
+        if not path.exists():
+            return (f"<tr><td>{nom}</td><td style='color:#b71c1c'>"
+                    f"SIN ARCHIVO</td><td>—</td><td>{extra}</td></tr>")
+        edad = int((time.time() - path.stat().st_mtime) / 86400)
+        color = "#0a7a2f" if edad <= 2 else "#d97706"
+        return (f"<tr><td>{nom}</td><td style='color:{color}'>"
+                f"{'ok' if edad <= 2 else 'vieja'}</td>"
+                f"<td>hace {edad}d</td><td>{extra}</td></tr>")
+    fb_extra = ""
+    if est.get("fb_sesion", {}).get("estado") == "caida" \
+            and est["fb_sesion"].get("alertado") == hoy_s:
+        fb_extra = ("<b style='color:#b71c1c'>CHECKPOINT HOY</b> — "
+                    "corre fb_login.py")
+    x_extra = ""
+    if est.get("x_sesion", {}).get("estado") == "caida":
+        x_extra = ("<b style='color:#b71c1c'>LOGIN-WALL</b> — "
+                   "corre x_login.py (radar X vacío, XEVT sin captura)")
+    ses = ("<h2>Sesiones</h2><table><tr><th>Sesión</th><th>Estado</th>"
+           "<th>Edad</th><th>Nota</th></tr>"
+           + _sesion("FB · juan (portadas)", FB_SESSION, fb_extra)
+           + _sesion("FB · chucky (posts)", FB_SESSION_REDES)
+           + _sesion("X · @elpolidelanoche", X_SESSION, x_extra)
+           + "</table>")
+    out.append(ses)
+
+    # ── chucky: rendimiento del barrido de posts ──
+    fbp = est.get("fb_posts") or {}
+    if fbp:
+        pags = fbp.get("paginas", {})
+        cero = [k for k, v in pags.items()
+                if v["x"] and not v["n"]]
+        rz = " · ".join(f"{k}: {v}" for k, v in
+                        (fbp.get("razones") or {}).items())
+        filas_p = "".join(
+            f"<tr><td>{html.escape(k)}</td><td>{v['x']}</td>"
+            f"<td>{' · '.join(f'{a}:{b}' for a, b in v['r'].items()) or '—'}"
+            f"</td></tr>"
+            for k, v in sorted(pags.items(),
+                               key=lambda kv: -kv[1]["x"])
+            if v["x"] and not v["n"])
+        out.append(
+            f"<h2>Chucky · posts FB</h2>"
+            f"<p class='meta'>última pasada {fbp.get('fecha', '?')} — "
+            f"{fbp.get('nuevas', 0)} nuevos · rechazos: {rz or '—'}</p>"
+            + (f"<p><b style='color:#b71c1c'>{len(fbp.get('vacias', []))}"
+               f" páginas vacías</b> (0 posts extraídos = sesión muerta "
+               f"o página sin feed): "
+               f"{html.escape(', '.join(fbp.get('vacias', [])[:20]))}"
+               + ("…" if len(fbp.get('vacias', [])) > 20 else "")
+               + "</p>" if fbp.get("vacias") else "")
+            + (f"<details><summary>{len(cero)} páginas extrajeron "
+               f"pero nada pasó los filtros</summary>"
+               f"<table><tr><th>Página</th><th>Extraídos</th>"
+               f"<th>Rechazos</th></tr>{filas_p}</table></details>"
+               if cero else ""))
+
+    # ── portadas: semana en problemas ──
+    evs = [e for e in est.get("eventos", [])
+           if e.get("d", "") >=
+           (ahora - timedelta(days=7)).strftime("%Y-%m-%d")]
+    stale = sorted({e["m"] for e in evs if e.get("stale")})
+    ok_dia = {(e["m"], e["d"]) for e in evs if e.get("ok")}
+    # faltas por medio: días del último rango sin captura exitosa.
+    # 'hoy' se excluye — la edición puede estar aún en ventana; y
+    # dias_off (domingo) no cuenta como inasistencia
+    dias7 = [(ahora - timedelta(days=k)).strftime("%Y-%m-%d")
+             for k in range(1, 8)]
+    faltas = []
+    off = set(cfg["portadas"].get("dias_off") or [])
+    for m in cfg["portadas"]["medios"]:
+        faltan = [d[5:] for d in dias7
+                  if datetime.strptime(d, "%Y-%m-%d").weekday() not in off
+                  and (m["nombre"], d) not in ok_dia]
+        if faltan:
+            faltas.append((m["nombre"], faltan))
+    faltas.sort(key=lambda x: -len(x[1]))
+    bloque = "<h2>Portadas · 7 días</h2><table>"
+    if stale:
+        bloque += (f"<tr><td><b>Plana repetida (stale)</b></td>"
+                   f"<td style='color:#d97706'>{', '.join(stale)}</td>"
+                   "</tr>")
+    if faltas:
+        bloque += ("<tr><th>Medio</th><th>Faltas</th>"
+                   "<th>Fechas sin portada</th></tr>"
+                   + "".join(
+                       f"<tr><td>{html.escape(nom)}</td>"
+                       f"<td style='color:#b71c1c'><b>{len(f)}</b></td>"
+                       f"<td class='meta'>{', '.join(f)}</td></tr>"
+                       for nom, f in faltas))
+    else:
+        bloque += "<tr><td>Sin faltas en la semana</td></tr>"
+    bloque += "</table>"
+    out.append(bloque)
+
+    # ── fuentes calladas ──
+    sal = est.get("salud") or _salud_fuentes(cfg, ahora)
+    call = sal.get("calladas", [])
+    filas = "".join(
+        f"<tr><td>{html.escape(c['f'])}</td><td>{c['tipo']}</td>"
+        f"<td style='color:{'#b71c1c' if c['dias'] < 0 else '#d97706'}'>"
+        f"{'nunca' if c['dias'] < 0 else str(c['dias']) + ' días'}</td>"
+        f"<td class='meta'>{html.escape(c.get('ult', '—'))}</td></tr>"
+        for c in call)
+    out.append(
+        f"<h2>Fuentes calladas — {len(call)} de "
+        f"{sal.get('activas', '?')} activas</h2>"
+        f"<p class='meta'>umbrales: rss/html/x ≥3 días sin nota · "
+        f"fb ≥7 días · 'nunca' = jamás ha producido (feed roto o "
+        f"nombre desajustado) · calculado {sal.get('fecha', '?')}</p>"
+        + (f"<table><tr><th>Fuente</th><th>Tipo</th><th>Sin notas</th>"
+           f"<th>Última</th></tr>{filas}</table>" if filas
+           else "<p>Todas las fuentes activas producen.</p>"))
+    return "".join(out)
 
 
 def aplicar_accion_horarios(form: dict) -> str:
@@ -4516,13 +5319,13 @@ PAGINA = """<!DOCTYPE html>
 <meta property="og:site_name" content="@noticias">
 <meta property="og:title" content="{og_title}">
 <meta property="og:description" content="{og_desc}">
-<meta property="og:image" content="{base}/og.png">
-<meta property="og:image:width" content="1376">
-<meta property="og:image:height" content="768">
+<meta property="og:image" content="{og_img}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="{og_title}">
 <meta name="twitter:description" content="{og_desc}">
-<meta name="twitter:image" content="{base}/og.png">
+<meta name="twitter:image" content="{og_img}">
 <title>@noticias — Síntesis de prensa</title>
 <style>
   * {{ box-sizing: border-box; }}
@@ -4540,6 +5343,10 @@ PAGINA = """<!DOCTYPE html>
   .nav-tabs a {{ color: #c5cae9; text-decoration: none; font-size: 1rem;
          padding: .55rem .7rem; border-radius: 6px; white-space: nowrap; }}
   .nav-tabs a:hover, .nav-tabs a:active {{ color: #fff; background: #3949ab; }}
+  .nav-tabs a.on {{ color: #fff; background: #3949ab; font-weight: 700; }}
+  .tab-badge {{ display: inline-block; min-width: 1.05rem; margin-left: .35rem;
+       padding: .05rem .32rem; border-radius: 9px; background: #e53935;
+       color: #fff; font-size: .68rem; font-weight: 700; text-align: center; }}
   .salir-top {{ color: #7986cb; text-decoration: none; font-size: .9rem;
       padding: .5rem .2rem .5rem .6rem; white-space: nowrap; }}
   .salir-top:active {{ color: #fff; }}
@@ -4570,6 +5377,17 @@ PAGINA = """<!DOCTYPE html>
   .card::after {{ content: ""; display: table; clear: both; }}
   .card img.thumb {{ width: 78px; height: 78px; object-fit: cover;
                    border-radius: 6px; float: right; margin: 0 0 .4rem .9rem; }}
+  /* cluster de Interés: mosaico 2×2 en el mismo slot del thumb */
+  .thumb-grid {{ float: right; width: 78px; height: 78px;
+      display: grid; grid-template-columns: 1fr 1fr;
+      grid-template-rows: 1fr 1fr; gap: 2px; border-radius: 6px;
+      overflow: hidden; margin: 0 0 .4rem .9rem; }}
+  .thumb-grid img {{ width: 100%; height: 100%; object-fit: cover; }}
+  .card.grupo {{ border-left-color: #455a64; }}
+  .grupo-item {{ display: block; padding: .45rem 0;
+      border-top: 1px solid #eee; text-decoration: none;
+      color: #263238; font-size: .85rem; line-height: 1.35; }}
+  .grupo-item:hover {{ background: #f5f7fa; }}
   .card.top img.thumb {{ width: 110px; height: 84px; }}
   .card .meta {{ color: #666; font-size: .85rem; margin-bottom: .2rem; }}
   .card .titulo {{ font-weight: 600; display: block; margin: .15rem 0; }}
@@ -4852,11 +5670,30 @@ document.addEventListener('click', function(e) {{
              ? 'Buscando...' : 'Cargando nota...');
   showLoader(msg);
 }});
+// tab activo: marca el link del nav según la ruta actual
+var _mapa = {{'/':'/noticias','/nota':'/noticias','/buscar':'/noticias',
+             '/destacadas':'/noticias','/schedule':'/portadas'}};
+var _tab = _mapa[location.pathname] || location.pathname;
+document.querySelectorAll('.nav-tabs a').forEach(function(a) {{
+  if (a.getAttribute('href') === _tab) a.classList.add('on');
+}});
 // Contador en el ícono anclado (Badging API; solo aplica si la PWA
 // está instalada en el menú de inicio — en navegador normal se ignora)
+// + globito por tab con notas nuevas desde la última visita a cada una
 fetch("/badge").then(r => r.json()).then(d => {{
   if ("setAppBadge" in navigator)
     d.n ? navigator.setAppBadge(d.n) : navigator.clearAppBadge();
+  var t = d.t || {{}};
+  document.querySelectorAll('.nav-tabs a').forEach(function(a) {{
+    var n = t[a.getAttribute('href')];
+    var old = a.querySelector('.tab-badge'); if (old) old.remove();
+    if (n) {{
+      var b = document.createElement('span');
+      b.className = 'tab-badge';
+      b.textContent = n > 99 ? '99+' : n;
+      a.appendChild(b);
+    }}
+  }});
 }}).catch(() => {{}});
 </script>
 </body></html>"""
@@ -4970,6 +5807,53 @@ def badge_count(email: str) -> int:
                and a["fecha"] > visto)
 
 
+def badge_counts(email: str) -> dict:
+    """Globitos por tab: notas nuevas desde la última visita a cada
+    sección. 'n' = alertas (Badging API); 't' = {ruta: cuenta} que el
+    JS pinta sobre el tab. Sin visita previa: ventana de 24 h."""
+    cfg = json.loads(CONFIG.read_text())
+    perfil = perfil_usuario(email, cfg)
+    ahora = datetime.now()
+
+    def _v(clave: str) -> str:
+        return perfil.get(clave) or \
+            (ahora - timedelta(hours=24)).isoformat(timespec="seconds")
+
+    vis = fuentes_visibles(perfil, cfg)
+    vn, vi, vx, vs = (_v("visto_noticias"), _v("visto_interes"),
+                      _v("visto_x"), _v("visto_seguimiento"))
+    x_ok = {_handle_x(u).lower()
+            for u in cfg.get("x_permitidos", [])} - {""}
+    cn = ci = cx = cs = 0
+    for n in leer_jsonl(NOTICIAS, limite=0):
+        f = n["fecha"]
+        if not (f > vn or f > vi or f > vx or f > vs):
+            continue
+        if f > vs and n.get("categoria") == "seguimiento":
+            cs += 1
+        if f > vx and str(n.get("fuente", "")).lstrip("@").lower() \
+                in x_ok:
+            cx += 1
+        if n["fuente"] not in vis and n.get("via") not in vis:
+            continue
+        if f > vn and n.get("categoria") != "seguimiento":
+            cn += 1
+        if f > vi and coincide_interes(n):
+            ci += 1
+    return {"n": badge_count(email),
+            "t": {"/noticias": cn, "/interes": ci, "/x": cx,
+                  "/seguimiento": cs}}
+
+
+def _marcar_visto(email: str, clave: str):
+    """El usuario está viendo esta sección: su globito vuelve a 0."""
+    usuarios = cargar_usuarios()
+    if email in usuarios:
+        usuarios[email][clave] = \
+            datetime.now().isoformat(timespec="seconds")
+        guardar_usuarios(usuarios)
+
+
 def cookie_sesion(email: str, https: bool) -> str:
     seguro = "; Secure" if https else ""
     return (f"s={email}.{firma_cookie(email)}; Path=/; HttpOnly; "
@@ -5041,9 +5925,20 @@ STOPWORDS = {"el", "la", "los", "las", "de", "del", "en", "y", "a", "un",
              "ante", "tras", "este", "esta", "como", "más", "no", "su"}
 
 
+def _plural_tok(p: str) -> str:
+    """'centros'→'centro', 'pilares'→'pilar': sin el folding, la misma
+    historia en plural/singular perdía ~15% de Jaccard."""
+    if len(p) > 5 and p.endswith("es"):
+        return p[:-2]
+    if len(p) > 4 and p.endswith("s"):
+        return p[:-1]
+    return p
+
+
 def tokens_titulo(titulo: str) -> set:
     """Palabras significativas del titular para comparar similitud."""
-    return {p for p in re.findall(r"[a-z0-9]+", normalizar(titulo))
+    return {_plural_tok(p)
+            for p in re.findall(r"[a-z0-9]+", normalizar(titulo))
             if len(p) > 3 and p not in STOPWORDS}
 
 
@@ -5124,6 +6019,86 @@ def agrupar_noticias(noticias: list, umbral: float = 0.45,
     return sorted(grupos, key=lambda g: -len(g[1]))
 
 
+def _fusionar_temas(ordenadas: list, clusters: list) -> list:
+    """2ª vuelta de agrupación para Interés: Jaccard exige titulares
+    parecidos, pero la prensa local reescribe la historia completa
+    ('inaugura Centro DIF Pilares' vs 'apuesta por duplicar centros
+    Pilares' = 0.23). Une grupos —incluidas notas sueltas— cuando el
+    MISMO actor de la lista aparece en ambos Y comparten un token
+    raro presente en TODAS las notas de cada grupo (df ≤3 entre
+    grupos: 'pilar' sí; 'inaugura'/'agua' con df 5 ya son genéricos
+    y abrían la puerta a notas ajenas). Además la nota más reciente
+    de cada grupo debe estar dentro de la misma ventana de 5 días —
+    sin eso 'agua en Comalcalco' juntaba julio con octubre."""
+    grupos = [list(c) for _, c in clusters]
+    cubiertas = {n["link"] for c in grupos for n in c}
+    grupos += [[n] for n in ordenadas if n["link"] not in cubiertas]
+    if len(grupos) < 2:
+        return clusters
+
+    def _fmax(g):
+        f = []
+        for n in g:
+            try:
+                f.append(datetime.fromisoformat(n["fecha"]).timestamp())
+            except Exception:
+                pass
+        return max(f) if f else 0
+
+    actor_g, comun_g, fmax_g = [], [], []
+    for g in grupos:
+        ac = Counter(t for n in g for t in _interes_match(n))
+        actor_g.append(ac.most_common(1)[0][0] if ac else "")
+        comunes = tokens_titulo(g[0]["titulo"])
+        for n in g[1:]:
+            comunes &= tokens_titulo(n["titulo"])
+        comun_g.append(comunes)
+        fmax_g.append(_fmax(g))
+    df = Counter(t for ts in comun_g for t in ts)
+    ventana_s = 5 * 86400
+
+    def _compatible(i, j):
+        return (actor_g[i] and actor_g[i] == actor_g[j]
+                and abs(fmax_g[i] - fmax_g[j]) <= ventana_s
+                and any(df[t] <= 3 for t in comun_g[i] & comun_g[j]))
+
+    # sin cadenas: un suelto solo se anexa a un cluster ya formado
+    # (si 'puenteara' entre clusters volvía el mega-cluster de
+    # 'javier may' — May+feria→May+queso→May+sheinbaum)
+    res = []
+    usados = set()
+    bases = [i for i, g in enumerate(grupos) if len(g) > 1]
+    for i in bases:
+        if i in usados:
+            continue
+        cur = list(grupos[i])
+        usados.add(i)
+        for j in bases:
+            if j not in usados and _compatible(i, j):
+                cur.extend(grupos[j])
+                usados.add(j)
+        res.append((i, cur))
+    pareja = set()
+    solos = [i for i, g in enumerate(grupos) if len(g) == 1]
+    for i in solos:
+        if i in pareja:
+            continue
+        dest = next((cur for bi, cur in res if _compatible(i, bi)),
+                    None)
+        if dest is not None:
+            dest.extend(grupos[i])
+            pareja.add(i)
+            continue
+        for j in solos:
+            if j <= i or j in pareja:
+                continue
+            if _compatible(i, j):
+                res.append((i, grupos[i] + grupos[j]))
+                pareja.update((i, j))
+                break
+    return [c for _, c in res]
+
+
 def tarjeta_destacada(rep: dict, cluster: list) -> str:
     fuentes = sorted({n["fuente"] for n in cluster})
     variantes = "".join(
@@ -5170,11 +6145,104 @@ def tarjeta_noticia(n: dict, extra: str = "") -> str:
     )
 
 
+_SIGLAS_INT = {"tsj", "tsjt", "dif", "pjf", "oaj", "ine", "sutapjet"}
+
+
+def _forma_token(tok: str, cluster: list) -> str:
+    """Casing dominante del token en los titulares — DIF/PILARES
+    conservan sus mayúsculas; 'centros' sale capitalizado."""
+    c = Counter()
+    for x in cluster:
+        for w in re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ']+", x["titulo"]):
+            if normalizar(w) == tok:
+                c[w] += 1
+    if not c:
+        return tok.capitalize()
+    forma = c.most_common(1)[0][0]
+    return forma if forma.isupper() else forma.capitalize()
+
+
+def _titulo_grupo(cluster: list) -> str:
+    """'Javier May · Centros DIF Pilares': actor de la lista de
+    interés + los tokens que comparten TODOS los titulares. Mejor
+    encabezado de cluster que copiar el titular de un solo medio."""
+    rep = max(cluster, key=lambda n: len(n["titulo"]))
+    comunes = tokens_titulo(rep["titulo"])
+    for x in cluster:
+        if x is not rep:
+            comunes &= tokens_titulo(x["titulo"])
+    if not comunes:
+        return ""
+    actores = Counter()
+    for x in cluster:
+        for t in _interes_match(x):
+            actores[t] += 1
+    actor = actores.most_common(1)[0][0] if actores else ""
+    toks_actor = set(normalizar(actor).split())
+    tema = [t for t in comunes if t not in toks_actor]
+    orden_rep = {t: i for i, t in enumerate(
+        re.findall(r"[a-z0-9]+", normalizar(rep["titulo"])))}
+    tema.sort(key=lambda t: orden_rep.get(t, 99))
+    tema_txt = " ".join(_forma_token(t, cluster) for t in tema[:5])
+    if not tema_txt:
+        return ""   # actor solo no dice tema — mejor el titular rep
+    actor_txt = " ".join(
+        w.upper() if w in _SIGLAS_INT else w.capitalize()
+        for w in actor.split())
+    return f"{actor_txt} · {tema_txt}" if actor_txt else tema_txt
+
+
+def tarjeta_grupo(cluster: list) -> str:
+    """Tarjeta de cluster en Interés: un tema, N medios. Mosaico 2×2
+    en el slot del thumb (1 imagen = thumb normal) y dropdown con el
+    titular de cada nota — no el titular de un solo medio."""
+    orden = sorted(cluster, key=lambda n: n["fecha"], reverse=True)
+    rep = orden[0]
+    titulo_g = _titulo_grupo(cluster) or rep["titulo"]
+    imgs, vistos = [], set()
+    for n in orden:
+        i = html.unescape(n.get("imagen", ""))
+        if i and "profile_images" not in i and i not in vistos:
+            vistos.add(i)
+            imgs.append(i)
+    if len(imgs) > 1:
+        celda = "".join(
+            f"<img src='{html.escape(url_https(u))}' loading='lazy'"
+            f" onerror='this.remove()'>" for u in imgs[:4])
+        thumb = f"<div class='thumb-grid'>{celda}</div>"
+    elif imgs:
+        thumb = (f"<img class='thumb' "
+                 f"src='{html.escape(url_https(imgs[0]))}'"
+                 f" loading='lazy' onerror='this.remove()'>")
+    else:
+        thumb = ""
+    medios = len({n["fuente"] for n in orden})
+    items = "".join(
+        f"<a class='grupo-item' "
+        f"href='/nota?u={quote(n['link'], safe='')}'>"
+        f"<span class='chip-fuente' style='font-size:.6rem;"
+        f"padding:1px 6px'>{html.escape(n['fuente'])}</span>"
+        f" {html.escape(n['titulo'])}"
+        f" <span class='meta'>{fmt_fecha(n['fecha'])}</span></a>"
+        for n in orden)
+    terminos = sorted({t for n in orden for t in _interes_match(n)})
+    return (
+        f"<div class='card nota grupo'>{thumb}"
+        f"<div class='meta2'><span class='chip-fuente' "
+        f"style='background:#455a64'>{medios} medios</span>"
+        f"<span class='meta'>{fmt_fecha(rep['fecha'])}</span></div>"
+        f"<span class='titulo'>{html.escape(titulo_g)}</span>"
+        f"<details class='grupo-det'><summary class='grupo-tog'>"
+        f"{len(orden)} notas · ver titulares</summary>{items}</details>"
+        f"<p style='font-size:.68rem;color:#2e7d32;margin:.2rem 0 0'>"
+        f"encontró: {html.escape(', '.join(terminos))}</p></div>")
+
+
 INTERES_FUERTES = [
     # nombres propios — bastan solos
     "efrain resendez", "resendez bocanegra", "carlos efrain",
     "mario balcazar",
-    "paola hernandez", "paola hernandez garcia",
+    "paola hernandez garcia",
     "donaciano quen", "quen perez",
     "juan pablo rabago", "rabago contreras",
     "paolo orrico", "orrico julien",
@@ -5192,6 +6260,11 @@ INTERES_FUERTES = [
     "magistrados del tsj", "magistrados de tsj",
     "magistrados tabasco", "judicial tabasco",
 ]
+# nombres propios COMUNES (homónimos frecuentes) — solo cuentan con
+# ancla Tabasco/TSJ o en prensa local: 'Paola Hernández' a secas en
+# una nota de K-dramas de Vanguardia (15/oct) era homónima del medio
+# artístico, no la del TSJ
+INTERES_FUERTES_CTX = ["paola hernandez"]
 # \b en nombres: 'javier may' como substring crudo colaría
 # 'Mayagoitia'/'Javier Mayor'
 INTERES_DEBILES_TEMA = [
@@ -5295,8 +6368,15 @@ def _interes_listas() -> dict:
             if f.get("tipo") == "x"
             and not str(f.get("url", "")).lower().startswith(
                 "x:home")} - {""}
+        d["fuertes_ctx"] = L(INTERES_FUERTES_CTX, "fuertes_ctx")
         d["rx_fuertes"] = re.compile(r"\b(?:" + "|".join(
             re.escape(t) for t in d["fuertes"]) + r")\b")
+        # lista vacía → regex que nunca matchea (un '(?:)' vacío
+        # encontraría '' en TODAS las notas y todo sería 'interés')
+        f_ctx = [re.escape(t) for t in d["fuertes_ctx"]]
+        d["rx_fuertes_ctx"] = re.compile(
+            r"\b(?:" + "|".join(f_ctx) + r")\b" if f_ctx
+            else r"(?!x)x")
         d["rx_siglas_f"] = re.compile(r"\b(?:" + "|".join(sig_f) + r")\b")
         d["rx_siglas_t"] = re.compile(r"\b(?:" + "|".join(sig_t) + r")\b")
         d["rx_ajenos"] = re.compile(r"\b(?:" + "|".join(
@@ -5304,7 +6384,7 @@ def _interes_listas() -> dict:
         d["rx_hl"] = re.compile(
             r"\b(" + "|".join(
                 _pat_interes(t) for t in sorted(
-                    d["fuertes"] + d["debiles_tema"]
+                    d["fuertes"] + d["fuertes_ctx"] + d["debiles_tema"]
                     + d["debiles_actor"] + d["tabasco"],
                     key=len, reverse=True))
             + r"|tsjt?|" + "|".join(sig_f + sig_t) + r")", re.I)
@@ -5379,6 +6459,12 @@ def _interes_match(nota: dict) -> list:
     # una nota de otro estado, el nombre manda sobre las guardias
     if hits:
         return hits
+    # nombres comunes ('paola hernandez' sin apellido completo): la
+    # nota debe anclarse a Tabasco/TSJ o venir de prensa local — en
+    # nacional/espectáculos casi seguro es homónimo
+    hits = li["rx_fuertes_ctx"].findall(texto)
+    if hits and (hay_tab or local or RX_TSJ.search(texto)):
+        return hits
     # la nota es de OTRO poder judicial (TSJ de Guerrero, de la
     # Ciudad de México…) y no nombra Tabasco → no es de interés
     if RX_TSJ_OTRO.search(texto) and "tabasco" not in texto_ctx:
@@ -5393,7 +6479,10 @@ def _interes_match(nota: dict) -> list:
         return ["tsj"]
     hits = [t for t in li["debiles_tema"] if t in texto]
     hits += li["rx_siglas_t"].findall(texto)
-    if hits and (hay_tab or local):
+    # temas ('fiscalización', 'reforma judicial') exigen ancla
+    # Tabasco EN EL TEXTO — la prensa local también corre notas
+    # federales (Senado/ASF/ANAM) y 'local' solo las colaba
+    if hits and hay_tab:
         return hits
     hits = [t for t in li["debiles_actor"] if t in texto]
     if hits and (hay_tab or local):
@@ -5725,7 +6814,7 @@ def vista_noticias(email: str, pagina: int = 1, dia: str = "") -> str:
     noticias = [n for n in leer_jsonl(NOTICIAS, limite=0)
                 if (n["fuente"] in vis or n.get("via") in vis)
                 and (dia or n.get("categoria")
-                     not in ("columnas", "x"))
+                     not in ("columnas", "x", "seguimiento"))
                 and (not dia or n["fecha"].startswith(dia))]
     ordenadas = sorted(noticias, key=lambda n: n["fecha"], reverse=True)
     chips = trending_chips(noticias)
@@ -5898,47 +6987,29 @@ def vista_interes(email: str, pagina: int = 1) -> str:
     noticias = [n for n in leer_jsonl(NOTICIAS, limite=0)
                 if (n["fuente"] in vis or n.get("via") in vis)
                 and coincide_interes(n)]
-    _MAY = {"javier may", "gobernador", "javier may rodriguez",
-            "may rodriguez"}
+    # misma historia en varios medios → UNA tarjeta-grupo (mosaico +
+    # dropdown); umbral más laxo que el global: la prensa local
+    # reescribe mucho el mismo titular. La tarjeta toma la posición
+    # de la nota más reciente del cluster
     ordenadas = sorted(noticias, key=lambda n: n["fecha"], reverse=True)
-    # agrupar cobertura del mismo tema: 8 medios contando lo mismo
-    # colapsan a una tarjeta con <details> expandible
-    grupos = []                     # [(toks, [notas])]
-    for n in ordenadas:
-        toks = _norm_titulo(n["titulo"])
-        for g in grupos:
-            if len(toks & g[0]) / max(len(toks | g[0]), 1) >= 0.5:
-                g[1].append(n)
-                break
-        else:
-            grupos.append([toks, [n]])
-    def _es_may(g) -> bool:
-        m = set(_interes_match(g[1][0]))
-        return bool(m) and m <= _MAY
-    temas = [g for g in grupos if not _es_may(g)]
-    may_g = [g for g in grupos if _es_may(g)]
-    # relevancia: temas de interés primero, May intercalado 2:1 —
-    # sale desde la primera página pero no tapa los otros temas
-    pares = [temas[i:i + 2] for i in range(0, len(temas), 2)]
-    mezcla = []
-    for i, par in enumerate(pares):
-        mezcla += par
-        if i < len(may_g):
-            mezcla.append(may_g[i])
-    mezcla += may_g[len(pares):]
+    clusters = _fusionar_temas(
+        ordenadas, agrupar_noticias(ordenadas, umbral=0.32))
+    en_grupo = {}
+    for gi, cluster in enumerate(clusters):
+        for n in cluster:
+            en_grupo[n["link"]] = gi
+    emitidos = set()
     planos = []
-    for toks, ns in mezcla:
-        extra = "encontró: " + ", ".join(_interes_match(ns[0]))
-        if len(ns) > 1:
-            extra += f" · {len(ns)} medios"
-        card = tarjeta_noticia(ns[0], extra)
-        if len(ns) > 1:
-            sub = "".join(tarjeta_noticia(x) for x in ns[1:])
-            card += (f"<details style='margin-top:-4px'>"
-                     f"<summary class='meta' style='cursor:pointer'>"
-                     f"▸ {len(ns) - 1} medios más cubrieron esto"
-                     f"</summary>{sub}</details>")
-        planos.append(card)
+    for n in ordenadas:
+        gi = en_grupo.get(n["link"])
+        if gi is not None:
+            if gi in emitidos:
+                continue
+            emitidos.add(gi)
+            planos.append(tarjeta_grupo(clusters[gi]))
+        else:
+            planos.append(tarjeta_noticia(
+                n, "encontró: " + ", ".join(_interes_match(n))))
     total = len(planos)
     por_pagina = 100
     total_paginas = max(1, (total + por_pagina - 1) // por_pagina)
@@ -6004,6 +7075,44 @@ def vista_interes(email: str, pagina: int = 1) -> str:
             + f"{nav}{cards}{nav}" if cards
             else "<h1>Notas de interés</h1>" + panel +
                  "<p>Aún no cae ninguna nota de la lista.</p>")
+
+
+def vista_seguimiento(email: str, pagina: int = 1) -> str:
+    """Seguimiento: radar de perfiles personales de FB
+    (categoria 'seguimiento') — cronológico plano, con filtro duro
+    en el scraper (compartidos/bio-cards no entran). Sin filtro de
+    interés en la vista: sección en prueba solo para admin — el
+    filtro llegó a esconder publicaciones correctas. No pasa por
+    fuentes_visibles: es una sección propia, no el feed."""
+    noticias = [n for n in leer_jsonl(NOTICIAS, limite=0)
+                if n.get("categoria") == "seguimiento"]
+    ordenadas = sorted(noticias, key=lambda n: n["fecha"],
+                       reverse=True)
+    total = len(ordenadas)
+    por_pagina = 100
+    total_paginas = max(1, (total + por_pagina - 1) // por_pagina)
+    pagina = max(1, min(pagina, total_paginas))
+    inicio = (pagina - 1) * por_pagina
+    fin = min(inicio + por_pagina, total)
+    cards = "".join(tarjeta_noticia(n)
+                    for n in ordenadas[inicio:fin])
+    info = f"{inicio + 1}-{fin} de {total}" if total else "0"
+    nav = ""
+    if total_paginas > 1:
+        ant = (f"<a href='/seguimiento?p={pagina - 1}'>← Anterior</a>"
+               if pagina > 1 else "<span>← Anterior</span>")
+        sig = (f"<a href='/seguimiento?p={pagina + 1}'>Siguiente →</a>"
+               if pagina < total_paginas
+               else "<span>Siguiente →</span>")
+        nav = (f"<div class='paginacion'>{ant} "
+               f"<span class='pag-info'>{info}</span> {sig}</div>")
+    return (f"<h1>Seguimiento</h1>"
+            f"<p class='meta'>{info} posts · perfiles personales de "
+            "FB bajo radar — solo lo que pasa el filtro de "
+            "interés</p>"
+            f"{nav}{cards}{nav}" if cards
+            else "<h1>Seguimiento</h1><p class='meta'>Aún no hay "
+                 "posts — chucky raspa los perfiles cada 4 h.</p>")
 
 
 def _chip_nota(n: dict) -> tuple:
@@ -6126,27 +7235,27 @@ def vista_resumenes(email: str, msg: str = "") -> str:
                 return ct
         return ("prensa", "rss")
     entradas = leer_jsonl(SINTESIS)
-    # orden de tarjetas por rango horario (la poda ya dejó 1 x franja):
-    # noche → cierre, nocturna, matutina, vespertina
-    # mañana → matutina, vespertina, nocturna, cierre
-    # tarde  → vespertina, nocturna, cierre, matutina
-    h = datetime.now().hour
-    if 9 <= h < 15:
-        orden = ["matutina", "vespertina", "nocturna", "cierre"]
-    elif 15 <= h < 21:
-        orden = ["vespertina", "nocturna", "cierre", "matutina"]
-    else:
-        orden = ["cierre", "nocturna", "matutina", "vespertina"]
-    entradas.sort(key=lambda e: orden.index(e.get("franja"))
-                  if e.get("franja") in orden else 99)
+    # cronológico real, más reciente arriba — a las 21:10 queda
+    # cierre → nocturna → vespertina → matutina
+    entradas.sort(key=lambda e: e.get("fecha", ""), reverse=True)
     cards = ""
     for e in entradas[:30]:
+        # borradores privados (mediodía) — solo admin los ve hasta
+        # que los publique para paolo y demás
+        if e.get("privado") and not admin_v:
+            continue
         fecha = e.get("fecha", "")[:16].replace("T", " ")
         franja = e.get("franja", "")
         badge = ("<span style='background:#1a237e;color:#fff;padding:2px 8px;"
                  "border-radius:10px;font-size:.7rem'>"
-                 + {"cierre": "CIERRE DIARIO"}.get(
+                 + {"cierre": "CIERRE DIARIO",
+                    "mediodia": "MEDIODÍA"}.get(
                      franja, franja.upper()) + "</span>")
+        if e.get("privado"):
+            badge += ("<span style='background:#c62828;color:#fff;"
+                      "padding:2px 8px;border-radius:10px;"
+                      "font-size:.7rem;margin-left:.3rem'>PRIVADO"
+                      "</span>")
         notas_ref = e.get("notas", [])
         cuerpo = _cuerpo_sintesis(e.get("texto", ""), notas_ref)
         fuentes = sorted({n.get("f", "") for n in notas_ref} - {""})
@@ -6161,7 +7270,18 @@ def vista_resumenes(email: str, msg: str = "") -> str:
         ctrl = ""
         if admin_v:
             ffecha = html.escape(e.get("fecha", ""), quote=True)
-            ctrl = (
+            if e.get("privado"):
+                # borrador de mediodía — el admin decide cuándo la
+                # ve paolo y demás usuarios
+                ctrl += (
+                    f"<form method='post' "
+                    f"action='/resumenes/editar' style='display:inline'>"
+                    f"<input type='hidden' name='fecha' "
+                    f"value='{ffecha}'>"
+                    f"<button name='accion' value='publicar' "
+                    f"style='font-size:.75rem;background:#2e7d32'>"
+                    f"Publicar a usuarios</button></form>")
+            ctrl += (
                 f"<details style='margin-top:.6rem'>"
                 f"<summary class='meta' style='cursor:pointer'>"
                 f"editar / borrar</summary>"
@@ -6202,6 +7322,34 @@ def vista_resumenes(email: str, msg: str = "") -> str:
                         f"<button onclick=\"return confirm("
                         f"'¿Publicar en @elpolidelanoche?')\">"
                         f"Publicar</button></form></details>")
+            # perspectiva nacional-vs-Tabasco (la vespertina y el
+            # cierre la generan) — segundo post del poli, marcado
+            # 'perspectiva' en x_posts para no chocar con el cierre
+            if e.get("perspectiva"):
+                if _x_publicado(e.get("fecha", ""), "perspectiva"):
+                    ctrl += ("<p class='meta' style='color:#2e7d32'>"
+                             "✓ perspectiva publicada</p>")
+                else:
+                    ps = html.escape(e["perspectiva"])
+                    ff_p = html.escape(e.get("fecha", ""), quote=True)
+                    ctrl += (
+                        f"<details style='margin-top:.6rem'>"
+                        f"<summary class='meta' style='cursor:pointer'>"
+                        f"perspectiva del día (poli)</summary>"
+                        f"<form method='post' "
+                        f"action='/resumenes/publicar-x' "
+                        f"style='margin-top:.5rem'>"
+                        f"<input type='hidden' name='fecha' "
+                        f"value='{ff_p}'>"
+                        f"<input type='hidden' name='tipo' "
+                        f"value='perspectiva'>"
+                        f"<textarea name='texto' rows='3' maxlength='280' "
+                        f"style='width:100%;font-size:.85rem' "
+                        f"placeholder='perspectiva para X (≤280)'>"
+                        f"{ps}</textarea>"
+                        f"<button onclick=\"return confirm("
+                        f"'¿Publicar en @elpolidelanoche?')\">"
+                        f"Publicar</button></form></details>")
         # imprimir/PDF por tarjeta — para todos los registrados: el
         # reporte imprimible ya existía pero solo con checkboxes y
         # solo para admin; ahora cada tarjeta lleva su atajo directo
@@ -6236,13 +7384,16 @@ def vista_resumenes(email: str, msg: str = "") -> str:
             for g in ("Portales de Internet", "Facebook", "X",
                       "Columnas") if conteo_g.get(g))
         cuadro_g = (
+            f"<details style='margin:.4rem 0 1rem'>"
+            f"<summary style='font-size:.8rem;color:#5c6bc0;"
+            f"cursor:pointer'>Notas por medio</summary>"
             f"<table style='border-collapse:collapse;font-size:.74rem;"
-            f"margin:.4rem 0 1rem;width:260px'>"
+            f"margin:.4rem 0;width:260px'>"
             f"<tr><th style='background:#1a237e;color:#fff;padding:5px "
             f"14px;text-align:left;border:1px solid #1a237e'>Medio</th>"
             f"<th style='background:#1a237e;color:#fff;padding:5px 14px;"
             f"border:1px solid #1a237e'>Notas</th></tr>"
-            f"{filas}</table>")
+            f"{filas}</table></details>")
     # selector descargar/imprimir — solo admin (paolo entrega el reporte)
     selector = ""
     if admin_v and entradas:
@@ -6254,8 +7405,8 @@ def vista_resumenes(email: str, msg: str = "") -> str:
             f"{e.get('fecha', '')[:16].replace('T', ' ')}</label>"
             for e in entradas[:30])
         selector = (
-            f"<details style='margin:0 0 1rem'>"
-            f"<summary class='btn-linea' style='display:inline-block;"
+            f"<details style='margin:.8rem 0 0'>"
+            f"<summary style='font-size:.8rem;color:#5c6bc0;"
             f"cursor:pointer'>Descargar / imprimir</summary>"
             f"<form method='get' action='/resumenes/reporte' "
             f"target='_blank' style='margin-top:.6rem'>{opts}"
@@ -6263,31 +7414,38 @@ def vista_resumenes(email: str, msg: str = "") -> str:
             f"</div></form></details>")
     aviso = (f"<p class='meta' style='color:#1a237e'>{html.escape(msg)}</p>"
              if msg else "")
+    # herramientas admin plegadas — la lectura diaria manda; se abre
+    # sola mientras algo se genera (auto-reload cada 30 s)
+    acciones = ""
+    if admin_v:
+        if _GENERANDO:
+            botones = (
+                "<span class='meta' style='color:#1a237e'>"
+                "⏳ generando — la página se recarga sola"
+                "</span>"
+                "<script>setTimeout(function(){location.reload()},"
+                "30000)</script>")
+        else:
+            botones = (
+                "<form method='post' action='/resumenes/generar' "
+                "style='display:flex;gap:.6rem;margin:.5rem 0 0'>"
+                "<button class='btn-linea' style='font-size:.78rem;"
+                "padding:.3rem .8rem'>Generar ahora</button>"
+                "<button class='btn-linea' name='franja' "
+                "value='cierre' style='font-size:.78rem;"
+                "padding:.3rem .8rem'>Cierre diario</button>"
+                "</form>")
+        acciones = (
+            f"<details{' open' if _GENERANDO else ''} "
+            f"style='margin:.7rem 0 .3rem'>"
+            f"<summary style='font-size:.8rem;color:#5c6bc0;"
+            f"cursor:pointer'>Acciones</summary>{botones}</details>")
     return (f"<h1>Síntesis Diaria "
             f"{datetime.now().strftime('%d/%m/%y')}</h1>" + aviso
             + "<p class='meta'>Resumen ejecutivo — "
               "matutina 9:00 h, vespertina 15:00 h y nocturna "
-              "21:00 h, cierre 21:05 h.</p>" + cuadro_g
-            + (("<form method='post' action='/resumenes/generar' "
-                "style='margin-bottom:1rem;display:flex;gap:.5rem'>"
-                + (f"<button class='btn-linea' disabled "
-                   f"style='opacity:.45;cursor:wait'>generando…"
-                   f"</button>"
-                   f"<button class='btn-linea' disabled "
-                   f"style='opacity:.45;cursor:wait'>Cierre diario"
-                   f"</button>"
-                   f"<span class='meta' style='align-self:center'>"
-                   f"Ollama tarda ~4-5 min — la página se recarga sola"
-                   f"</span>"
-                   f"<script>setTimeout(function(){{location.reload()}},"
-                   f"30000)</script>"
-                   if _GENERANDO else
-                   "<button class='btn-linea'>Generar ahora</button>"
-                   "<button class='btn-linea' name='franja' "
-                   "value='cierre'>Cierre diario</button>")
-                + "</form>")
-               if admin_v else "")
-            + selector
+              "21:00 h, cierre 21:03 h.</p>" + cuadro_g
+            + acciones + selector
             + (cards or "<p>Aún no hay síntesis — la primera sale a las "
                         "9:00 h.</p>"))
 
@@ -6313,6 +7471,10 @@ def vista_reporte_resumenes(sel: list) -> str:
         return ("prensa", "rss")
 
     entradas = leer_jsonl(SINTESIS)
+    if not admin:
+        # borradores privados nunca llegan al reporte — aunque el
+        # usuario adivine la fecha en ?sel=
+        entradas = [e for e in entradas if not e.get("privado")]
     if sel:
         sel_set = set(sel)
         entradas = [e for e in entradas if e.get("fecha") in sel_set]
@@ -6390,7 +7552,7 @@ def vista_reporte_resumenes(sel: list) -> str:
 </div>
 <h1>SÍNTESIS DE NOTICIAS DEL {fecha_larga.upper()}</h1>
 <p class="sub">Monitor de medios — matutina 9:00 h, vespertina 15:00 h,
-nocturna 21:00 h, cierre del día 21:05 h · {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
+nocturna 21:00 h, cierre del día 21:03 h · {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
 {cuadro}
 {secciones or "<p>Sin síntesis seleccionadas.</p>"}
 </body></html>"""
@@ -6715,6 +7877,7 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
     if not titulo:
         m = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.S | re.I)
         titulo = m.group(1).strip() if m else link
+    titulo = html.unescape(re.sub(r"<[^>]+>", "", titulo)).strip()
     imagen = _meta(r.text, "og:image") or _meta(r.text, "twitter:image")
     if imagen and imagen.startswith("/"):
         imagen = urljoin(link, imagen)   # og:image relativo → absoluto
@@ -6723,6 +7886,15 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
         # &lt;/B&gt; literal del medio (Reforma escapa dos veces) — unescape
         # y limpiar cualquier tag residual para que no salga crudo
         desc = re.sub(r"<[^>]+>", "", html.unescape(desc)).strip()
+        # a veces el description es el menú, no la nota (Poder y Crítica)
+        _dt = desc.split()
+        if re.search(r"\bno results?\b|\bview all\b|^\s*login\b",
+                     desc, re.I) or (
+                len(_dt) >= 15 and
+                sum(1 for t in _dt
+                    if re.fullmatch(r"[A-ZÁÉÍÓÚÑÜ0-9.,#-]+", t))
+                / len(_dt) > 0.5):
+            desc = ""
     meta = {"titulo": titulo, "imagen": imagen, "desc": desc,
             "dominio": dominio}
 
@@ -6771,6 +7943,25 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
             continue
         if re.search(r"derechos reservados|©\s*\d{4}|todos los derechos",
                      txt, re.I):
+            continue
+        # menú del sitio volcado dentro de un <p> (Poder y Crítica):
+        # el párrafo mezcla 'Login ESTADOS CDMX CAMPECHE…' con la nota —
+        # los detecta la ráfaga de tokens en MAYÚSCULAS y la basura
+        # típica de buscador interno ('No Result', 'View All Result')
+        toks = txt.split()
+        if re.search(r"\bno results?\b|\bview all\b|^\s*login\b|"
+                     r"username or email|reset your password|"
+                     r"\blog in\b|\bsign up\b|\bsuscr[ií]bete\b|"
+                     r"\binicia sesi[oó]n\b|\bcrea una cuenta\b",
+                     txt, re.I) or (
+                len(toks) >= 15 and
+                sum(1 for t in toks
+                    if re.fullmatch(r"[A-ZÁÉÍÓÚÑÜ0-9.,#-]+", t))
+                / len(toks) > 0.5):
+            continue
+        # teaser de 'notas relacionadas' colado en el artículo:
+        # párrafo completo que termina truncado con '…' o '...'
+        if len(txt) > 100 and txt.endswith(("…", "...")):
             continue
         paras.append(txt)
         vistos_p.add(txt)
@@ -7356,6 +8547,7 @@ def vista_fuentes(email: str, msg: str = "") -> str:
     cfg = json.loads(CONFIG.read_text())
     perfil = perfil_usuario(email, cfg)
     ocultas = set(perfil.get("fuentes_ocultas", []))
+    dep_on = set(perfil.get("deportes_visibles", []))
     admin = es_admin(email, cfg)
     estado = cargar_json(ESTADO_FUENTES, {})
     intervalo = cfg.get("intervalo", 15)
@@ -7378,7 +8570,9 @@ def vista_fuentes(email: str, msg: str = "") -> str:
         cat_label = html.escape(cat.replace("_", " ").title())
         cat_attr = html.escape(cat, quote=True)
         cat_checked = " checked" if all(
-            f["nombre"] not in ocultas for _, f in sources) else ""
+            f["nombre"] not in ocultas
+            and (cat != "deportes" or f["nombre"] in dep_on)
+            for _, f in sources) else ""
         filas += (f"<details class='fuentes-cat'>"
                   f"<summary><input type='checkbox' class='cat-check' "
                   f"data-cat='{cat_attr}' "
@@ -7439,7 +8633,10 @@ def vista_fuentes(email: str, msg: str = "") -> str:
       data-cat="{cat_attr}"
       value="{html.escape(f['nombre'], quote=True)}"
       onchange="syncUp()"
-      {'' if f['nombre'] in ocultas else ' checked'}>
+      {'' if f['nombre'] in ocultas
+        or (f.get('categoria') == 'deportes'
+            and f['nombre'] not in dep_on)
+        else ' checked'}>
     {dot}{html.escape(f['nombre'])}
     <span class="meta"> · {html.escape(f.get('categoria', 'prensa'))}</span></label>
   {edicion}
@@ -7448,14 +8645,16 @@ def vista_fuentes(email: str, msg: str = "") -> str:
 
     aviso = (f"<div class='card' style='border-left-color:#d32f2f'>"
              f"<b>URL rechazada:</b> {html.escape(msg)}</div>" if msg else "")
+    todas_dep = all(f["nombre"] in dep_on for f in cfg["fuentes"]
+                    if f.get("categoria") == "deportes")
     seleccion = f"""
 <h1>Fuentes</h1>
 {aviso}
 <p class="meta">Marca los medios que quieres ver en Destacadas, Noticias
-y Buscar.</p>
+y Buscar. <b>Deportes viene apagada</b> — márquela si la quiere.</p>
 <form method="post" action="/fuentes">
   <label class="fuente-check master"><input type="checkbox" id="sel-todo"
-      {'checked' if not ocultas else ''}
+      {'checked' if not ocultas and todas_dep else ''}
       onclick="document.querySelectorAll('input[name=ver], .cat-check').forEach(c=>c.checked=this.checked)">
     <span class="meta">todas ({len(cfg['fuentes'])})</span></label>
   {filas}
@@ -7989,10 +9188,13 @@ def vista_analitica() -> str:
 
 
 def render_pagina(contenido: str, q: str = "", base: str = "",
+                  og_img: str = "",
                   usuario: str = "", og_title: str = "",
                   og_desc: str = "") -> bytes:
     cfg = json.loads(CONFIG.read_text())
-    admin_tabs = ('<a href="/horarios">Horarios</a>'
+    admin_tabs = ('<a href="/seguimiento">Seguimiento</a>'
+                  '<a href="/horarios">Horarios</a>'
+                  '<a href="/salud">Salud</a>'
                   '<a href="/stats">Stats</a>'
                   '<a href="/analitica">Analítica</a>'
                   if usuario and es_admin(usuario, cfg) else "")
@@ -8023,7 +9225,9 @@ def render_pagina(contenido: str, q: str = "", base: str = "",
                          og_desc=html.escape(og_desc or
                              "Monitor de medios en tiempo real: destacadas, "
                              "alertas por tema, noticias y estadísticas. "
-                             "Powered by Olmeca Code.")).encode()
+                             "Powered by Olmeca Code."),
+                         og_img=html.escape(og_img or
+                             f"{base}/og.png")).encode()
 
 
 def aplicar_accion_fuentes(form: dict, email: str):
@@ -8040,6 +9244,11 @@ def aplicar_accion_fuentes(form: dict, email: str):
             vistas = set(form.get("ver", []))
             perfil["fuentes_ocultas"] = [
                 f["nombre"] for f in cfg["fuentes"] if f["nombre"] not in vistas]
+            # deportes es opt-in: se guarda la lista de las marcadas
+            perfil["deportes_visibles"] = [
+                f["nombre"] for f in cfg["fuentes"]
+                if f.get("categoria") == "deportes"
+                and f["nombre"] in vistas]
             guardar_usuarios(usuarios)
         return
 
@@ -8095,6 +9304,10 @@ def aplicar_accion_fuentes(form: dict, email: str):
         try:
             idx = int(form.get("idx", ["-1"])[0])
             f = datos_fuente()
+            # el form no edita estos flags — conservar los que traía
+            for flag in ("activa", "expandir", "perfil"):
+                if cfg["fuentes"][idx].get(flag) is not None:
+                    f[flag] = cfg["fuentes"][idx][flag]
             if f["nombre"] and (f["url"].startswith("http")
                                 or f["url"].lower().startswith("x:")):
                 if f["tipo"] == "fb":
@@ -8301,7 +9514,7 @@ def servir_web(puerto: int):
                 return
             if (ruta.path not in ("/icon.png", "/icon3.png", "/og.png",
                                   "/manifest.webmanifest", "/badge",
-                                  "/captura.png")
+                                  "/sw.js", "/captura.png")
                     and not ruta.path.startswith("/shots/")):
                 registrar_actividad(
                     email, ruta.path, params.get("u", [""])[0],
@@ -8336,10 +9549,12 @@ def servir_web(puerto: int):
                 return
             if not email and not (
                     ruta.path in ("/icon.png", "/icon3.png", "/og.png",
-                                  "/manifest.webmanifest", "/nota",
+                                  "/manifest.webmanifest", "/sw.js",
+                                  "/nota",
                                   "/instructivo", "/captura", "/propuesta",
                                   "/portadas")
-                    or ruta.path.startswith(("/shots/", "/portadas/"))):
+                    or ruta.path.startswith(("/shots/", "/portadas/",
+                                             "/brand/"))):
                 # sin sesión: cualquier ruta muestra el login
                 self._html(vista_login(base))
                 return
@@ -8363,11 +9578,7 @@ def servir_web(puerto: int):
                 self._html(render_pagina(vista_alertas(email, msg),
                                          base=base, usuario=email))
                 # ya las vio: el contador del ícono vuelve a 0
-                usuarios = cargar_usuarios()
-                if email in usuarios:
-                    usuarios[email]["visto_alertas"] = \
-                        datetime.now().isoformat(timespec="seconds")
-                    guardar_usuarios(usuarios)
+                _marcar_visto(email, "visto_alertas")
             elif ruta.path == "/noticias":
                 try:
                     p = int(params.get("p", ["1"])[0])
@@ -8379,9 +9590,28 @@ def servir_web(puerto: int):
                 self._html(render_pagina(
                     vista_noticias(email, p, dia), base=base,
                     usuario=email))
+                _marcar_visto(email, "visto_noticias")
             elif ruta.path == "/x":
                 self._html(render_pagina(vista_x(email), base=base,
                                          usuario=email))
+                _marcar_visto(email, "visto_x")
+            elif ruta.path == "/seguimiento":
+                # sección en prueba — solo admin mientras afinamos
+                # el filtro de seguimientos
+                if not es_admin(email, json.loads(
+                        CONFIG.read_text())):
+                    self.send_response(303)
+                    self.send_header("Location", "/noticias")
+                    self.end_headers()
+                    return
+                try:
+                    p = int(params.get("p", ["1"])[0])
+                except (ValueError, IndexError):
+                    p = 1
+                self._html(render_pagina(
+                    vista_seguimiento(email, p), base=base,
+                    usuario=email))
+                _marcar_visto(email, "visto_seguimiento")
             elif ruta.path == "/buscar":
                 q = params.get("q", [""])[0]
                 self._html(render_pagina(vista_buscar(q, email), q=q,
@@ -8424,17 +9654,29 @@ def servir_web(puerto: int):
                         self.wfile.write(doc.read_bytes())
                     else:
                         self.send_error(404)
+            elif ruta.path == "/salud":
+                # diagnóstico del sistema — solo admin
+                if not es_admin(email, json.loads(
+                        CONFIG.read_text())):
+                    self._html(render_pagina("<h1>Solo admin</h1>",
+                                             base=base, usuario=email))
+                else:
+                    self._html(render_pagina(vista_salud(),
+                                             base=base, usuario=email))
             elif ruta.path == "/columnas":
                 self._html(render_pagina(vista_columnas(email),
                                          base=base, usuario=email))
             elif ruta.path == "/interes":
                 self._html(render_pagina(vista_interes(
                     email, int(params.get("p", ["1"])[0])),
-                    base=base, usuario=email))
+                    base=base, usuario=email,
+                    og_img=f"{base}/brand/01int.jpg"))
+                _marcar_visto(email, "visto_interes")
             elif ruta.path == "/resumenes":
                 self._html(render_pagina(vista_resumenes(
                     email, params.get("msg", [""])[0]),
-                    base=base, usuario=email))
+                    base=base, usuario=email,
+                    og_img=f"{base}/brand/01res.jpg"))
             elif ruta.path == "/resumenes/reporte":
                 # reporte imprimible: para todos los registrados —
                 # paolo imprime las tarjetas para su entrega diaria;
@@ -8444,7 +9686,10 @@ def servir_web(puerto: int):
                     self.send_header("Location", "/resumenes")
                     self.end_headers()
                     return
-                doc = vista_reporte_resumenes(params.get("sel", []))
+                doc = vista_reporte_resumenes(
+                    params.get("sel", []),
+                    admin=es_admin(email, json.loads(
+                        CONFIG.read_text())))
                 if params.get("fmt", [""])[0] == "png":
                     png = _reporte_png(doc)
                     if png:
@@ -8496,6 +9741,21 @@ def servir_web(puerto: int):
                                              usuario=email))
             elif ruta.path == "/instructivo":
                 self._html(vista_instructivo(base))
+            elif ruta.path.startswith("/brand/"):
+                p = (BASE / ruta.path.lstrip("/")).resolve()
+                if p.parent == (BASE / "brand") and p.suffix in (
+                        ".jpg", ".jpeg", ".png") and p.exists():
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "image/jpeg" if p.suffix
+                                     in (".jpg", ".jpeg")
+                                     else "image/png")
+                    self.send_header("Cache-Control",
+                                     "public, max-age=86400")
+                    self.end_headers()
+                    self.wfile.write(p.read_bytes())
+                else:
+                    self.send_error(404)
             elif ruta.path.startswith("/shots/"):
                 p = (BASE / ruta.path.lstrip("/")).resolve()
                 if p.parent == (BASE / "shots") and p.suffix == ".png" \
@@ -8579,13 +9839,21 @@ def servir_web(puerto: int):
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(
-                    json.dumps({"n": badge_count(email)}).encode())
+                    json.dumps(badge_counts(email)).encode())
             elif ruta.path == "/manifest.webmanifest":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/manifest+json")
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(MANIFEST)
+            elif ruta.path == "/sw.js":
+                # scope raíz; no-store para que updatefound lo detecte
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "application/javascript; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write((BASE / "sw.js").read_bytes())
             elif ruta.path == "/og.png" and OG_PNG.exists():
                 self.send_response(200)
                 mime_og = "image/jpeg" if OG_PNG.suffix in \
@@ -8732,11 +10000,13 @@ def servir_web(puerto: int):
                     return
                 texto_x = form.get("texto", [""])[0].strip()[:280]
                 fecha_x = form.get("fecha", [""])[0]
-                ok = texto_x and not _x_publicado(fecha_x) \
+                tipo_x = form.get("tipo", ["cierre"])[0]
+                ok = texto_x and not _x_publicado(fecha_x, tipo_x) \
                     and _post_x(texto_x)
                 with open(X_POSTS, "a", encoding="utf-8") as f:
                     f.write(json.dumps(
                         {"fecha": fecha_x, "texto": texto_x, "ok": ok,
+                         "tipo": tipo_x,
                          "ts": datetime.now().isoformat(
                              timespec="seconds")},
                         ensure_ascii=False) + "\n")
@@ -8769,6 +10039,7 @@ def servir_web(puerto: int):
                 else:
                     h = datetime.now().hour
                     franja = ("matutina" if h < 9 else
+                              "mediodia" if h < 12 else
                               "vespertina" if h < 15 else "nocturna")
                     if franja not in _GENERANDO:
                         _GENERANDO.add(franja)
@@ -8907,12 +10178,14 @@ def main():
                     threading.Thread(target=generar_sintesis,
                                      args=(cfg, franja), daemon=True,
                                      name=f"sintesis-{franja}").start()
-            # cierre del día: automático 21:05, 5 min tras la
-            # nocturna (el post a X sigue siendo botón — humano)
+            # cierre del día: automático 21:03, 3 min tras la
+            # nocturna — genera la tarjeta y la manda por mail
+            # (el post a X sigue siendo botón — humano)
             if toca_sintesis("cierre") and "cierre" not in _GENERANDO:
                 _GENERANDO.add("cierre")
                 threading.Thread(target=_gen_bg,
-                                 args=(generar_cierre, "cierre", cfg),
+                                 args=(_cierre_programado, "cierre",
+                                       cfg),
                                  daemon=True, name="cierre").start()
             # chucky: posts de las fuentes tipo fb, cada 4 h
             if toca_fb_posts():
@@ -8940,9 +10213,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
-if __name__ == "__main__":
-    sys.exit(main())
-if __name__ == "__main__":
-    sys.exit(main())
     sys.exit(main())
