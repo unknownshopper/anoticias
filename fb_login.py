@@ -40,6 +40,19 @@ def main():
             if any(c["name"] == "c_user" for c in ctx.cookies()):
                 ok = True
                 break
+        if ok and "/checkpoint/" in pg.url:
+            # reto de FB pendiente (¿fuiste tú? / confirma identidad):
+            # la sesión sirve solo DESPUÉS de resolverlo — esperar
+            print(">>> FB pide confirmar la sesión (checkpoint) — "
+                  "resuélvelo en la ventana; guardo al terminar.")
+            for _ in range(120):        # 10 min extra
+                time.sleep(5)
+                if "/checkpoint/" not in pg.url:
+                    break
+            ok = "/checkpoint/" not in pg.url
+            if not ok:
+                print("!! El checkpoint siguió abierto — "
+                      "nada se guardó.")
         if ok:
             ctx.storage_state(path=str(SESION))
             print(f"Sesión guardada en {SESION}")

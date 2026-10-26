@@ -109,14 +109,16 @@
         documentar el tratamiento digital de la información.</li>
   </ul>
 
-  <p>Además, la plataforma monitorea de forma continua los feeds y
-  sitios web de <b>89 fuentes informativas</b> (prensa tabasqueña,
-  medios nacionales, Quintana Roo, deportes, internacional y boletines
-  oficiales) y los organiza en secciones diseñadas para el trabajo
+  <p>Además, la plataforma monitorea de forma continua los feeds,
+  sitios web y redes sociales de <b>118 fuentes informativas</b>
+  (prensa tabasqueña, medios nacionales, Quintana Roo, deportes,
+  internacional, columnas políticas, redes X y Facebook, y boletines
+  oficiales) y las organiza en secciones diseñadas para el trabajo
   diario de Comunicación Social:</p>
   <ul>
     <li><b>Noticias</b> — feed unificado de todas las fuentes, con
-        temas de tendencia y búsqueda sobre el archivo histórico.</li>
+        temas de tendencia detectados automáticamente en X y búsqueda
+        sobre el archivo histórico.</li>
     <li><b>Alertas</b> — reglas personalizadas por usuario; cualquier
         nota que mencione los temas o personas de interés del Tribunal
         queda señalada y accesible de inmediato.</li>
@@ -125,14 +127,18 @@
         histórico desplegable por columna.</li>
     <li><b>Notas de interés</b> — filtrado específico del tema judicial
         de Tabasco: noticias sobre el Poder Judicial del estado, el
-        TSJT, sus magistrados, juzgados y actores institucionales.
+        TSJT, sus magistrados, juzgados y actores institucionales,
+        con los términos que lo activaron resaltados en cada nota.
         El filtro descarta automáticamente noticias judiciales de otros
-        estados o del ámbito federal que no mencionen a Tabasco.</li>
+        estados o del ámbito federal que no mencionen a Tabasco, y la
+        lista de términos se enriquece sobre la marcha conforme el
+        área identifique nuevas palabras clave.</li>
     <li><b>Lector interno</b> — cada nota se abre y lee dentro de la
         plataforma, con extracción de texto, imagen destacada y
         generación de PNG para compartir en informes o redes.</li>
     <li><b>Portadas</b> — captura diaria de primeras planas con
-        resolución nativa del PDF institucional.</li>
+        resolución nativa del PDF institucional, con línea de tiempo
+        que registra la hora exacta en que cae cada portada.</li>
     <li><b>Estadísticas y analítica</b> — conteo por medio, horario,
         categoría y periodo para el seguimiento de la cobertura.</li>
   </ul>
@@ -140,19 +146,22 @@
   <h2>Cobertura</h2>
   <table class="tabla">
     <tr><th>Sección</th><th>Medios</th><th>Entrega</th></tr>
-    <tr><td><b>Nacional</b> (22)</td>
+    <tr><td><b>Nacional</b> (27)</td>
         <td><div class="lista-medios" style="columns:2">
         Reforma · El Universal · Excélsior · La Jornada · 24 Horas ·
-        La Crónica · Diario Basta · Capital Edomex · Diario de México ·
-        Eje Central · El Economista · El Día · El Financiero · El Heraldo ·
-        El Independiente · El Sol de México · La Prensa · Milenio ·
-        Ovaciones · La Razón · Reporte Índigo · Uno Más Uno</div></td>
+        La Crónica · Contraréplica · Diario Basta · Capital Índigo ·
+        Diario de México · Eje Central · El Economista · El Día ·
+        El Financiero · ESTO · El Informador · Vanguardia · AM ·
+        Expreso · El Heraldo · El Independiente · El Sol de México ·
+        La Prensa · Milenio · Ovaciones · La Razón · Reporte Índigo ·
+        Uno Más Uno</div></td>
         <td>PDF único:<br>primeras planas nacionales</td></tr>
-    <tr><td><b>Tabasco</b> (12)</td>
+    <tr><td><b>Tabasco</b> (13)</td>
         <td><div class="lista-medios" style="columns:2">
-        Tabasco Hoy · Tabasco al Día · En Cambio · Diario Ahora Noticias ·
-        Avance · Diario de Tabasco · El Sol de Tabasco · Novedades de
-        Tabasco · Presente · CORAT/TVT · XEVT · XHVX</div></td>
+        El Heraldo · Tabasco Hoy · Tabasco al Día · En Cambio ·
+        Ahora Noticias · Avance · Diario de Tabasco · El Sol del
+        Sureste · Novedades · Presente · CORAT/TVT · XEVT · XHVX
+        </div></td>
         <td>PDF único:<br>primeras planas estatales</td></tr>
   </table>
 
@@ -160,13 +169,17 @@
   <ul>
     <li><b>00:30 h</b> — captura de los medios que publican de madrugada
         en sus redes oficiales (Tabasco al Día, CORAT/TVT publican su
-        edición al filo de medianoche).</li>
-    <li><b>06:30 h</b> — captura del resto de los diarios: primera plana
-        impresa y portada web de cada medio.</li>
-    <li><b>07:00 h</b> — se envía por correo electrónico al destinatario
-        designado un mensaje con los dos PDF adjuntos:
-        <i>Portadas Nacional</i> y <i>Portadas Tabasco</i>. En diarios con
-        edición impresa y web se incluyen ambas portadas.</li>
+        edición al filo de medianoche; Tabasco Hoy, Ahora Noticias y
+        demás medios que publican su portada en Facebook se capturan en
+        cuanto aparecen).</li>
+    <li><b>06:45 h</b> — se envía por correo electrónico la primera
+        emisión con los dos PDF adjuntos: <i>Portadas Nacional</i> y
+        <i>Portadas Tabasco</i>. En diarios con edición impresa y web
+        se incluyen ambas portadas.</li>
+    <li><b>08:45–09:00 h</b> — segunda emisión con los medios de
+        publicación tardía (Expreso, El Heraldo, XEVT y otros que
+        suben su portada después de las 06:45), de modo que el
+        compilado quede completo para el inicio de la jornada.</li>
     <li>El correo funciona además como <b>archivo histórico</b>: cada
         mensaje queda fechado y consultable en el buzón del cliente.</li>
     <li><b>Panel web</b> disponible las 24 h para consultar las capturas
@@ -188,13 +201,21 @@
   <div class="costo">
     <span>Desarrollo e implementación a la medida (pago único):</span>
     <span class="monto" contenteditable="true"
-      title="Editar monto antes de descargar">$45,000 MXN</span>
+      title="Editar monto antes de descargar">$90,000 MXN</span>
   </div>
   <div class="costo">
     <span>Soporte 24/7 (mensualidad):</span>
     <span class="monto" contenteditable="true"
       title="Editar monto antes de descargar">$18,000 MXN</span>
   </div>
+  <p>Para facilitar la puesta en marcha, el servicio incluye un
+  <b>periodo de implantación y ajuste de dos meses sin costo de
+  mensualidad</b>, durante el cual el Tribunal ya dispone de la
+  plataforma en operación plena (portadas, noticias, alertas,
+  columnas, notas de interés y analítica) mientras se calibran
+  fuentes, listas de interés y reglas de alerta a la medida del
+  área. La mensualidad de soporte comienza a facturarse a partir
+  del <b>tercer mes</b> de operación.</p>
   <p class="nota">* Precios más IVA. La cuota de implementación se
   factura una sola vez al inicio del servicio. El soporte 24/7 —
   que incluye la operación continua del monitoreo, la entrega

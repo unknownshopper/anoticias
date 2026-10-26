@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Monitor de noticias locales con alertas por palabras clave.
+Monitor de noticias del TSJT (Poder Judicial de Tabasco) con alertas y síntesis ejecutivas.
 
 Uso:
     python monitor.py              # revisa una vez
@@ -28,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+import random
 import unicodedata
 from collections import Counter
 from datetime import datetime, timedelta
@@ -36,7 +37,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, quote, urljoin
+from urllib.parse import urlparse, parse_qs, quote, urljoin, unquote
 import urllib.robotparser as robotparser
 
 import feedparser
@@ -93,18 +94,24 @@ def cargar_vistos() -> dict:
 
 
 def guardar_vistos(vistos: dict):
-    """Poda vistos a RETENCION_VISTOS_DIAS y tope de 8000 enlaces."""
+    """Poda vistos a RETENCION_VISTOS_DIAS y tope de 40000 enlaces.
+    22/oct: el write NO-atómico truncó el archivo (dedup ciego un día
+    entero — notas repetidas a los 3 días); y al ritmo actual
+    (~8k/día) el tope 8k hacía que un link 'expirara' en <24h."""
     ahora = time.time()
     limpio = {k: v for k, v in vistos.items()
               if ahora - v < RETENCION_VISTOS_DIAS * 86400}
-    if len(limpio) > 8000:
-        limpio = dict(list(limpio.items())[-8000:])
-    VISTOS.write_text(json.dumps(limpio, indent=0))
+    if len(limpio) > 40000:
+        limpio = dict(list(limpio.items())[-40000:])
+    _escribir_json(VISTOS, limpio)
 
 
 # ---- Multi-tenant: un perfil por usuario autenticado ----
 
-DEMO_HORAS = 24  # cuánto dura el perfil de invitado
+DEMO_HORAS = 24  # demo que REGALA el admin a un correo real (botón)
+DEMO_MINUTOS = 5      # la demo abierta /invitado dura esto
+DEMO_BLOQUEO_MIN = 60  # la IP no puede pedir otra demo hasta pasar esto
+DEMO_IPS = BASE / "demo_ips.json"  # {ip: ts última demo} — cool-down persistente
 
 
 def cargar_usuarios() -> dict:
@@ -200,6 +207,10 @@ def perfil_usuario(email: str, cfg: dict) -> dict:
     siembran las reglas globales de config.json (migración del MVP)."""
     usuarios = cargar_usuarios()
     if email not in usuarios:
+        if "@demo.local" in email:
+            # guest ya purgado/expirado — recrearlo aquí lo haría
+            # permanente (expira=0): devuelve perfil vacío efímero
+            return {"reglas": [], "fuentes_ocultas": [], "expira": 0}
         usuarios[email] = {
             "reglas": list(cfg.get("alertas", [])) if es_admin(email, cfg) else [],
             "fuentes_ocultas": [],
@@ -208,6 +219,30 @@ def perfil_usuario(email: str, cfg: dict) -> dict:
         }
         guardar_usuarios(usuarios)
     return usuarios[email]
+
+
+def nivel_usuario(email: str) -> str:
+    """'supervision' o 'operacion' (default) — el campo lo asigna el
+    admin al crear el usuario (alertas colaborativas, 20/oct)."""
+    return (cargar_usuarios().get(email) or {}).get(
+        "nivel", "operacion")
+
+
+def proyectos_usuario(email: str) -> list:
+    """Proyectos del usuario (puede estar en varios: ['tsjt','qroo']).
+    Lee 'proyectos' (lista); migra del campo viejo 'proyecto' (str)."""
+    u = cargar_usuarios().get(email) or {}
+    ps = u.get("proyectos")
+    if ps is None:
+        s = u.get("proyecto", "")
+        ps = [s] if s else []
+    return ps
+
+
+def es_supervisor(email: str, cfg: dict) -> bool:
+    """Admin o nivel supervisión (Paolo): supervisa TODOS los
+    proyectos — ve quién creó cada alerta y edita/borra resúmenes."""
+    return es_admin(email, cfg) or nivel_usuario(email) == "supervision"
 
 
 def fuentes_visibles(perfil: dict, cfg: dict) -> set:
@@ -321,6 +356,64 @@ def guardar_noticia(nota: dict):
         f.write(json.dumps(nota, ensure_ascii=False) + "\n")
 
 
+def _mandar_brevo_api(correo: dict, msg) -> None:
+    """Fallback sin IPs autorizadas: POST /v3/smtp/email con api-key.
+    Brevo exige IP autorizada para SMTP y UNINET rota la IP pública
+    (apagones) → los envíos morían con 525; la API autentica por key.
+    300 correos/día en el plan Free — sobra para alertas+PDFs+cierre."""
+    key = correo.get("api_key")
+    if not key:
+        raise RuntimeError("sin correo.api_key para fallback API")
+    payload = {"sender": {"email": correo.get("remitente",
+                                                 correo["usuario"])},
+               "to": [{"email": a.strip()}
+                      for a in str(msg["To"]).split(",")],
+               "subject": str(msg["Subject"])}
+    for p in msg.walk():
+        if p.get_content_maintype() == "multipart":
+            continue
+        if "attachment" in str(p.get("Content-Disposition", "")):
+            payload.setdefault("attachment", []).append({
+                "name": p.get_filename() or "adjunto",
+                "content": base64.b64encode(
+                    p.get_payload(decode=True)).decode()})
+        elif p.get_content_type() == "text/plain":
+            payload["textContent"] = \
+                p.get_payload(decode=True).decode("utf-8")
+        elif p.get_content_type() == "text/html":
+            payload["htmlContent"] = \
+                p.get_payload(decode=True).decode("utf-8")
+    r = requests.post("https://api.brevo.com/v3/smtp/email",
+                      headers={"api-key": key,
+                               "Accept": "application/json"},
+                      json=payload, timeout=40)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(
+            f"API Brevo {r.status_code}: {r.text[:150]}")
+
+
+def _mandar_msg(correo: dict, msg, timeout: int = 20):
+    """SMTP primero; si falla (525 Unauthorized IP al rotar la IP de
+    UNINET en un apagón, timeout, etc.) → API REST de Brevo con
+    correo.api_key — no depende de la IP pública."""
+    puerto = correo.get("smtp_port", 465)
+    try:
+        if puerto == 587:   # STARTTLS (Brevo)
+            with smtplib.SMTP(correo["smtp_host"], puerto,
+                              timeout=timeout) as s:
+                s.starttls()
+                s.login(correo["usuario"], correo["password"])
+                s.send_message(msg)
+        else:               # SSL directo (Gmail 465)
+            with smtplib.SMTP_SSL(correo["smtp_host"], puerto,
+                                  timeout=timeout) as s:
+                s.login(correo["usuario"], correo["password"])
+                s.send_message(msg)
+    except Exception as e:
+        print(f"    [correo] SMTP falló ({e}) → intento API Brevo")
+        _mandar_brevo_api(correo, msg)
+
+
 def enviar_correo(cfg: dict, alerta: dict):
     """Manda correo de alerta vía SMTP si está habilitado en config.
 
@@ -349,18 +442,7 @@ def enviar_correo(cfg: dict, alerta: dict):
         msg["Subject"] = f"[Monitor] {alerta['reglas']}: {alerta['titulo'][:80]}"
         msg["From"] = correo.get("remitente", correo["usuario"])
         msg["To"] = destinatario
-        puerto = correo.get("smtp_port", 465)
-        if puerto == 587:   # STARTTLS (Brevo)
-            with smtplib.SMTP(correo["smtp_host"], puerto,
-                              timeout=20) as s:
-                s.starttls()
-                s.login(correo["usuario"], correo["password"])
-                s.send_message(msg)
-        else:               # SSL (Gmail 465)
-            with smtplib.SMTP_SSL(correo["smtp_host"], puerto,
-                                  timeout=20) as s:
-                s.login(correo["usuario"], correo["password"])
-                s.send_message(msg)
+        _mandar_msg(correo, msg)
         print("    ✉ correo enviado")
     except Exception as e:
         print(f"    [!] correo falló: {e}")
@@ -482,6 +564,46 @@ def extraer_og_desc(link: str) -> str:
     return ""
 
 
+_RX_CUERPO_NOTA = re.compile(
+    r'<(?:div|article|section)[^>]+class=["\'][^"\']*'
+    r"(?:post-text|post-content|entry-content|article-body|"
+    r"cuerpo-nota|note-body|post-body|content-nota)"
+    r'[^"\']*["\'][^>]*>', re.I)
+
+
+def extraer_lead_html(link: str) -> str:
+    """Primer ~400c del cuerpo real de la nota — para fuentes 'html'
+    cuyo índice solo entrega el titular y cuyo og:description repite
+    el título (TSJ Tabasco). Busca contenedores típicos de body."""
+    try:
+        r = requests.get(link, timeout=10,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        m = _RX_CUERPO_NOTA.search(r.text)
+        if not m:
+            return ""
+        # el body empieza tras la etiqueta; 8KB alcanzan para el lead
+        txt = re.sub(r"<[^>]+>", " ", r.text[m.end():m.end() + 8192])
+        return " ".join(html.unescape(txt).split())[:400]
+    except Exception:
+        return ""
+
+
+_RX_TERMINO: dict = {}
+
+
+def termino_en(termino_norm: str, t_norm: str) -> bool:
+    """El término ya normalizado aparece como PALABRA/frase completa
+    en el texto normalizado — 'prada' no debe prenderse dentro de
+    'comprada'; 'garcia serrano' sigue siendo frase exacta."""
+    rx = _RX_TERMINO.get(termino_norm)
+    if rx is None:
+        if len(_RX_TERMINO) > 4000:
+            _RX_TERMINO.clear()
+        rx = _RX_TERMINO[termino_norm] = re.compile(
+            r"(?<!\w)" + re.escape(termino_norm) + r"(?!\w)")
+    return bool(rx.search(t_norm))
+
+
 def coincide(texto: str, regla: dict) -> bool:
     """Match flexible: con 3+ términos basta que aparezcan TODOS MENOS
     UNO (la nota 'Pepín López Obrador' alerta la regla 'Ramiro, Obrador,
@@ -490,7 +612,8 @@ def coincide(texto: str, regla: dict) -> bool:
     t = normalizar(texto)
     palabras = regla["requiere_todas"]
     hits = sum(1 for p in palabras
-               if any(normalizar(v) in t for v in p.split("/")))
+               if any(termino_en(normalizar(v), t)
+                      for v in p.split("/")))
     min_hits = len(palabras) if len(palabras) <= 2 \
         else len(palabras) - 1
     return hits >= min_hits
@@ -659,29 +782,92 @@ def generar_sintesis(cfg: dict, franja: str) -> str:
         desde = (ahora - timedelta(days=1)).replace(
             hour=21, minute=0, second=0)
     elif franja == "mediodia":
-        desde = ahora.replace(hour=0, minute=0, second=0)
+        # desde el cierre del día anterior — cubre noche + mañana
+        desde = (ahora - timedelta(days=1)).replace(
+            hour=17, minute=0, second=0)
     elif franja == "nocturna":
         desde = ahora.replace(hour=15, minute=0, second=0)
+    elif franja in ("semanal", "dominical"):
+        # sábado/domingo → cubre la semana en curso: lunes 00:00
+        desde = (ahora - timedelta(days=ahora.weekday())).replace(
+            hour=0, minute=0, second=0)
     else:   # vespertina
         desde = ahora.replace(hour=9, minute=0, second=0)
-    sel = _sel_interes_extendida(desde)
+    # la semanal junta 6 días de material — doble de notas que una
+    # franja diaria (llama3.2 lo tolera con títulos, no con resúmenes)
+    sel = _sel_interes_extendida(
+        desde, limite=150 if franja in ("semanal", "dominical") else 60)
     if not sel:
         return ""
+    if franja in ("semanal", "dominical"):
+        # recirculaciones GN: el feed reporta fecha de RE-indexación,
+        # no la de publicación real — una nota de julio/2025 no puede
+        # colarse al reporte de esta semana. Solo se verifican las que
+        # llegaron vía Google News (RSS propio trae pubDate real)
+        lim_dia = desde.strftime("%Y-%m-%d")
+        verif = []
+        for n in sel:
+            if "GN" not in (n.get("via") or ""):
+                verif.append(n)
+                continue
+            fr_ = _fecha_real_pagina(n["link"])
+            if fr_ and fr_[:10] < lim_dia:
+                print(f"[sintesis] recirculación GN descartada "
+                      f"({fr_[:10]}): {n['titulo'][:60]}")
+                continue
+            verif.append(n)
+        sel = verif
+        if not sel:
+            return ""
     # jerarquía institucional: numerar [N#] en ese orden guía al
     # modelo a escribir por relevancia — Reséndez siempre arriba
     sel.sort(key=_prio_interes)
+    if franja == "dominical":
+        # análisis del tema rector de la semana: se toma el tier más
+        # alto con material (Reséndez siempre si hubo; si no, cae al
+        # siguiente — fallback explícito, nunca fuerza un texto vacío)
+        mejor = _prio_interes(sel[0])
+        sel = [n for n in sel if _prio_interes(n) == mejor][:30]
     lineas = "\n".join(
         f"- [N{i+1}|{n.get('categoria', '')}|{n['fuente']}] "
         f"{n['titulo']}"
         + (f" — {n['resumen'][:280]}" if n.get("resumen") else "")
         for i, n in enumerate(sel))
     nombre = {"matutina": "matutina (lo ocurrido desde ayer 21:00)",
-              "mediodia": "de mediodía (hoy 00:00 a 12:00)",
+              "mediodia": "de mediodía (desde ayer 17:00 "
+                          "hasta hoy al mediodía)",
               "vespertina": "vespertina (hoy 09:00 a 15:00)",
+              "semanal": "SEMANAL — balance de la semana "
+                          "(lunes a hoy sábado al mediodía)",
               "nocturna": "nocturna — cierre del día "
                           "(hoy 15:00 a 21:00)"}.get(
                   franja, franja)
-    prompt = (
+    if franja == "dominical":
+        prompt = (
+            "Eres el analista político-judicial del Poder Judicial del "
+            "Estado de Tabasco. Escribe un ANÁLISIS DOMINICAL: la "
+            "lectura editorial de fin de semana sobre el tema rector "
+            "que muestran estas notas de la semana (prioridad siempre "
+            "al Magistrado Presidente Efraín Reséndez y al TSJT).\n"
+            "Formato exacto, con estos subtítulos en mayúsculas:\n"
+            "- EL TEMA: qué pasó esta semana, en un párrafo.\n"
+            "- LA SITUACIÓN: contexto y actores involucrados, según "
+            "las notas.\n"
+            "- A FAVOR / EN CONTRA: fuerzas, lecturas o bandos que se "
+            "observan en la cobertura (si aplica).\n"
+            "- QUÉ OBSERVAR: qué viene o qué se debe vigilar la "
+            "próxima semana.\n"
+            "- PROFUNDIDAD: reporte enriquecido — desarrolla cada "
+            "sección con el detalle que permita el material (varios "
+            "párrafos por sección si hay suficientes notas); cruza "
+            "actores, fechas y hechos entre notas distintas.\n"
+            "- REGLA DURA: usa SOLO los hechos literales de las notas. "
+            "PROHIBIDO inventar citas, cifras, nombres o hechos. Si un "
+            "subtítulo no tiene material real, omítelo.\n"
+            "- Cada párrafo cierra con [N#] de la nota que lo "
+            "sustenta. Sin introducción ni despedida.\n\n" + lineas)
+    else:
+        prompt = (
         "Eres el analista de comunicación social del Poder Judicial del "
         "Estado de Tabasco. Redacta la SÍNTESIS EJECUTIVA " + nombre +
         " con estas notas, al estilo de un reporte profesional de "
@@ -703,7 +889,13 @@ def generar_sintesis(cfg: dict, franja: str) -> str:
         "- PRIORIDAD de agenda: primero lo del Magistrado Presidente "
         "del TSJT (Efraín Reséndez) y del Poder Judicial del Estado; "
         "después el Gobernador (Javier May); luego el resto.\n"
-        "- REGLA DURA: usa SOLO los hechos literales de las notas. "
+        + (
+            "- SEMANAL: la sección PODER JUDICIAL DE TABASCO abre con "
+            "un párrafo 'Destaque de la semana' que resume en 3-4 "
+            "líneas las actividades del Magistrado Presidente Efraín "
+            "Reséndez y del TSJT; los bullets siguen después.\n"
+            if franja == "semanal" else "")
+        + "- REGLA DURA: usa SOLO los hechos literales de las notas. "
         "PROHIBIDO inventar citas textuales, usuarios de redes "
         "(@alguien), cifras, nombres o hechos. No escribas 'no se "
         "tienen noticias' — si una sección no tiene material, omítela.\n"
@@ -744,7 +936,7 @@ def _perspectiva_dia(cfg: dict, ahora: datetime) -> str:
     # ventana 24h: historias de ayer que siguen vigentes compiten —
     # el modelo ve la fecha de cada titular y valora continuidad
     desde = (ahora - timedelta(hours=24)).isoformat()
-    notas = [n for n in leer_jsonl(NOTICIAS, limite=0)
+    notas = [n for n in _noticias_cache()
              if n.get("fecha", "") >= desde]
     # piezas fijas no son 'impacto': crucigramas, programas diarios,
     # columnas firmadas, parte meteorológico — y timestamps crudos
@@ -846,22 +1038,22 @@ def _perspectiva_dia(cfg: dict, ahora: datetime) -> str:
     return txt
 
 
-def _sel_interes_extendida(desde: datetime) -> list:
+def _sel_interes_extendida(desde: datetime, limite: int = 60) -> list:
     """Notas de la lista de interés desde 'desde', deduplicadas; si hay
     <5 la ventana se extiende hacia atrás (72 h máx.) para no salir
     vaga — misma regla para síntesis y monólogo."""
     sel = _dedup_notas(
-        [n for n in leer_jsonl(NOTICIAS, limite=0)
+        [n for n in _noticias_cache()
          if n.get("fecha", "") >= desde.isoformat()
-         and coincide_interes(n)])[:60]
+         and coincide_interes(n)])[:limite]
     intentos = 0
     while len(sel) < 5 and intentos < 6:
         intentos += 1
         desde = desde - timedelta(hours=12)
         sel = _dedup_notas(
-            [n for n in leer_jsonl(NOTICIAS, limite=0)
+            [n for n in _noticias_cache()
              if n.get("fecha", "") >= desde.isoformat()
-             and coincide_interes(n)])[:60]
+             and coincide_interes(n)])[:limite]
     # posts de redes que DISPARARON alguna regla (alertas.jsonl) entran
     # a la selección aunque no sean de interés judicial — la síntesis
     # puede citar al menos uno cuando hay ruido social relevante
@@ -869,7 +1061,7 @@ def _sel_interes_extendida(desde: datetime) -> list:
                  if a.get("fecha", "") >= desde.isoformat()}
     if alertados:
         en_sel = {n["link"] for n in sel}
-        sel += [n for n in leer_jsonl(NOTICIAS, limite=0)
+        sel += [n for n in _noticias_cache()
                 if n.get("categoria") in ("redes", "x")
                 and n["link"] in alertados
                 and n["link"] not in en_sel
@@ -1010,9 +1202,169 @@ def generar_cierre(cfg: dict) -> str:
     return texto
 
 
+# reporte express: un proceso por usuario, cancelable desde la UI
+_REPORTE_EXPRESS = {}
+
+
+def _worker_reporte_express(email: str, cfg: dict):
+    """Hilo del reporte: el usuario pudo cancelar a media generación —
+    si la marca ya está puesta al terminar el LLM, el PDF se desecha."""
+    st = _REPORTE_EXPRESS.setdefault(
+        email, {"estado": "generando", "pdf": None})
+    try:
+        texto = generar_reporte_express(cfg)
+        if st.get("estado") == "cancelado":
+            return
+        if not texto:
+            st["estado"] = "error"
+            return
+        ahora_r = datetime.now()
+        st["pdf"] = _texto_pdf(
+            "Reporte express — monitoreo de medios",
+            ahora_r.strftime("%d/%m/%Y · %H:%M h"), texto)
+        if st.get("estado") == "cancelado":
+            st["pdf"] = None
+            return
+        st["estado"] = "listo"
+    except Exception as e:
+        print(f"[reporte-express] {email}: {e}")
+        st["estado"] = "error"
+
+
+def _vista_reporte_progreso(estado: str) -> str:
+    """Pantalla de espera con spinner + cancelar; el JS consulta el
+    estado y salta a la descarga cuando el PDF está listo."""
+    return (
+        "<style>.spin{width:36px;height:36px;border:4px solid #1a237e33;"
+        "border-top-color:#1a237e;border-radius:50%;"
+        "animation:spin 1s linear infinite;margin:0 auto}</style>"
+        "<div class='card' style='text-align:center;padding:2.5rem'>"
+        "<div class='spin'></div>"
+        "<h1 style='margin-top:1rem'>Generando reporte express…</h1>"
+        "<p class='meta'>El modelo redacta el informe con la "
+        "información capturada hasta ahora — puede tardar ~1 min.</p>"
+        "<a href='/resumenes-pdf?op=cancelar'>"
+        "<button class='btn-linea'>Cancelar</button></a></div>"
+        "<script>setInterval(function(){"
+        "fetch('/resumenes-pdf?op=estado').then(r=>r.json())"
+        ".then(function(d){"
+        " if(d.e==='listo'){location='/resumenes-pdf?op=descargar'}"
+        " else if(d.e==='error'){location='/resumenes?msg='"
+        "   +encodeURIComponent('No se pudo generar — sin material o "
+        "el modelo no respondió.')}"
+        " else if(d.e==='cancelado'){location='/resumenes'}"
+        "})},2000);</script>")
+
+
+def generar_reporte_express(cfg: dict) -> str:
+    """REPORTE EXPRESS — on-demand, a la hora en que se pide. El LLM
+    escribe un informe breve e imprimible con la info del día hasta
+    ese momento (notas de interés + síntesis ya generadas)."""
+    ahora = datetime.now()
+    sel = sorted(_sel_interes_extendida(ahora.replace(
+        hour=0, minute=0, second=0)),
+        key=_prio_interes)[:15]
+    hoy = ahora.strftime("%Y-%m-%d")
+    sint_hoy = [e for e in leer_jsonl(SINTESIS)
+                if e.get("fecha", "").startswith(hoy)]
+    if not sel and not sint_hoy:
+        return ""
+    lineas = "\n".join(
+        f"- [N{i+1}|{n.get('categoria', '')}|{n['fuente']}] "
+        f"{n['titulo']}"
+        + (f" — {n['resumen'][:280]}" if n.get("resumen") else "")
+        for i, n in enumerate(sel))
+    bloque_s = "\n".join(
+        f"· {e.get('franja', '').upper()} "
+        f"({e.get('fecha', '')[11:16]}): "
+        f"{e.get('texto', '')[:900]}" for e in sint_hoy)
+    prompt = (
+        "Eres el redactor de comunicación social del Poder Judicial de "
+        f"Tabasco. Son las {ahora.strftime('%H:%M')} — escribe un "
+        "REPORTE EXPRESS imprimible de media a una cuartilla: el estado "
+        "del monitoreo de medios a esta hora, usando SOLO este "
+        "material:\n\n"
+        "NOTAS DE INTERÉS DE HOY:\n" + (lineas or "(ninguna)") +
+        "\n\nSÍNTESIS YA GENERADAS HOY:\n" + (bloque_s or "(ninguna)") +
+        "\n\nReglas:\n"
+        "- Tono: informe institucional, tercera persona, sin saludos "
+        "ni despedidas.\n"
+        "- Estructura: 1 párrafo de panorama, luego hasta 5 puntos "
+        "con lo relevante (los del TSJ/Reséndez primero), y una línea "
+        "final de vigilancia ('se continuará el monitoreo de…').\n"
+        "- PROHIBIDO inventar datos, citas, cifras o nombres que no "
+        "estén en el material.\n"
+        "- Marca entre corchetes la hora de publicación cuando la "
+        "sepa la síntesis; sin etiquetas [N#] en el texto final.\n"
+        "- Sin títulos ni subtítulos dentro del cuerpo — el "
+        "encabezado lo pone el PDF.")
+    texto = _llm(cfg, prompt, timeout=480)
+    if not texto or texto.startswith("(no se pudo"):
+        return ""
+    return texto
+
+
+def _texto_pdf(titulo: str, subtitulo: str, cuerpo: str) -> bytes:
+    """Texto → PDF multipágina con PIL/DejaVu (~A4 a 150dpi). El
+    mismo truco imgs[0].save(PDF, save_all) del PDF de portadas."""
+    from PIL import ImageDraw, ImageFont
+    W, H, MX, MY = 1240, 1754, 90, 80
+    _FD = "/usr/share/fonts/truetype/dejavu/"
+    f_t = ImageFont.truetype(_FD + "DejaVuSans-Bold.ttf", 44)
+    f_s = ImageFont.truetype(_FD + "DejaVuSans.ttf", 26)
+    f_b = ImageFont.truetype(_FD + "DejaVuSans.ttf", 28)
+
+    def _pagina():
+        im = Image.new("RGB", (W, H), "#ffffff")
+        return im, ImageDraw.Draw(im)
+
+    def _wrap(draw, texto, font, ancho):
+        for par in texto.split("\n"):
+            if not par.strip():
+                yield None            # salto de párrafo
+                continue
+            linea = ""
+            for pal in par.split():
+                prueba = (linea + " " + pal).strip()
+                if draw.textlength(prueba, font=font) <= ancho:
+                    linea = prueba
+                else:
+                    yield linea
+                    linea = pal
+            yield linea
+
+    paginas = []
+    im, draw = _pagina()
+    y = MY
+    draw.text((MX, y), titulo, font=f_t, fill="#1a237e")
+    y += 62
+    draw.text((MX, y), subtitulo, font=f_s, fill="#555555")
+    y += 52
+    draw.line((MX, y, W - MX, y), fill="#1a237e", width=3)
+    y += 30
+    for linea in _wrap(draw, cuerpo, f_b, W - 2 * MX):
+        if linea is None:
+            y += 22
+            continue
+        if y > H - MY - 40:
+            paginas.append(im)
+            im, draw = _pagina()
+            y = MY
+        draw.text((MX, y), linea, font=f_b, fill="#222222")
+        y += 40
+    paginas.append(im)
+    buf = io.BytesIO()
+    paginas[0].save(buf, "PDF", save_all=True,
+                    append_images=paginas[1:], title=titulo,
+                    author="@noticias", creator="Olmeca Code")
+    for im in paginas:
+        im.close()
+    return buf.getvalue()
+
+
 def enviar_cierre_mail(cfg: dict, texto_cierre: str):
-    """Correo del cierre del día (programado 21:03): el briefing más
-    las síntesis matutina, vespertina y nocturna — 24 h completas."""
+    """Correo del cierre del día (programado 17:00): el briefing más
+    la síntesis de mediodía — el día completo."""
     correo = cfg.get("correo", {})
     if not correo.get("habilitado"):
         return
@@ -1021,11 +1373,11 @@ def enviar_cierre_mail(cfg: dict, texto_cierre: str):
         return
     ultimas = {}
     for e in leer_jsonl(SINTESIS):
-        if e.get("franja") in ("matutina", "vespertina", "nocturna"):
+        if e.get("franja") == "mediodia":
             ultimas[e["franja"]] = e
     partes = [f"CIERRE DEL DÍA — {datetime.now():%d/%m/%Y %H:%M}",
               "=" * 52, "", texto_cierre]
-    for fr in ("matutina", "vespertina", "nocturna"):
+    for fr in ("mediodia",):
         e = ultimas.get(fr)
         if not e:
             continue
@@ -1038,18 +1390,7 @@ def enviar_cierre_mail(cfg: dict, texto_cierre: str):
                           f"{datetime.now():%d/%m/%Y}")
         msg["From"] = correo.get("remitente", correo["usuario"])
         msg["To"] = destinatario
-        puerto = correo.get("smtp_port", 465)
-        if puerto == 587:   # STARTTLS (Brevo)
-            with smtplib.SMTP(correo["smtp_host"], puerto,
-                              timeout=20) as s:
-                s.starttls()
-                s.login(correo["usuario"], correo["password"])
-                s.send_message(msg)
-        else:               # SSL (Gmail 465)
-            with smtplib.SMTP_SSL(correo["smtp_host"], puerto,
-                                  timeout=20) as s:
-                s.login(correo["usuario"], correo["password"])
-                s.send_message(msg)
+        _mandar_msg(correo, msg)
         print("[cierre] ✉ mail enviado")
     except Exception as e:
         print(f"[cierre] mail falló: {e}")
@@ -1067,15 +1408,24 @@ def _cierre_programado(cfg: dict) -> str:
 def toca_sintesis(franja: str) -> bool:
     """True si pasó la hora de la franja y aún no hay síntesis de hoy."""
     ahora = datetime.now()
-    # minutos desde medianoche — cierre 21:03, mismo tick que suele
-    # disparar la nocturna (≥21:00): si esperara 21:05 se iría a la
-    # siguiente pasada del loop (~15 min tarde)
-    hora = {"matutina": 9 * 60, "mediodia": 11 * 60 + 55,
-            "vespertina": 15 * 60,
-            "nocturna": 21 * 60, "cierre": 21 * 60 + 3}.get(
-        franja, 9 * 60)
-    if ahora.hour * 60 + ahora.minute < hora:
+    # CANON: lun-vie → digests matutina 09:00 / vespertina 15:00 /
+    # nocturna 21:00 (concentrado fiel de lo publicado, imprimible)
+    # + análisis mediodía 12:00 y cierre 17:00; sábado → solo
+    # semanal 12:00; domingo → solo análisis dominical 10:00.
+    hora = {"matutina": 9 * 60, "mediodia": 12 * 60,
+            "vespertina": 15 * 60, "cierre": 17 * 60,
+            "nocturna": 21 * 60,
+            "semanal": 12 * 60, "dominical": 10 * 60}.get(franja, -1)
+    if hora < 0 or ahora.hour * 60 + ahora.minute < hora:
         return False
+    wd = ahora.weekday()
+    if franja == "semanal" and wd != 5:
+        return False   # balance semanal: solo sábados al mediodía
+    if franja == "dominical" and wd != 6:
+        return False   # análisis editorial: solo domingos
+    if franja in ("matutina", "mediodia", "vespertina",
+                  "cierre", "nocturna") and wd >= 5:
+        return False   # fin de semana no hay digests ni cierres
     hoy = ahora.strftime("%Y-%m-%d")
     return not any(e.get("franja") == franja
                    and e.get("fecha", "").startswith(hoy)
@@ -1083,7 +1433,7 @@ def toca_sintesis(franja: str) -> bool:
 
 
 PATRON_NOTA_HTML = re.compile(
-    r'<a[^>]+href=["\']([^"\']*/[^/"\']+/\d{3,}/[^/"\']+)["\'][^>]*>'
+    r'<a[^>]+href=["\']([^"\']*/[^/"\']+/\d{3,}/[^/"\']+/?)["\'][^>]*>'
     r"(.*?)</a>", re.I | re.S)
 
 
@@ -1116,27 +1466,72 @@ def resolver_link_gn(link: str) -> str:
             headers={**ua, "Content-Type":
                      "application/x-www-form-urlencoded;charset=UTF-8",
                      "Referer": link})
-        m = re.search(r'\\"garturlres\\",\\"(https?://[^"\\]+)', resp.text)
+        m = re.search(r'\\"garturlres\\",\\"(https?://[^"\\]+)',
+                      resp.text)
         if not m:
-            m = re.search(r'"garturlres","(https?://[^"\\]+)', resp.text)
+            m = re.search(r'"garturlres","(https?://[^"\\]+)',
+                          resp.text)
         return m.group(1) if m else link
     except Exception:
         return link
 
 
+_MESES_ES = {"enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+             "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+             "septiembre": 9, "setiembre": 9, "octubre": 10,
+             "noviembre": 11, "diciembre": 12}
+_RX_FECHA_ES = re.compile(
+    r"(\d{1,2})\s+de\s+([a-záéíóúñ]+)\s+(?:de|del)\s+(\d{4})", re.I)
+
+
+def _fecha_cerca(doc: str, pos: int) -> tuple:
+    """Fecha '19 de Octubre de 2026' en una ventana alrededor del
+    anchor — el card del listado la trae junto al link (TSJ Tabasco).
+    Devuelve published_parsed o None."""
+    win = doc[max(0, pos - 1500):pos + 2500]
+    m = _RX_FECHA_ES.search(win)
+    if not m:
+        return None
+    mes = _MESES_ES.get(m.group(2).lower())
+    if not mes:
+        return None
+    try:
+        # mediodía local evita cruzar el día al convertir a epoch
+        return datetime(int(m.group(3)), mes, int(m.group(1)),
+                        12, 0).timetuple()
+    except ValueError:
+        return None
+
+
 def extraer_notas_html(doc: str, base: str) -> list:
     """De HTML plano extrae enlaces-título de notas del patrón
-    /seccion/123456/slug — típico de sitios sin RSS (XEVA, etc.)."""
-    notas = []
-    vistos = set()
-    for href, texto in PATRON_NOTA_HTML.findall(doc):
-        link = urljoin(base, html.unescape(href))
-        titulo = re.sub(r"<[^>]+>", " ", texto).strip()
-        titulo = " ".join(titulo.split())
-        if len(titulo) < 15 or link in vistos:
+    /seccion/123456/slug[/] — típico de sitios sin RSS (XEVA, TSJ
+    Tabasco). El mismo link suele salir 3 veces (imagen, título,
+    botón): se queda el anchor con más texto; si ninguno trae texto
+    se usa el slug como título."""
+    por_link = {}
+    for m in PATRON_NOTA_HTML.finditer(doc):
+        link = urljoin(base, html.unescape(m.group(1)))
+        titulo = re.sub(r"<[^>]+>", " ", m.group(2))
+        titulo = " ".join(html.unescape(titulo).split())
+        if not titulo or titulo == por_link.get(link, ("",))[0]:
             continue
-        vistos.add(link)
-        notas.append({"link": link, "title": titulo, "summary": ""})
+        # quedarse con el anchor de más texto (h5 > botón)
+        if len(titulo) > len(por_link.get(link, ("",))[0]):
+            por_link[link] = (titulo, m.start())
+    notas = []
+    for link, (titulo, pos) in por_link.items():
+        if len(titulo) < 15:
+            # sin texto de anchor → el slug como título legible
+            slug = unquote(link.rstrip("/").rsplit("/", 1)[-1])
+            titulo = slug.replace("-", " ").replace("_", " ").strip()
+            if len(titulo) < 15:
+                continue
+        ent = {"link": link, "title": titulo, "summary": ""}
+        fp = _fecha_cerca(doc, pos)
+        if fp:
+            ent["published_parsed"] = fp
+        notas.append(ent)
     return notas
 
 
@@ -1208,7 +1603,16 @@ def _scrapear_x_posts(handle: str) -> list:
     del feed propio (todo lo que sigue el poli, atribuido por autor)."""
     if not X_SESSION.exists():
         return []
+    # 'buscar:<query>' → pestaña Latest de la búsqueda global: revela
+    # quién publica sobre el actor sin tener que seguir ni listar cada
+    # cuenta (técnica acordada 22/oct — una carga de página por pasada)
+    buscar = handle.lower().startswith("buscar:")
     es_home = handle.lower() == "home"
+    if buscar:
+        target = "https://x.com/search?q=" + quote(handle[7:]) + "&f=live"
+    else:
+        target = ("https://x.com/home" if es_home
+                else f"https://x.com/{handle}")
     posts = []
     try:
         from playwright.sync_api import sync_playwright
@@ -1216,10 +1620,12 @@ def _scrapear_x_posts(handle: str) -> list:
             br = _launch(p)
             pg = br.new_context(
                 storage_state=str(X_SESSION)).new_page()
-            pg.goto("https://x.com/home" if es_home
-                    else f"https://x.com/{handle}",
-                    wait_until="domcontentloaded", timeout=45000)
-            pg.wait_for_timeout(6000)
+            # ritmo humano (tropicalización 22/oct): pausa variable
+            # antes de navegar — nada de ir de perfil en perfil en
+            # ráfaga metronómica
+            pg.wait_for_timeout(random.randint(2500, 5500))
+            pg.goto(target, wait_until="domcontentloaded", timeout=45000)
+            pg.wait_for_timeout(random.randint(4000, 7500))
             if "login" in pg.url:
                 br.close()
                 print(f"[!] X sesión caída — re-correr x_login.py")
@@ -1233,11 +1639,12 @@ def _scrapear_x_posts(handle: str) -> list:
                     pg.wait_for_timeout(4000)
                 except Exception:
                     pass   # si no hay tab, queda 'Para ti' (ruido)
-            for _ in range(4):
-                pg.mouse.wheel(0, 3000)
-                pg.wait_for_timeout(1800)
-            posts = pg.evaluate("""() => {
-                const out = [], seen = new Set();
+            # scroll profundo con extracción INCREMENTAL: X desmonta del
+            # DOM los tweets que salen de pantalla — 4 giros al final
+            # solo veían ~7. Extrae en cada giro y acumula por link;
+            # sigue hasta ~30 únicos o 2 giros sin carga nueva
+            js_tweets = """() => {
+                const out = [];
                 for (const t of document.querySelectorAll(
                         'article[data-testid="tweet"]')) {
                     // ad promocionado: entra al feed sin seguir la
@@ -1250,8 +1657,7 @@ def _scrapear_x_posts(handle: str) -> list:
                         continue;
                     const a = t.querySelector('a[href*="/status/"]');
                     const link = a ? a.href.split('?')[0] : '';
-                    if (!link || seen.has(link)) continue;
-                    seen.add(link);
+                    if (!link) continue;
                     const tt = t.querySelector(
                         'div[data-testid="tweetText"]');
                     const tm = t.querySelector('time');
@@ -1259,17 +1665,35 @@ def _scrapear_x_posts(handle: str) -> list:
                     // NO (og:image de X siempre devuelve el perfil);
                     // fallback: card del link compartido (img del
                     // artículo, ej. 'De xevt.com')
-                    const ph = t.querySelector(
-                        'div[data-testid="tweetPhoto"] img,'
-                      + 'div[data-testid="card.wrapper"] img');
+                    const phs = Array.from(t.querySelectorAll(
+                        'div[data-testid="tweetPhoto"] img'))
+                        .map(i => i.src)
+                        .filter(s => s && s.includes('media'));
+                    const card = t.querySelector(
+                        'div[data-testid="card.wrapper"] img');
                     out.push({link: link,
                               autor: (link.split('/')[3] || ''),
                               txt: tt ? tt.innerText : '',
-                              img: ph ? ph.src : '',
+                              img: phs.length ? phs[0]
+                                              : (card ? card.src : ''),
+                              imgs: phs.length ? phs
+                                               : (card ? [card.src] : []),
                               time: tm ? (tm.dateTime || '') : ''});
                 }
                 return out;
-            }""")
+            }"""
+            posts, vistos, quieto, prev = [], set(), 0, -1
+            for _ in range(15):
+                for tw in pg.evaluate(js_tweets):
+                    if tw["link"] not in vistos:
+                        vistos.add(tw["link"])
+                        posts.append(tw)
+                if len(posts) >= 30 or quieto >= 2:
+                    break
+                quieto = quieto + 1 if len(posts) <= prev else 0
+                prev = len(posts)
+                pg.mouse.wheel(0, random.randint(2400, 3400))
+                pg.wait_for_timeout(random.randint(1500, 3200))
             br.close()
     except Exception:
         return []
@@ -1294,15 +1718,24 @@ def _scrapear_x_posts(handle: str) -> list:
                "summary": txt, "published_parsed": pp,
                "_autor": "@" + p_["autor"] if p_.get("autor")
                          else ""}
-        if p_.get("img"):
-            ent["media_content"] = [{"url": html.unescape(p_["img"])}]
+        # imgs[] = TODAS las fotos del tweet (multi-foto: portada +
+        # contraportada); img = solo la 1ª (fallback extractor viejo)
+        fotos = p_.get("imgs") or ([p_["img"]] if p_.get("img") else [])
+        if fotos:
+            ent["media_content"] = [{"url": html.unescape(u)}
+                                    for u in fotos if u]
         out.append(ent)
     return out
 
 
 def _feed_x(url: str) -> list:
-    """Timeline de X. Fuente.url = 'x:handle'. Primero Nitter (gratis);
-    si los espejos mueren cae al scraper con sesión (x_session.json)."""
+    """Timeline de X. Fuente.url = 'x:handle' o 'x:buscar:<query>'.
+    Primero Nitter (gratis); si los espejos mueren cae al scraper con
+    sesión (x_session.json). La búsqueda no tiene espejo — va directo
+    a la sesión."""
+    if url.strip().lower().startswith("x:buscar:"):
+        q = url.strip()[9:]
+        return _scrapear_x_posts("buscar:" + q) if q else []
     handle = _handle_x(url)
     if not handle:
         return []
@@ -1334,7 +1767,7 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
     # misma nota 2-3 veces con link distinto → triples falsos. El medio
     # va en la clave para NO borrar cobertura real multi-medio.
     titulos_vistos = {(normalizar(n["titulo"]), _canon_medio(n["fuente"]))
-                      for n in leer_jsonl(NOTICIAS, limite=800)}
+                      for n in _noticias_cache()[-5000:]}
 
     now = time.time()
     delay = cfg.get("delay_fuentes", 1)
@@ -1344,11 +1777,14 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
     # X con ritmo propio: ~6 handles × Playwright cada 15 min era
     # mucho desgaste de sesión/CPU — pasa cada 30 min; el resto del
     # ciclo (RSS) sigue a los 15
-    global _ULT_X
-    correr_x = now - _ULT_X >= 30 * 60
+    global _ULT_X, _X_ESP
+    # intervalo jittered 45-75 min — metrónomo exacto es huella de bot
+    correr_x = now - _ULT_X >= _X_ESP
     if correr_x:
         _ULT_X = now
-    for i, fuente in enumerate(cfg["fuentes"]):
+        _X_ESP = random.randint(45, 75) * 60
+    for i, fuente in enumerate(
+            random.sample(list(cfg["fuentes"]), len(cfg["fuentes"]))):
         if fuente.get("activa") is False:
             continue   # apagada en catálogo (ej. bloque QRoo en esta instancia)
         if fuente.get("tipo") == "fb":
@@ -1504,6 +1940,12 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
                 medio = (src.get("title") or src.get("value") or "").strip()
                 if medio and titulo.endswith(f" - {medio}"):
                     titulo = titulo[: -len(medio) - 3]
+            # fuente html sin RSS: el índice solo da el titular — el
+            # lead (que trae el nombre, p.ej. 'Reséndez Bocanegra' en
+            # boletines del TSJ) hace falta para interés y alertas
+            if fuente.get("traer_resumen") and not resumen:
+                resumen = extraer_lead_html(link) \
+                    or extraer_og_desc(link)
             texto = f"{titulo} {resumen} {autor}"
 
             # algunas fuentes publican "páginas edición" (índice del día,
@@ -1593,12 +2035,17 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
             autor_hit = normalizar(autor) in {
                 normalizar(a) for a in cfg.get("seguir_autores", [])
             } if autor else False
+            # project-first: una regla PERSONAL dispara por sus palabras;
+            # una regla COMPARTIDA (proyecto asignado) solo dispara si la
+            # nota es de interés del proyecto — evita flood de info basura
             hits_usuario = []
             for email, perfil in usuarios.items():
                 if fuente["nombre"] not in fuentes_visibles(perfil, cfg):
                     continue
                 hits = [r["nombre"] for r in perfil.get("reglas", [])
-                        if coincide(texto, r)]
+                        if coincide(texto, r)
+                        and (not r.get("proyecto")
+                             or coincide_interes(nota))]
                 if hits:
                     hits_usuario.append((email, hits))
 
@@ -1637,7 +2084,8 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
 
     guardar_vistos(vistos)
     _escribir_json(ESTADO_FUENTES, estado)
-    _escribir_json(CONFIG, cfg)
+    # NO reescribir CONFIG: el ciclo solo lee cfg — volcar la copia en
+    # memoria pisaba altas de fuentes/perfiles hechas mientras corría
     alertas += detectar_desarrollo(cfg, resumir)
     purgar()
     purgar_usuarios()
@@ -1704,7 +2152,7 @@ def wp_scan_reglas(cfg: dict):
     hosts = sorted(set(hosts) & set(vivos) | set(vivos))
     print(f"[wp-scan] {len(hosts)} medios con API WP viva")
 
-    exist = {n.get("link") for n in leer_jsonl(NOTICIAS, limite=0)}
+    exist = {n.get("link") for n in _noticias_cache()}
     vistos = cargar_vistos()
 
     def buscar(dom_q):
@@ -1740,7 +2188,8 @@ def wp_scan_reglas(cfg: dict):
                     if base["nombre"] not in fuentes_visibles(perfil, cfg):
                         continue
                     hits = [r["nombre"] for r in perfil.get("reglas", [])
-                            if all(normalizar(w) in texto
+                            if all(any(termino_en(normalizar(v), texto)
+                                       for v in w.split("/"))
                                    for w in r.get("requiere_todas", []))]
                     if hits:
                         hits_usuario.append((email, ", ".join(hits)))
@@ -1914,10 +2363,56 @@ def _portada_issuu(handle: str):
 
 FB_SESSION = BASE / "fb_session.json"
 FB_SESSION_REDES = BASE / "fb_session_redes.json"  # chucky — posts
+
+
+def _fb_pausa() -> bool:
+    """Kill-switch del usuario: fb_pausa=true en config suspende
+    TODO contacto con FB — ni sesiones ni plugin anónimo ni posts.
+    (22/oct: chucky cayó a verificación video-selfie; FB en modo
+    hostil, cortar todo tráfico)."""
+    return bool(cargar_json(CONFIG, {}).get("fb_pausa"))
+
+
+def _fb_marcar_muerta(nombre: str):
+    """Sesión caída hoy (checkpoint/ban) → la saca del pool el resto
+    del día; nadie vuelve a gastar navegaciones probándola."""
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    est = cargar_json(ESTADO_PORTADAS, {})
+    fm = est.setdefault("fb_muertas", {})
+    if fm.get("d") != hoy:
+        est["fb_muertas"] = {"d": hoy, "sesiones": []}
+        fm = est["fb_muertas"]
+    if nombre not in fm["sesiones"]:
+        fm["sesiones"].append(nombre)
+        _guardar_portadas(est)
+
+
+def _fb_sesiones(rol: str = "portadas") -> list:
+    """Pool UNIFICADO de cuentas FB (incluye fb_session_redes).
+    Turno diario rotativo (regla del usuario, 22/oct): portadas
+    arranca con pool[día % n], posts con pool[(día+1) % n] — cuentas
+    distintas cada jornada, el resto descansa como respaldo.
+    Las marcadas muertas hoy se filtran; una caída salta a la
+    siguiente sana automáticamente."""
+    pool = sorted(BASE.glob("fb_session*.json"),
+                  key=lambda f: (f.name != "fb_session.json", f.name))
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    est = cargar_json(ESTADO_PORTADAS, {})
+    fm = est.get("fb_muertas", {})
+    if fm.get("d") == hoy:
+        muertas = fm.get("sesiones", [])
+        pool = [f for f in pool if f.name not in muertas]
+    if not pool:
+        return []
+    n = len(pool)
+    d = datetime.now().timetuple().tm_yday
+    i = d % n if rol == "portadas" else (d + 1) % n
+    return pool[i:] + pool[:i]   # primero la del turno
 X_SESSION = BASE / "x_session.json"              # X — timeline
 X_POSTS = BASE / "x_posts.jsonl"               # log de publicados
 _ULT_FB_POSTS = 0.0        # epoch de la última pasada de chucky
 _ULT_X = 0.0               # epoch de la última pasada de fuentes tipo x
+_X_ESP = 30 * 60           # segundos hasta el próximo barrido x (jittered)
 _FB_POSTS_CORRIENDO = False
 
 
@@ -2119,14 +2614,19 @@ def _imagenes_fb_post(url: str) -> list:
     portadas en el mismo post). Dedup por id de foto. Con sesión
     (fb_session.json) abre el visor de cada foto en alta res; sin
     sesión cae a la versión del feed (~600px)."""
+    if _fb_pausa():
+        return []
     try:
-        if FB_SESSION.exists():
+        for i, ses in enumerate(_fb_sesiones()):
             try:
+                if i:                    # cuenta previa falló — pausa
+                    time.sleep(random.randint(8, 15))
                 from playwright.sync_api import sync_playwright
                 with sync_playwright() as p:
                     br = _launch(p)
                     pg = br.new_context(
-                        storage_state=str(FB_SESSION)).new_page()
+                        storage_state=str(ses)).new_page()
+                    pg.wait_for_timeout(random.randint(2500, 5000))
                     imgs = _imagenes_fb_visores(pg, url)
                     br.close()
                 if imgs:
@@ -2177,6 +2677,12 @@ def _bajar_portada_fb(m: dict) -> list:
     """FB: share/post directo → TODAS sus fotos (lista de JPGs). Si es
     página → plugin timeline público (sin login): post DE HOY cuyo texto
     diga portada/edición/primera plana (TAD publica ~medianoche)."""
+    if _fb_pausa():
+        return []
+    if datetime.now().hour < 5:
+        return []   # FB se scrapea de 5 am a cierre (regla 22/oct):
+                    # antes de esa hora no hay posts nuevos indexados
+                    # y cada visita quema las cuentas para nada
     fb = m["fb"]
     if "/share/" in fb or "/posts/" in fb or "/photo" in fb:
         return _imagenes_fb_post(fb)
@@ -2199,31 +2705,47 @@ def _bajar_portada_fb(m: dict) -> list:
     try:
         with sync_playwright() as p:
             br = _launch(p)
-            if FB_SESSION.exists():
-                # sesión guardada → timeline real de la página (todos
-                # los posts, no solo el último del plugin anónimo)
+            pg = None
+            for ses in _fb_sesiones():
+                # ritmo humano (regla del usuario): nada de ráfagas —
+                # cada navegación de cuenta lleva pausa aleatoria
                 pg = br.new_context(
-                    storage_state=str(FB_SESSION)).new_page()
+                    storage_state=str(ses)).new_page()
+                pg.wait_for_timeout(random.randint(2500, 5000))
+                if random.random() < 0.15:
+                    # disfraz de lector: a veces pasar por la home
+                    # primero — un humano no entra directo al timeline
+                    pg.goto("https://www.facebook.com/",
+                            wait_until="domcontentloaded",
+                            timeout=30000)
+                    pg.wait_for_timeout(random.randint(2000, 4500))
                 pg.goto(fb.split("#")[0], wait_until="domcontentloaded",
                         timeout=45000)
                 if _fb_sesion_caido(pg):
-                    _aviso_fb_sesion()
-                    # cae al plugin anónimo
-                    pg = br.new_page()
-                    pg.goto(plugin, wait_until="domcontentloaded",
-                            timeout=30000)
-            else:
+                    print(f"[fb] sesión {ses.name} caída "
+                          f"(checkpoint/ban) — pruebo siguiente cuenta")
+                    _fb_marcar_muerta(ses.name)
+                    pg.context.close()
+                    pg = None
+                    time.sleep(random.randint(8, 15))
+                    continue
+                break
+            if pg is None:
+                if _fb_sesiones():
+                    _aviso_fb_sesion()   # TODAS las cuentas caídas
+                # cae al plugin anónimo
                 pg = br.new_page()
                 pg.goto(plugin, wait_until="domcontentloaded",
                         timeout=30000)
             pg.wait_for_timeout(6000)
             prev = -1
-            for _ in range(25):          # scroll interno del timeline
+            # giros y pausas variables — scroll de lector, no de bot
+            for _ in range(random.randint(6, 14)):
                 pg.evaluate(
                     "for (const el of document.querySelectorAll('*')) "
                     "if (el.scrollHeight > el.clientHeight + 50) "
                     "el.scrollTop += 2500;")
-                pg.wait_for_timeout(1400)
+                pg.wait_for_timeout(random.randint(1200, 3200))
                 n = pg.evaluate("document.querySelectorAll('img').length")
                 if n == prev:
                     break
@@ -2387,7 +2909,10 @@ def _bajar_portada_fb(m: dict) -> list:
             fechas = (normalizar(fecha_txt),              # 5 de octubre
                       normalizar(fecha_txt.replace(
                           str(hoy.day), f"{hoy.day:02d}")))  # 05 de octubre
-            if _post_viejo(txt):
+            # typo del medio ('17 de junio' en octubre — Ahora 17/oct)
+            # no tumba un post reciente: 'hace 42 min' no puede ser
+            # de junio; el guard solo opera en posts SIN frescura
+            if _post_viejo(txt) and not reciente:
                 continue
             # 'hoy' en el texto NO es frescura — el post fijado de
             # ayer ('#EnPortada hoy', 1d) se colaba y repetía edición
@@ -2409,6 +2934,10 @@ def _bajar_portada_fb(m: dict) -> list:
     except Exception:
         return []
     if not cand:
+        # diagnóstico: 0 posts vistos = sesión/plugin no rindió; >0 =
+        # el post existe pero no pasó el filtro de texto/frescura
+        print(f"[fb] {m['nombre']}: sin candidata "
+              f"({len(posts)} posts vistos)")
         return []
     print(f"[fb] {m['nombre']}: {len(cand)} post(s) → {cand[0][1][:90]}")
     # un post con N fotos se reparte en varios links /photo que
@@ -2481,6 +3010,12 @@ def _bajar_portada_x(m: dict) -> list:
         # 'portada' (16/oct: Levi's, FGET, gato). Pasa si el texto
         # anuncia plana o la imagen misma ya luce de primera plana
         txt = normalizar(p_.get("summary") or p_.get("title") or "")
+        # medios multi-sede (El Momento postea la plana de Tabasco,
+        # Metropolitano, Veracruz, QRoo...): x_filtro exige que el
+        # texto nombre ESTA edición — si no, bajaría la de otro estado
+        fil = normalizar(m.get("x_filtro", ""))
+        if fil and fil not in txt:
+            continue
         dice_portada = any(
             t in txt for t in ("portada", "edicion impresa",
                                "edicion digital", "primera plana",
@@ -2505,9 +3040,10 @@ def _bajar_portada_x(m: dict) -> list:
 
 
 def toca_fb_posts() -> bool:
-    """Chucky cada 4 h y solo si tiene sesión — ritmo tranquilo para
-    no quemar la cuenta dedicada."""
-    return (FB_SESSION_REDES.exists()
+    """Posts cada 4 h y solo si hay cuenta sana en el pool — ritmo
+    tranquilo para no quemar las cuentas."""
+    return (not _fb_pausa()
+            and bool(_fb_sesiones("posts"))
             and time.time() - _ULT_FB_POSTS >= 4 * 3600)
 
 
@@ -2544,7 +3080,8 @@ def scrapear_posts_fb(cfg: dict):
     Dedup por link; filtro de autor (posts 'sugeridos' de páginas
     ajenas se descartan); una instancia a la vez."""
     global _ULT_FB_POSTS, _FB_POSTS_CORRIENDO
-    if _FB_POSTS_CORRIENDO or cfg.get("fb_posts_pausa"):
+    if _FB_POSTS_CORRIENDO or cfg.get("fb_posts_pausa") \
+            or _fb_pausa():
         return
     _FB_POSTS_CORRIENDO = True
     _ULT_FB_POSTS = time.time()
@@ -2562,7 +3099,7 @@ def scrapear_posts_fb(cfg: dict):
                 return "fbid:" + m.group(1)
             return u.split("?")[0].rstrip("/")
         links_vistos = {_clave_link(n.get("link", ""))
-                        for n in leer_jsonl(NOTICIAS, limite=0)}
+                        for n in _noticias_cache()}
         from playwright.sync_api import sync_playwright
         nuevas = 0
         stats_pag = {}   # página → {x: extraídos, n: nuevos, r: razones}
@@ -2592,8 +3129,26 @@ def scrapear_posts_fb(cfg: dict):
 
         with sync_playwright() as p:
             br = _launch(p)
-            pg = br.new_context(
-                storage_state=str(FB_SESSION_REDES)).new_page()
+            pg = None
+            for ses in _fb_sesiones("posts"):
+                pg = br.new_context(
+                    storage_state=str(ses)).new_page()
+                pg.wait_for_timeout(random.randint(2500, 5000))
+                pg.goto("https://www.facebook.com/",
+                        wait_until="domcontentloaded", timeout=30000)
+                if _fb_sesion_caido(pg):
+                    print(f"[fb-posts] sesión {ses.name} caída "
+                          f"(checkpoint/ban) — pruebo siguiente")
+                    _fb_marcar_muerta(ses.name)
+                    pg.context.close()
+                    pg = None
+                    time.sleep(random.randint(8, 15))
+                    continue
+                break
+            if pg is None:
+                print("[fb-posts] TODAS las cuentas caídas — "
+                      "sin barrido esta pasada")
+                return
             for fuente in fuentes_fb:
                 url = fuente["url"].split("#")[0]
                 segs = [s for s in urlparse(url).path.split("/") if s]
@@ -2603,8 +3158,9 @@ def scrapear_posts_fb(cfg: dict):
                     pg.goto(url, wait_until="domcontentloaded",
                             timeout=45000)
                     if _fb_sesion_caido(pg):
-                        print("[fb-posts] sesión de chucky cayó — "
-                              "re-correr fb_login.py")
+                        print("[fb-posts] sesión cayó a mitad del "
+                              "barrido — la próxima pasada usa "
+                              "otra cuenta")
                         break
                     pg.wait_for_timeout(5000)
                     prev = -1
@@ -3610,7 +4166,18 @@ def _captura_medio(m: dict, base: Path, tardia: bool,
                         and not _img_repetida_hoy(f, base.name) \
                         and not _img_repetida_propia(f, base.name)
                 vis = _vision_es_portada(cfg, d) if guardas else None
-                if guardas and vis is not False:
+                # fb/x es el canal más ruidoso (flyers, memes, fotos
+                # de nota): con Gemini configurado se exige veredicto
+                # POSITIVO — si la API falla la candidata se descarta
+                # y el medio reintenta en el siguiente pase, en vez de
+                # colar basura (20/oct: meme 'Canada' en XEVT, foto de
+                # costales en XHVX pasaron con vision=None). Sin key
+                # configurada se mantiene el comportamiento permisivo.
+                if src_fb and cfg and _gemini_key(cfg):
+                    veredicto = vis is True
+                else:
+                    veredicto = vis is not False
+                if guardas and veredicto:
                     n_ok += 1
                 else:
                     print(f"[portadas] {m['nombre']} ✗ candidata "
@@ -3847,28 +4414,47 @@ def _vision_es_portada(cfg: dict, b: bytes):
     if not cfg or not _gemini_key(cfg):
         return None
     mime = "image/png" if b[:4] == b"\x89PNG" else "image/jpeg"
+    r = None
+    for intento in range(3):
+        # la API falla en ráfagas (429/5xx) — un None transitorio no
+        # debe descartar una portada real (Capital Índigo 20/oct: el
+        # post #EnPortada se rechazó 4 veces con vision=None)
+        try:
+            r = requests.post(
+                "https://generativelanguage.googleapis.com/v1beta/"
+                f"models/{cfg['gemini'].get('modelo', 'gemini-3.1-flash-lite')}"
+                ":generateContent",
+                params={"key": _gemini_key(cfg)},
+                json={"contents": [{"parts": [
+                    {"text": "¿Esta imagen es la PORTADA o PRIMERA PLANA "
+                             "de un medio de noticias — un diario impreso "
+                             "O la portada digital de un noticiero "
+                             "(cabecera del medio, fecha o número de "
+                             "edición y varios titulares/notas)? "
+                             "Comunicados, flyers, promocionales, memes o "
+                             "fotos sueltas NO son portadas. "
+                             "Responde solo SI o NO."},
+                    {"inline_data": {"mime_type": mime,
+                                     "data": base64.b64encode(b).decode()}
+                     }]}]},
+                timeout=60)
+            if r.status_code == 200:
+                break
+            r = None
+        except Exception:
+            r = None
+        if intento < 2:
+            time.sleep(4)
+    if r is None:
+        return None
     try:
-        r = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/"
-            f"models/{cfg['gemini'].get('modelo', 'gemini-3.1-flash-lite')}"
-            ":generateContent",
-            params={"key": _gemini_key(cfg)},
-            json={"contents": [{"parts": [
-                {"text": "¿Esta imagen es la PORTADA o PRIMERA PLANA "
-                         "de un medio de noticias — un diario impreso "
-                         "O la portada digital de un noticiero "
-                         "(cabecera del medio, fecha o número de "
-                         "edición y varios titulares/notas)? "
-                         "Comunicados, flyers, promocionales, memes o "
-                         "fotos sueltas NO son portadas. "
-                         "Responde solo SI o NO."},
-                {"inline_data": {"mime_type": mime,
-                                 "data": base64.b64encode(b).decode()}
-                 }]}]},
-            timeout=60)
         parts = (r.json()["candidates"][0]["content"].get("parts") or [])
         txt = "".join(p.get("text", "") for p in parts
                       if not p.get("thought")).strip().lower()
+        # Gemini a veces decora la respuesta ('**SÍ.**', '- NO.') —
+        # sin esta limpieza caía a None y se descartaban portadas
+        # reales (Capital Índigo 20/oct)
+        txt = re.sub(r"^[^a-záéíóúñ]+", "", txt)
         if txt.startswith(("si", "sí")):
             return True
         if txt.startswith("no"):
@@ -3943,7 +4529,9 @@ def capturar_portadas(cfg: dict):
             sucio = True
     if sucio:
         _guardar_portadas(est0)
-    for m in medios:
+    # orden barajeado cada ola — el mismo orden siempre a la
+    # misma hora es huella de bot (regla ritmo humano, 22/oct)
+    for m in random.sample(medios, len(medios)):
         if not _en_ventana(m, port, ahora_m):
             continue   # fuera de su ventana propia
         base = dia / _slug_portada(m["nombre"])
@@ -3956,10 +4544,17 @@ def capturar_portadas(cfg: dict):
                                                   "2000-01-01"))
         except Exception:
             ult = datetime(2000, 1, 1)
-        if (ahora - ult).total_seconds() < \
-                _cada_efectivo(m, port, ahora) * 60:
-            continue   # le toca más tarde — cada_min por medio (rampa)
+        es_fb = bool(m.get("fb"))
+        # medios FB: intervalo propio ~30 min + jitter (26-38) — la
+        # rampa de 5-20 min era volumen muerto contra el lag de
+        # indexación de FB y es lo que quemó a juan
+        intervalo = (stamps.get(base.name + "_j", 30) if es_fb
+                     else _cada_efectivo(m, port, ahora))
+        if (ahora - ult).total_seconds() < intervalo * 60:
+            continue   # le toca más tarde
         stamps[base.name] = ahora.isoformat()
+        if es_fb:
+            stamps[base.name + "_j"] = random.randint(26, 38)
         hoy = ahora.strftime("%Y-%m-%d")
         # conserva ~7 días de eventos — histórico para ver patrones de
         # publicación de cada medio
@@ -4036,7 +4631,7 @@ def _salud_fuentes(cfg: dict, ahora: datetime) -> dict:
     (sus posts se barren cada ~4 h y hay páginas que postean poco)."""
     ult = {}
     try:
-        for n in leer_jsonl(NOTICIAS, limite=0):
+        for n in _noticias_cache():
             f, fe = n.get("fuente"), n.get("fecha") or ""
             if f and fe > ult.get(f, ""):
                 ult[f] = fe
@@ -4130,7 +4725,10 @@ def _guardar_portadas(est: dict):
         en_disco.get('eventos', []), est.get('eventos', []))[-3000:]
     cap = en_disco.setdefault('cap_medios', {})
     for k, v in est.get('cap_medios', {}).items():
-        if v > cap.get(k, ''):
+        if isinstance(v, str):
+            if v > str(cap.get(k, '') or ''):
+                cap[k] = v
+        else:
             cap[k] = v
     for k, v in est.items():
         if k not in ('eventos', 'cap_medios'):
@@ -4201,61 +4799,72 @@ def _pagina_portada_pdf(sec: str, n_medios: int):
     return img
 
 
+def _armar_pdf_portadas(medios: list, sec: str, dia,
+                        fecha=None) -> tuple:
+    """Arma el PDF de `sec` con las imágenes guardadas en `dia` (dir
+    portadas/mes/dd). Regresa (bytes, fallos) — sin tocar disco ni
+    correo; lo usan la emisión programada y el endpoint 'en vivo'."""
+    imgs = []
+    fallos = []
+    for m in medios:
+        if m.get("seccion", "nacional") != sec:
+            continue
+        slug = _slug_portada(m["nombre"])
+        # impresa(s) primero — los posts FB traen portada-2, etc.
+        extras = sorted(dia.glob(f"{slug}-[0-9].jpg"))
+        tiene = False
+        web = [] if m.get("solo_impresa") else [dia / f"{slug}-web.png"]
+        for cand in ([_portada_img(slug, dia)] + extras + web):
+            if cand.exists() and _img_ok(cand):
+                try:
+                    imgs.append(Image.open(cand).convert("RGB"))
+                    tiene = True
+                except Exception:
+                    pass
+        if not tiene:
+            fallos.append(m["nombre"])
+    if not imgs:
+        return None, fallos
+    f = fecha or datetime.now()
+    portada = _pagina_portada_pdf(sec, len(imgs))
+    imgs = [portada] + imgs
+    # ancho uniforme: kiosko/shots/fb varían (800-2550px) y el PDF
+    # quedaba con páginas de tamaños distintos — la mediana del día
+    # minimiza reescalado (la mayoría ya va en su tamaño)
+    from statistics import median
+    W = int(median(im.width for im in imgs))
+    imgs = [im.resize((W, round(im.height * W / im.width)),
+                      Image.LANCZOS) if im.width != W else im
+            for im in imgs]
+    buf = io.BytesIO()
+    imgs[0].save(
+        buf, "PDF", save_all=True, append_images=imgs[1:],
+        title=f"Portadas {sec.capitalize()} — {f.strftime('%d/%m/%Y')}",
+        author="@noticias", subject="Portadas de medios impresos",
+        keywords="portadas, prensa, Tabasco, monitoreo de medios",
+        creator="Olmeca Code")
+    for i in imgs:
+        i.close()
+    return buf.getvalue(), fallos
+
+
 def generar_pdfs_portadas(cfg: dict, marca: str = "pdf_fecha"):
-    """Hora_pdf (06:45) y hora_pdf2 (09:00): arma los PDFs con lo
-    recolectado, los manda por correo y lista los que no respondieron.
+    """Hora_pdf (06:30): arma los PDFs con lo recolectado, los manda
+    por correo y lista los que no respondieron.
     `marca` = llave del estado que registra qué emisión ya salió."""
     medios = cfg.get("portadas", {}).get("medios", [])
     escribir_schedule_portadas(cfg)   # schedule.html siempre al día
     hoy = datetime.now().strftime("%Y-%m-%d")
-    hoy_d = datetime.now().date()
     fallos = []
     pdfs = {}
+    dia = _dir_dia()
     for sec in ("nacional", "tabasco"):
-        imgs = []
-        for m in medios:
-            if m.get("seccion") != sec:
-                continue
-            slug = _slug_portada(m["nombre"])
-            dia = _dir_dia()
-            # impresa(s) primero — los posts FB traen portada-2, etc.
-            extras = sorted(dia.glob(f"{slug}-[0-9].jpg"))
-            tiene = False
-            web = [] if m.get("solo_impresa") else \
-                [dia / f"{slug}-web.png"]
-            for cand in ([_portada_img(slug)] + extras + web):
-                if cand.exists() and _img_ok(cand):
-                    try:
-                        imgs.append(Image.open(cand).convert("RGB"))
-                        tiene = True
-                    except Exception:
-                        pass
-            if not tiene:
-                fallos.append(m["nombre"])
-        if imgs:
+        data, f = _armar_pdf_portadas(medios, sec, dia)
+        fallos += f
+        if data:
             dia.mkdir(parents=True, exist_ok=True)
             pdf = dia / f"portadas_{sec}_{hoy}.pdf"
-            portada = _pagina_portada_pdf(sec, len(imgs))
-            imgs = [portada] + imgs
-            # ancho uniforme: kiosko/shots/fb varían (800-2550px) y el
-            # PDF quedaba con páginas de tamaños distintos — la mediana
-            # del día minimiza reescalado (la mayoría ya va en su tamaño)
-            from statistics import median
-            W = int(median(im.width for im in imgs))
-            imgs = [im.resize((W, round(im.height * W / im.width)),
-                              Image.LANCZOS) if im.width != W else im
-                    for im in imgs]
-            imgs[0].save(
-                pdf, save_all=True, append_images=imgs[1:],
-                title=f"Portadas {sec.capitalize()} — "
-                      f"{hoy_d.strftime('%d/%m/%Y')}",
-                author="@noticias",
-                subject="Portadas de medios impresos",
-                keywords="portadas, prensa, Tabasco, "
-                         "monitoreo de medios",
-                creator="Olmeca Code")
-            for i in imgs:
-                i.close()
+            pdf.write_bytes(data)
             pdfs[sec] = pdf
     enviar_portadas(cfg, pdfs, fallos)
     est = cargar_json(ESTADO_PORTADAS, {})
@@ -4312,18 +4921,7 @@ def enviar_portadas(cfg: dict, pdfs: dict, fallos: list):
                          filename=pdf.name)
         msg.attach(parte)
     try:
-        puerto = correo.get("smtp_port", 465)
-        if puerto == 587:   # STARTTLS (Brevo, etc.)
-            with smtplib.SMTP(correo["smtp_host"], puerto,
-                              timeout=30) as s:
-                s.starttls()
-                s.login(correo["usuario"], correo["password"])
-                s.send_message(msg)
-        else:               # SSL directo (Gmail 465)
-            with smtplib.SMTP_SSL(correo["smtp_host"], puerto,
-                                  timeout=30) as s:
-                s.login(correo["usuario"], correo["password"])
-                s.send_message(msg)
+        _mandar_msg(correo, msg, timeout=30)
     except Exception as e:
         print(f"[portadas] correo falló: {e}")
 
@@ -4886,7 +5484,8 @@ def checar_ip_correo():
         print(f"[correo] check IP falló: {e}")
 
 
-def vista_portadas(sec: str, dia: str = "") -> str:
+def vista_portadas(sec: str, dia: str = "", admin: bool = False,
+                   logueado: bool = False) -> str:
     """Tab Portadas: grid de las capturas por sección; ?dia=oct/06
     navega subcarpetas para cotejar un día contra otro."""
     cfg = json.loads(CONFIG.read_text())
@@ -4899,16 +5498,16 @@ def vista_portadas(sec: str, dia: str = "") -> str:
     # diario de _salud_fuentes — así se ve sin abrir logs)
     hoy_s = datetime.now().strftime("%Y-%m-%d")
     avisos = ""
-    fb_st = est_v.get("fb_sesion", {})
+    fb_st = est_v.get("fb_sesion", {}) if admin else {}
     if fb_st.get("estado") == "caida" and fb_st.get("alertado") == hoy_s:
         avisos += ("<p class='meta' style='color:#b71c1c'>⚠ Sesión de "
                    "Facebook caída — corre fb_login.py; las capturas FB "
                    "salen anónimas mientras.</p>")
-    if est_v.get("x_sesion", {}).get("estado") == "caida":
+    if admin and est_v.get("x_sesion", {}).get("estado") == "caida":
         avisos += ("<p class='meta' style='color:#b71c1c'>⚠ Sesión de "
                    "X caída — corre x_login.py; XEVT queda sin portada "
                    "y el radar X vacío.</p>")
-    sal = est_v.get("salud", {})
+    sal = est_v.get("salud", {}) if admin else {}
     call = sal.get("calladas") or []
     if call:
         lista = ", ".join(
@@ -4931,16 +5530,29 @@ def vista_portadas(sec: str, dia: str = "") -> str:
         f"<a class='tab-cat{' on' if d == dia_sel else ''}' "
         f"href='/portadas?sec={sec}&dia={d}'>{d}</a>" for d in dias)
         + "</div>") if dias else ""
-    pdfs = sorted(dir_sel.glob(f"portadas_{sec}_*.pdf"), reverse=True) \
-        if dir_sel.exists() else []
-    links_pdf = "".join(
-        f"<a class='tab-cat' href='/portadas/{dia_sel}/{p.name}' "
-        f"target='_blank'>{p.stem.rsplit('_', 1)[-1]}</a>" for p in pdfs)
+    # un solo botón PDF: se arma al click con lo capturado de ese
+    # día (los tardíos entran hasta ~9am); solo usuarios con sesión
+    pdf_block = (f"<p class='meta'>PDF: <a class='tab-cat on' "
+                 f"href='/portadas-pdf?sec={sec}&dia={dia_sel}' "
+                 f"target='_blank'>{dia_sel}</a></p>"
+                 if logueado else "")
     tabs = ("<div class='tabs-cat'>"
             + f"<a class='tab-cat{' on' if sec != 'tabasco' else ''}' "
-              "href='/portadas'>Nacional</a>"
+              "href='/portadas?sec=nacional'>Nacional</a>"
             + f"<a class='tab-cat{' on' if sec == 'tabasco' else ''}' "
               "href='/portadas?sec=tabasco'>Tabasco</a></div>")
+    # orden: la captura más reciente arriba; sin captura al final
+    _m_idx = {m: f"{i + 1:02d}" for i, m in enumerate(
+        ("ene", "feb", "mar", "abr", "may", "jun",
+         "jul", "ago", "sep", "oct", "nov", "dic"))}
+    _dia_key = "-" + _m_idx.get(dia_sel.split("/")[0], "") \
+        + "-" + dia_sel.split("/")[-1]     # "oct/19" → "-10-19"
+    _hora_ev = {}
+    for ev in est_v.get("eventos", []):
+        if ev.get("ok") and str(ev.get("d", "")).endswith(_dia_key):
+            _hora_ev[ev.get("m", "")] = ev.get("t", "")
+    medios.sort(key=lambda m: _hora_ev.get(m["nombre"], ""),
+                reverse=True)
     cards = ""
     for m in medios:
         slug = _slug_portada(m["nombre"])
@@ -4978,10 +5590,6 @@ def vista_portadas(sec: str, dia: str = "") -> str:
         cards += (f"<div class='card' style='border-left-color:#7b1fa2'>"
                   f"<b>{html.escape(m['nombre'])}</b>{reciente}"
                   f"{link_m}{img}</div>")
-    pdf_block = (f"<p class='meta'>PDFs: {links_pdf}</p>"
-                 if links_pdf
-                 else "<p class='meta'>Sin PDFs todavía — "
-                      "se generan cada mañana.</p>")
     return (f"<h1>Portadas — {sec.title()} — {dia_sel}</h1>"
             f"{tabs}{tabs_dia}"
             f"<p class='meta'>Capturas del {ultima or '—'} · se regeneran a "
@@ -4989,7 +5597,7 @@ def vista_portadas(sec: str, dia: str = "") -> str:
             + avisos + pdf_block + cards)
 
 
-def vista_salud() -> str:
+def vista_salud(admin: bool = True) -> str:
     """Tab Salud (admin): diagnóstico del sistema sin abrir logs —
     sesiones de terceros, medios de portadas que repiten/fallan y
     fuentes de notas calladas."""
@@ -5095,7 +5703,9 @@ def vista_salud() -> str:
     bloque += "</table>"
     out.append(bloque)
 
-    # ── fuentes calladas ──
+    # ── fuentes calladas (diagnóstico interno — solo admin) ──
+    if not admin:
+        return "".join(out)
     sal = est.get("salud") or _salud_fuentes(cfg, ahora)
     call = sal.get("calladas", [])
     filas = "".join(
@@ -5326,7 +5936,7 @@ PAGINA = """<!DOCTYPE html>
 <meta name="twitter:title" content="{og_title}">
 <meta name="twitter:description" content="{og_desc}">
 <meta name="twitter:image" content="{og_img}">
-<title>@noticias — Síntesis de prensa</title>
+<title>@noticias — Monitor de prensa TSJT</title>
 <style>
   * {{ box-sizing: border-box; }}
   body {{ font-family: system-ui, sans-serif; margin: 0; background: #f6f7f9;
@@ -5339,7 +5949,9 @@ PAGINA = """<!DOCTYPE html>
   nav .logo {{ font-weight: 800; font-size: 1.35rem; letter-spacing: .02em;
               color: #fff; text-decoration: none; }}
   .nav-tabs {{ display: flex; gap: .1rem; margin-top: .5rem;
-              overflow-x: auto; -webkit-overflow-scrolling: touch; }}
+              overflow-x: auto; -webkit-overflow-scrolling: touch;
+              scrollbar-width: none; -ms-overflow-style: none; }}
+  .nav-tabs::-webkit-scrollbar {{ display: none; }}
   .nav-tabs a {{ color: #c5cae9; text-decoration: none; font-size: 1rem;
          padding: .55rem .7rem; border-radius: 6px; white-space: nowrap; }}
   .nav-tabs a:hover, .nav-tabs a:active {{ color: #fff; background: #3949ab; }}
@@ -5370,7 +5982,9 @@ PAGINA = """<!DOCTYPE html>
              text-decoration: none; transition: all .15s; }}
   .btn-imp:hover {{ background: #1a237e; color: #fff;
                    border-color: #1a237e; }}
-  @media print {{ .btn-imp {{ display: none; }} }}
+  @media print {{ .btn-imp {{ display: none; }}
+                  .blk-refs > * {{ display: block !important; }}
+                  .blk-refs > summary {{ display: none; }} }}
   .card:active {{ background: #f0f4ff; }}
   /* clearfix: sin esto el thumb flotante se sale por abajo/derecha
      cuando el texto de la tarjeta es más corto que la imagen */
@@ -5496,6 +6110,15 @@ PAGINA = """<!DOCTYPE html>
   .chip-fuente {{ display: inline-block; background: #1a237e; color: #fff;
       font-size: .66rem; font-weight: 700; text-transform: uppercase;
       letter-spacing: .06em; padding: .22rem .55rem; border-radius: 10px; }}
+  .chip-creador {{ display: inline-flex; align-items: center; gap: .3rem;
+      background: #fff8e1; color: #7a5d00; border: 1px solid #e8d48a;
+      font-size: .66rem; font-weight: 700; padding: .18rem .55rem;
+      border-radius: 10px; vertical-align: 1px; }}
+  .chip-creador::before {{ content: ''; width: 6px; height: 6px;
+      border-radius: 50%; background: #f9a825; flex: 0 0 auto; }}
+  .chip-pals {{ display: inline-block; background: #eceff1; color: #546e7a;
+      font-size: .64rem; font-weight: 600; font-style: italic;
+      padding: .18rem .55rem; border-radius: 10px; vertical-align: 1px; }}
   .ico-origen {{ display: inline-block; font-size: .56rem; font-weight: 700;
       line-height: 1; padding: 2px 4px; border-radius: 3px; margin-left: 3px;
       vertical-align: middle; }}
@@ -5658,6 +6281,19 @@ function showLoader(msg) {{
   document.getElementById('loader-txt').textContent = msg || 'Cargando...';
   l.style.display = 'flex';
 }}
+// bloques de enlaces de síntesis: Chrome no expande <details>
+// cerrado con CSS — abrir al imprimir y restaurar después
+window.addEventListener('beforeprint', function() {{
+  document.querySelectorAll('details.blk-refs').forEach(function(d) {{
+    if (!d.open) d.dataset._cerrado = '1';
+    d.open = true;
+  }});
+}});
+window.addEventListener('afterprint', function() {{
+  document.querySelectorAll('details.blk-refs').forEach(function(d) {{
+    if (d.dataset._cerrado) {{ d.open = false; delete d.dataset._cerrado; }}
+  }});
+}});
 window.addEventListener('pageshow', function() {{
   var l = document.getElementById('loader');
   if (l) l.style.display = 'none';
@@ -5677,6 +6313,24 @@ var _tab = _mapa[location.pathname] || location.pathname;
 document.querySelectorAll('.nav-tabs a').forEach(function(a) {{
   if (a.getAttribute('href') === _tab) a.classList.add('on');
 }});
+// tab activo siempre a la vista: al cargar salta directo; tras ~2.5s
+// sin tocar la barra (dedo o stylus) regresa con scroll suave
+var _tabs = document.querySelector('.nav-tabs');
+var _activo = _tabs && _tabs.querySelector('a.on');
+if (_tabs && _activo) {{
+  _activo.scrollIntoView({{inline:'center', block:'nearest'}});
+  var _tNav;
+  var _rearmarNav = function() {{
+    clearTimeout(_tNav);
+    _tNav = setTimeout(function() {{
+      _activo.scrollIntoView({{behavior:'smooth', inline:'center',
+                              block:'nearest'}});
+    }}, 2500);
+  }};
+  ['scroll','touchstart','pointerdown'].forEach(function(ev) {{
+    _tabs.addEventListener(ev, _rearmarNav, {{passive: true}});
+  }});
+}}
 // Contador en el ícono anclado (Badging API; solo aplica si la PWA
 // está instalada en el menú de inicio — en navegador normal se ignora)
 // + globito por tab con notas nuevas desde la última visita a cada una
@@ -5734,6 +6388,24 @@ def leer_jsonl(path: Path, limite: int = 0) -> list:
     return filas
 
 
+_NOTICIAS_CACHE = {"m": 0.0, "ns": []}
+
+
+def _noticias_cache() -> list:
+    """noticias.jsonl entero cacheado por mtime — 60 MB en RAM UNA
+    vez, no por cada render/badge (el 'tardísimo' al cambiar de tab
+    era reparsear el archivo en cada vista). Se invalida solo cuando
+    el archivo cambia (una nota nueva = mtime nuevo)."""
+    try:
+        m = NOTICIAS.stat().st_mtime
+    except OSError:
+        return []
+    if _NOTICIAS_CACHE["m"] != m:
+        _NOTICIAS_CACHE["ns"] = leer_jsonl(NOTICIAS, limite=0)
+        _NOTICIAS_CACHE["m"] = m
+    return _NOTICIAS_CACHE["ns"]
+
+
 LOGIN = """<!DOCTYPE html>
 <html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -5741,11 +6413,11 @@ LOGIN = """<!DOCTYPE html>
 <link rel="icon" type="image/png" href="/icon3.png">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="@noticias">
-<meta property="og:title" content="@noticias — Síntesis de prensa con alertas">
-<meta property="og:description" content="Monitor de medios en tiempo real: destacadas, alertas por tema, noticias y estadísticas.">
+<meta property="og:title" content="@noticias — Monitor de prensa TSJT">
+<meta property="og:description" content="Monitor de noticias del Poder Judicial de Tabasco: prensa del TSJT, alertas por tema y síntesis ejecutivas.">
 <meta property="og:image" content="{base}/og.png">
-<meta property="og:image:width" content="1376">
-<meta property="og:image:height" content="768">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="{base}/og.png">
 <title>@noticias — Entrar</title>
@@ -5820,14 +6492,17 @@ def badge_counts(email: str) -> dict:
             (ahora - timedelta(hours=24)).isoformat(timespec="seconds")
 
     vis = fuentes_visibles(perfil, cfg)
-    vn, vi, vx, vs = (_v("visto_noticias"), _v("visto_interes"),
-                      _v("visto_x"), _v("visto_seguimiento"))
+    vn, vi, vx, vs, vt = (_v("visto_noticias"), _v("visto_interes"),
+                          _v("visto_x"), _v("visto_seguimiento"),
+                          _v("visto_telegram"))
     x_ok = {_handle_x(u).lower()
             for u in cfg.get("x_permitidos", [])} - {""}
-    cn = ci = cx = cs = 0
-    for n in leer_jsonl(NOTICIAS, limite=0):
+    tg_f = {f["nombre"] for f in cfg.get("fuentes", [])
+            if f.get("tipo") == "telegram"}
+    cn = ci = cx = cs = ct = 0
+    for n in _noticias_cache():
         f = n["fecha"]
-        if not (f > vn or f > vi or f > vx or f > vs):
+        if not (f > vn or f > vi or f > vx or f > vs or f > vt):
             continue
         if f > vs and n.get("categoria") == "seguimiento":
             cs += 1
@@ -5836,13 +6511,16 @@ def badge_counts(email: str) -> dict:
             cx += 1
         if n["fuente"] not in vis and n.get("via") not in vis:
             continue
+        if f > vt and (n["fuente"] in tg_f
+                       or "t.me/" in (n.get("link") or "")):
+            ct += 1
         if f > vn and n.get("categoria") != "seguimiento":
             cn += 1
         if f > vi and coincide_interes(n):
             ci += 1
     return {"n": badge_count(email),
             "t": {"/noticias": cn, "/interes": ci, "/x": cx,
-                  "/seguimiento": cs}}
+                  "/telegram": ct, "/seguimiento": cs}}
 
 
 def _marcar_visto(email: str, clave: str):
@@ -5900,7 +6578,8 @@ def _ico_origen(n: dict) -> str:
             "web</span>")
 
 
-def tarjeta_alerta(a: dict, colores: dict) -> str:
+def tarjeta_alerta(a: dict, colores: dict, pals: str = "",
+                   creador: str = "") -> str:
     """Tarjeta completa = link; badge de regla con su color; borde del mismo."""
     autor = _autor_limpio(a)
     color = color_regla(a["reglas"], colores)
@@ -5914,7 +6593,13 @@ def tarjeta_alerta(a: dict, colores: dict) -> str:
         f"{html.escape(a['fuente'])}</span>{_ico_origen(a)}"
         f"<span class='meta'>{fmt_fecha(a['fecha'])}{autor}</span></div>"
         f"{badge_regla(a['reglas'], colores)} "
-        f"<span class='titulo'>{html.escape(a['titulo'])}</span>"
+        + (f"<span class='chip-creador' "
+           f"title='Creador de la regla'>{html.escape(creador)}"
+           f"</span> " if creador else "")
+        + (f"<span class='chip-pals' "
+           f"title='Palabras de la regla'>{html.escape(pals)}</span> "
+           if pals else "")
+        + f"<span class='titulo'>{html.escape(a['titulo'])}</span>"
         + (f"<p class='resumen'>{html.escape(a['resumen_ia'])}</p>" if a.get("resumen_ia") else "")
         + "</a>"
     )
@@ -6222,6 +6907,7 @@ def tarjeta_grupo(cluster: list) -> str:
         f"href='/nota?u={quote(n['link'], safe='')}'>"
         f"<span class='chip-fuente' style='font-size:.6rem;"
         f"padding:1px 6px'>{html.escape(n['fuente'])}</span>"
+        f"{_ico_origen(n)}"
         f" {html.escape(n['titulo'])}"
         f" <span class='meta'>{fmt_fecha(n['fecha'])}</span></a>"
         for n in orden)
@@ -6292,6 +6978,12 @@ INTERES_DEBILES_ACTOR = [
 ]
 INTERES_TABASCO = ["tabasco", "villahermosa", "resendez"]
 RX_TSJ = re.compile(r"\btsjt?\b")
+# menciones al magistrado/TSJ — compuerta única: el tab Telegram solo
+# enseña posts con una de estas, y 'javier may' SOLO no entra a
+# Interés sin tocar una (regla del usuario 22/oct: el sistema es un
+# monitor de Carlos Efraín Reséndez Bocanegra)
+RX_RESENDEZ = re.compile(
+    r"resendez|poder judicial|tribunal superior|magistrad|judicatur")
 # 'Tribunal Superior de Justicia de Guerrero/CDMX/…' — no es el TSJT
 RX_TSJ_OTRO = re.compile(
     r"tribunal superior de justicia (?:de|del) (?!tabasco\b)\w+")
@@ -6416,7 +7108,26 @@ def coincide_interes(nota: dict) -> bool:
     return bool(_interes_match(nota))
 
 
+_MATCH_CACHE = {"mt": 0.0, "m": {}}
+
+
 def _interes_match(nota: dict) -> list:
+    """Memo de _interes_match_scan por link — el regex completo de
+    ~94k notas tardaba ~8s por vista; con cache una sola vez por
+    versión del archivo (una nota nueva = mtime nuevo = re-scan)."""
+    try:
+        mt = NOTICIAS.stat().st_mtime
+    except OSError:
+        mt = 0.0
+    if _MATCH_CACHE["mt"] != mt:
+        _MATCH_CACHE["mt"], _MATCH_CACHE["m"] = mt, {}
+    key = nota.get("link") or nota.get("titulo", "")
+    if key not in _MATCH_CACHE["m"]:
+        _MATCH_CACHE["m"][key] = _interes_match_scan(nota)
+    return _MATCH_CACHE["m"][key]
+
+
+def _interes_match_scan(nota: dict) -> list:
     """Lista de términos de la lista de interés que activaron la nota —
     vacío si no es de interés. Sirve para justificar cada nota en la
     vista ('encontró: resendez bocanegra').
@@ -6457,7 +7168,11 @@ def _interes_match(nota: dict) -> list:
     hits += li["rx_siglas_f"].findall(texto)
     # nombres propios entran siempre — si Reséndez/Orrico sale en
     # una nota de otro estado, el nombre manda sobre las guardias
-    if hits:
+    # EXCEPTO 'javier may': solo cuenta junto al magistrado/TSJ
+    # ('no nos interesa a menos que se incluya a Efraín' — 22/oct);
+    # si solo hay hits de May sigue evaluando abajo, no regresa aún
+    if hits and (not all(h.startswith("javier may") for h in hits)
+                 or RX_RESENDEZ.search(texto)):
         return hits
     # nombres comunes ('paola hernandez' sin apellido completo): la
     # nota debe anclarse a Tabasco/TSJ o venir de prensa local — en
@@ -6504,7 +7219,7 @@ def vista_columnas(email: str) -> str:
     ocultas = set(perfil_usuario(email, cfg).get("fuentes_ocultas", []))
     n_sel = sum(1 for f in cols if f["nombre"] not in ocultas)
     por_col: dict = {}
-    for n in leer_jsonl(NOTICIAS, limite=0):
+    for n in _noticias_cache():
         clave = n.get("via") or n.get("fuente", "")
         if clave in nombres:
             por_col.setdefault(clave, []).append(n)
@@ -6573,7 +7288,7 @@ def vista_columnas(email: str) -> str:
 def vista_destacadas(email: str, cat: str = "") -> str:
     cfg = json.loads(CONFIG.read_text())
     vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
-    noticias = [n for n in leer_jsonl(NOTICIAS)
+    noticias = [n for n in _noticias_cache()
                 if n["fuente"] in vis or n.get("via") in vis]
     if cat:
         noticias = [n for n in noticias if n.get("categoria") == cat]
@@ -6603,12 +7318,14 @@ def vista_destacadas(email: str, cat: str = "") -> str:
 
 
 def tarjeta_grupo_alerta(regla: str, items: list, colores: dict,
-                         relacionadas: list = None) -> str:
+                         relacionadas: list = None,
+                         pals: str = "", creador: str = "",
+                         propio: bool = True) -> str:
     """Una tarjeta por regla: badge + último titular + notas que dispararon
     + cobertura relacionada (mismo tema, sin match directo)."""
     relacionadas = relacionadas or []
     if len(items) == 1 and not relacionadas:
-        return tarjeta_alerta(items[0], colores)
+        return tarjeta_alerta(items[0], colores, pals, creador)
     cat = items[-1].get("categoria", "prensa")
     color = color_regla(regla, colores)
     ultima = max(items, key=lambda a: a["fecha"])["fecha"]
@@ -6640,11 +7357,27 @@ def tarjeta_grupo_alerta(regla: str, items: list, colores: dict,
         + (f"<img class='thumb' src='{html.escape(url_https(ultima_img))}' loading='lazy' "
            f"onerror='this.remove()'>" if ultima_img else "")
         + badge_regla(regla, colores)
+        + (f"<span class='chip-creador' "
+           f"title='Creador de la regla'>{html.escape(creador)}"
+           f"</span>" if creador else "")
+        + (f"<span class='chip-pals' "
+           f"title='Palabras de la regla'>{html.escape(pals)}</span>"
+           if pals else "")
         + f"<span class='titulo'>{html.escape(reciente['titulo'])}</span>"
         + f"<div class='meta'>{len(items)} notas dispararon esta regla · "
         f"última: {fmt_fecha(ultima)}</div>"
         f"<details><summary>Ver las {len(items)} notas ▾</summary>{hits_html}</details>"
-        f"{rel_html}</div>"
+        f"{rel_html}"
+        # rastrear solo en reglas propias — la de un compañero vive
+        # en su perfil y no la puede rastrear quien no la creó
+        + (f"<form method='post' action='/alertas/rastrear' "
+           f"style='margin-top:.4rem'>"
+           f"<input type='hidden' name='regla' "
+           f"value='{html.escape(regla)}'>"
+           f"<button class='btn-linea' style='font-size:.72rem;"
+           f"padding:.2rem .6rem'>⌕ buscar más en el archivo de "
+           f"los medios</button></form>" if propio else "")
+        + "</div>"
     )
 
 
@@ -6684,6 +7417,195 @@ def cobertura_relacionada(items: list, noticias: list) -> list:
             and len(tokens_n[n["link"]] & tema) >= 2]
 
 
+# ── rastreo de archivo: jalar notas viejas desde el sitio del medio ──
+_RASTREO = {}   # email → {"en_curso": bool, "encontradas": int, "regla": str}
+
+
+def _base_sitio(url: str) -> str:
+    """'https://sitio.com/feed/' → 'https://sitio.com' — base para el
+    buscador ?s= propio del medio (WordPress y la mayoría de CMS)."""
+    return re.sub(r"/(feed/?|rss/?|atom/?|feed/atom/?|wp-json/?)$",
+                  "", url.rstrip("/"))
+
+
+def _fecha_archivo(txt: str, url: str) -> str:
+    """Fecha de la nota: meta published_time → <time datetime> →
+    /YYYY/MM/DD/ en la URL. Devuelve ISO sortable o ''."""
+    f = (_meta(txt, "article:published_time")
+         or _meta(txt, "datePublished")
+         or _meta(txt, "date"))
+    if not f:
+        m = re.search(r'<time[^>]+datetime=["\']([^"\']+)', txt, re.I)
+        f = m.group(1) if m else ""
+    if not f:
+        m = re.search(r"/(20\d{2})/(\d{2})/(\d{2})/", url)
+        f = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else ""
+    try:
+        return datetime.fromisoformat(
+            f.replace("Z", "+00:00")).strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        m = re.match(r"(20\d{2}-\d{2}-\d{2})", f)
+        return f"{m.group(1)}T00:00:00" if m else ""
+
+
+def _fecha_real_pagina(url: str) -> str:
+    """Baja la página y devuelve la fecha REAL de publicación
+    (meta published_time → <time> → /YYYY/MM/DD/). Google News
+    re-emite notas viejas con la fecha en que las re-indexó, no
+    la de publicación — esta verificación descubre esas
+    recirculaciones. Devuelve '' si no se pudo comprobar."""
+    try:
+        r = requests.get(url, timeout=(4, 8), stream=True,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        trozos, total = [], 0
+        for chunk in r.iter_content(65536, decode_unicode=False):
+            trozos.append(chunk)
+            total += len(chunk)
+            if total >= 900_000:   # los meta de fecha viven en <head>
+                break
+        r.close()
+        return _fecha_archivo(
+            b"".join(trozos).decode("utf-8", "ignore"), url)
+    except Exception:
+        return ""
+
+
+def _nota_archivo(url: str, f: dict) -> dict:
+    """Descarga la nota EN EL SITIO DEL MEDIO y extrae titulo/resumen/
+    imagen/fecha de sus meta tags — nada de Google."""
+    try:
+        r = requests.get(url, timeout=12,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or len(r.text) < 500:
+            return {}
+    except Exception:
+        return {}
+    titulo = _meta(r.text, "og:title") or _meta(r.text, "twitter:title")
+    if not titulo:
+        m = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.S | re.I)
+        titulo = m.group(1) if m else ""
+    titulo = html.unescape(re.sub(r"<[^>]+>", "", titulo)).strip()
+    # sufijo editorial: 'Titular - Tabasco HOY' → queda solo el titular
+    titulo = re.sub(r"\s*[—–\-|]\s*" + re.escape(f["nombre"]) +
+                    r"\s*$", "", titulo, flags=re.I)
+    if len(titulo) < 20:
+        return {}
+    resumen = _meta(r.text, "og:description") or \
+        _meta(r.text, "description")
+    resumen = re.sub(r"<[^>]+>", "",
+                     html.unescape(resumen)).strip()[:500]
+    fecha = _fecha_archivo(r.text, url)
+    if not fecha:
+        return {}
+    return {"titulo": titulo, "link": url, "resumen": resumen,
+            "fecha": fecha, "fuente": f["nombre"],
+            "categoria": f.get("categoria", "prensa"),
+            "imagen": _meta(r.text, "og:image"), "autor": "",
+            "via": "archivo"}
+
+
+def _candidatos_busqueda(f: dict, termino: str, limite: int = 12) -> list:
+    """Resultados del buscador DEL PROPIO MEDIO. Primero la API WP
+    (/wp-json/wp/v2/search — JSON confiable en sitios WordPress); si
+    no existe, el ?s= clásico con extracción de enlaces."""
+    base = _base_sitio(f["url"])
+    if not base.startswith("http"):
+        return []
+    dom = urlparse(base).netloc
+    # ── WP REST search — la vía limpia ──
+    try:
+        r = requests.get(f"{base}/wp-json/wp/v2/search",
+                         params={"search": termino, "per_page": 20},
+                         timeout=12,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        if (r.status_code == 200
+                and r.headers.get("Content-Type", "").startswith(
+                    "application/json")):
+            urls = []
+            for h in r.json():
+                u = h.get("url", "").split("#")[0]
+                if urlparse(u).netloc.removeprefix("www.") == \
+                        dom.removeprefix("www.") and u not in urls \
+                        and h.get("type") in ("post", "page", ""):
+                    urls.append(u)
+            if urls:
+                return urls[:limite]
+    except Exception:
+        pass
+    # ── fallback: ?s= HTML genérico ──
+    try:
+        r = requests.get(f"{base}/?s={quote(termino)}", timeout=12,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return []
+    except Exception:
+        return []
+    out, vistos = [], set()
+    for m in re.finditer(
+            r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+            r.text, re.S | re.I):
+        u = html.unescape(m.group(1)).split("#")[0]
+        txt = re.sub(r"\s+", " ", html.unescape(
+            re.sub(r"<[^>]+>", " ", m.group(2)))).strip()
+        if (urlparse(u).netloc.removeprefix("www.") ==
+                dom.removeprefix("www.") and u not in vistos
+                and 35 < len(txt) < 170
+                and not re.search(
+                    r"/(categor|tag|author|feed|wp-content|wp-includes"
+                    r"|page/|comment|search|tag/|\.xml)|\.(jpg|jpeg|png"
+                    r"|gif|css|js|svg|webp)(\?|$)", u, re.I)):
+            vistos.add(u)
+            out.append(u)
+            if len(out) >= limite:
+                break
+    return out
+
+
+def rastrear_archivo(email: str, regla_nom: str, cfg: dict):
+    """Hilo: por cada fuente consulta SU buscador con los términos de
+    la regla, descarga cada candidato del sitio original y guarda en
+    NOTICIAS + ALERTAS las que de verdad cumplen la regla (sin correo
+    ni notify — es archivo, no noticia fresca)."""
+    st = _RASTREO[email]
+    try:
+        perfil = perfil_usuario(email, cfg)
+        regla = next((r for r in perfil.get("reglas", [])
+                      if r["nombre"] == regla_nom), {})
+        pals = regla.get("requiere_todas", [])
+        if not pals:
+            return
+        termino = " ".join(p.split("/")[0] for p in pals)
+        conocidos = {n["link"] for n in _noticias_cache()}
+        for f in cfg.get("fuentes", []):
+            if st.get("estado") == "cancelado":
+                break
+            for u in _candidatos_busqueda(f, termino):
+                if u in conocidos or st.get("estado") == "cancelado":
+                    continue
+                conocidos.add(u)
+                nota = _nota_archivo(u, f)
+                if not nota:
+                    continue
+                t = normalizar(f"{nota['titulo']} "
+                               f"{nota.get('resumen','')}")
+                if not coincide(t, regla):
+                    continue
+                guardar_noticia(nota)
+                a = dict(nota)
+                a["reglas"] = regla_nom
+                a["usuario"] = email
+                with ALERTAS.open("a") as fh:
+                    fh.write(json.dumps(a, ensure_ascii=False) + "\n")
+                st["encontradas"] += 1
+        st["estado"] = "listo"
+    except Exception as e:
+        print(f"[rastreo] {email}: {e}")
+        st["estado"] = "error"
+    finally:
+        st["en_curso"] = False
+
+
 def vista_alertas(email: str, msg: str = "") -> str:
     """Alertas agrupadas por regla: cada regla = un cluster con todas sus notas.
     Muestra las alertas DEL USUARIO (usuario=email) + las globales (sin
@@ -6692,52 +7614,90 @@ def vista_alertas(email: str, msg: str = "") -> str:
     La supervisión de todos los usuarios va en /analitica, no aquí."""
     cfg = json.loads(CONFIG.read_text())
     perfil = perfil_usuario(email, cfg)
+    usuarios_all = cargar_usuarios()
+    superv = es_supervisor(email, cfg)
+    mis_proys = set(proyectos_usuario(email))
+    # alcance POR REGLA: cada regla lleva 'proyecto' — vacío = personal
+    # (solo la ve su dueño); con proyecto = la ven los miembros de ese
+    # equipo; supervisor/admin lo ve todo y con su creador
+    reglas_vis = {}
+    for d, u in usuarios_all.items():
+        for r in u.get("reglas", []):
+            if (superv or d == email
+                    or (r.get("proyecto") or "") in mis_proys):
+                reglas_vis[(r["nombre"], d)] = r
+    # alertas sin regla ('Autor seguido', 'Noticia en desarrollo') son
+    # personales — solo el dueño y supervisores las ven
+    dueños_esp = set(usuarios_all) if superv else {email}
     reglas = perfil.get("reglas", [])
-    reglas_vivas = {r["nombre"] for r in reglas}
-    colores = {r["nombre"]: r.get("color", "") for r in reglas}
+    colores = {r["nombre"]: r.get("color", "")
+               for r in reglas_vis.values()}
+
+    def _revalida(a: dict, r: dict) -> bool:
+        """La regla pudo editarse ('efrain/resendez' OR → 'efrain' Y
+        'resendez'): el match guardado en ALERTAS solo vale si sigue
+        cumpliendo la forma actual de la regla."""
+        t_a = normalizar(f"{a.get('titulo','')} {a.get('resumen','')} "
+                         f"{a.get('autor','')}")
+        pals = [[normalizar(v) for v in p.split("/")]
+                for p in r.get("requiere_todas", [])]
+        min_h = len(pals) if len(pals) <= 2 else len(pals) - 1
+        return bool(pals) and sum(
+            1 for p in pals
+            if any(termino_en(v, t_a) for v in p)) >= min_h
+
     alertas = []
     for a in leer_jsonl(ALERTAS):
         dueño = a.get("usuario", "")
-        if dueño and dueño != email:
-            continue  # alerta privada de otro usuario
         base = a["reglas"].split(" (")[0]
-        if base in reglas_vivas or base.startswith("Autor seguido"):
-            alertas.append(a)
+        r_obj = reglas_vis.get((base, dueño or email))
+        if r_obj:
+            # la alerta es visible si SU regla es visible para mí
+            if _revalida(a, r_obj):
+                alertas.append((a, dueño))
+        elif base.startswith("Autor seguido"):
+            if not dueño or dueño in dueños_esp:
+                alertas.append((a, dueño))
         elif base.startswith("Noticia en desarrollo"):
             # solo entra si la historia en sí matchea alguna regla activa
-            if any(coincide(a["titulo"], r) for r in reglas):
-                alertas.append(a)
+            if (not dueño or dueño in dueños_esp) and \
+                    any(coincide(a["titulo"], r) for r in reglas):
+                alertas.append((a, dueño))
 
     grupos = {}
-    for a in alertas:
-        # 'Noticia en desarrollo (0→5 medios)' -> agrupa por 'Noticia en desarrollo'
-        grupos.setdefault(a["reglas"].split(" (")[0], []).append(a)
+    for a, dueño in alertas:
+        # 'Noticia en desarrollo (0→5 medios)' -> agrupa por 'Noticia en desarrollo';
+        # la tupla (regla, dueño) separa reglas homónimas de distintos usuarios
+        grupos.setdefault((a["reglas"].split(" (")[0], dueño), []).append(a)
     vis = fuentes_visibles(perfil, cfg)
-    noticias = [n for n in leer_jsonl(NOTICIAS) if n["fuente"] in vis or n.get("via") in vis]
+    noticias = [n for n in _noticias_cache() if n["fuente"] in vis or n.get("via") in vis]
     # coincidencias retroactivas: notas del archivo que cumplen la regla
     # pero nunca dispararon (publicadas antes de crearla, o resumen
     # que llegó después) — la tarjeta muestra la cobertura real
     regs = []
-    for r in reglas:
+    for (nom, d), r in reglas_vis.items():
         pals = [[normalizar(v) for v in p.split("/")]
                 for p in r.get("requiere_todas", [])]
         if pals:
-            regs.append((r["nombre"], pals,
-                         len(pals) if len(pals) <= 2 else len(pals) - 1))
+            regs.append((nom, d, pals,
+                         len(pals) if len(pals) <= 2
+                         else len(pals) - 1))
     if regs:
-        links_g = {nombre: {a["link"] for a in grupos.get(nombre, [])}
-                   for nombre, _, _ in regs}
+        links_g = {(nom, d): {a["link"] for a in grupos.get((nom, d), [])}
+                   for nom, d, _, _ in regs}
         for n in noticias:
             t = normalizar(f"{n['titulo']} {n.get('resumen','')} "
                            f"{n.get('autor','')}")
-            for nombre, pals, min_h in regs:
-                if (n["link"] not in links_g[nombre]
+            for nombre, d, pals, min_h in regs:
+                if (n["link"] not in links_g[(nombre, d)]
+                        and coincide_interes(n)
                         and sum(1 for p in pals
-                                if any(v in t for v in p)) >= min_h):
+                                if any(termino_en(v, t) for v in p))
+                        >= min_h):
                     a = dict(n)
                     a["reglas"] = nombre
-                    grupos.setdefault(nombre, []).append(a)
-                    links_g[nombre].add(n["link"])
+                    grupos.setdefault((nombre, d), []).append(a)
+                    links_g[(nombre, d)].add(n["link"])
     ordenadas = sorted(
         grupos.items(),
         key=lambda kv: max(a["fecha"] for a in kv[1]),
@@ -6745,12 +7705,72 @@ def vista_alertas(email: str, msg: str = "") -> str:
     )
     boton = ("<p><a href='/config'><button class='btn-linea'>"
              "Personalizar alertas</button></a></p>")
+    # palabras de cada regla (por dueño), para mostrarlas junto al badge
+    pals_regla = {(nom, d): " + ".join(r.get("requiere_todas", []))
+                  for (nom, d), r in reglas_vis.items()}
+
+    def _creador(d: str) -> str:
+        """Chip '· por fulano' — visible siempre para supervisor/admin
+        (Paolo ve quién creó qué alerta) y en reglas ajenas del proyecto."""
+        if d and (superv or d != email):
+            return d.split("@")[0]
+        return ""
+
     cards = "".join(
         tarjeta_grupo_alerta(regla, items, colores,
-                             cobertura_relacionada(items, noticias))
-        for regla, items in ordenadas
+                             cobertura_relacionada(items, noticias),
+                             pals_regla.get((regla, dueño), ""),
+                             _creador(dueño),
+                             dueño in ("", email))
+        for (regla, dueño), items in ordenadas
     )
-    banner = ""
+    # regla activa sin coincidencias: tarjeta en 0 — el usuario ve
+    # que está guardada y vigilando, no que se perdió
+    cards += "".join(
+        f"<div class='card' style='border-left-color:"
+        f"{color_regla(nom, colores)};opacity:.75'>"
+        f"{badge_regla(nom, colores)}"
+        + (f"<span class='chip-creador' title='Creador de la regla'>"
+           f"{html.escape(d.split('@')[0])}</span>" if d and
+           (superv or d != email) else "")
+        + f"<span class='chip-pals' title='Palabras de la regla'>"
+        f"{html.escape(pals_regla.get((nom, d), ''))}</span>"
+        f"<span class='meta'>0 notas — vigilando: te avisará apenas "
+        "salga una que cumpla todas las palabras.</span>"
+        + (f"<form method='post' action='/alertas/rastrear' "
+           f"style='margin-top:.4rem'>"
+           f"<input type='hidden' name='regla' value='{html.escape(nom)}'>"
+           f"<button class='btn-linea' style='font-size:.72rem;"
+           f"padding:.2rem .6rem'>⌕ buscar en el archivo de "
+           f"los medios</button></form>" if d == email else "")
+        + "</div>"
+        for (nom, d) in reglas_vis
+        if (nom, d) not in grupos)
+    # rastreo del archivo en curso: aviso + auto-reload
+    rast = _RASTREO.get(email, {})
+    if rast.get("en_curso"):
+        banner_r = (
+            "<div class='card' style='border-left-color:#1a237e'>"
+            "<b>⏳ Rastreando los sitios de los medios…</b> "
+            "<span class='meta'>la página se recarga sola cada 20 s "
+            "— las notas encontradas van cayendo abajo.</span></div>"
+            "<script>setTimeout(function(){location.reload()},"
+            "20000)</script>")
+    elif rast.get("estado") == "listo":
+        banner_r = (
+            "<div class='card' style='border-left-color:#2e7d32'>"
+            f"<b>Rastreo terminado</b> — {rast.get('encontradas', 0)} "
+            f"nota(s) del archivo se sumaron a "
+            f"«{html.escape(rast.get('regla', ''))}».</div>")
+        _RASTREO.pop(email, None)   # el aviso se muestra una vez
+    elif rast.get("estado") == "error":
+        banner_r = ("<div class='card' style='border-left-color:#b71c1c'>"
+                    "<b>El rastreo falló</b> — reintenta en unos "
+                    "minutos.</div>")
+        _RASTREO.pop(email, None)
+    else:
+        banner_r = ""
+    banner = banner_r
     if msg.isdigit():
         n = int(msg)
         banner = ("<div class='card' style='border-left-color:#2e7d32'>"
@@ -6811,7 +7831,7 @@ def trending_chips(noticias: list) -> str:
 def vista_noticias(email: str, pagina: int = 1, dia: str = "") -> str:
     cfg = json.loads(CONFIG.read_text())
     vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
-    noticias = [n for n in leer_jsonl(NOTICIAS, limite=0)
+    noticias = [n for n in _noticias_cache()
                 if (n["fuente"] in vis or n.get("via") in vis)
                 and (dia or n.get("categoria")
                      not in ("columnas", "x", "seguimiento"))
@@ -6851,9 +7871,12 @@ def vista_x(email: str) -> str:
     posts, no cobertura."""
     cfg = json.loads(CONFIG.read_text())
     vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
-    posts = sorted((n for n in leer_jsonl(NOTICIAS, limite=0)
+    # REGLA MADRE: el tab X es radar de Reséndez/TSJ — el feed general
+    # sigue en /noticias; aquí solo posts de interés judicial
+    posts = sorted((n for n in _noticias_cache()
                     if (n["fuente"] in vis or n.get("via") in vis)
-                    and n.get("categoria") == "x"),
+                    and n.get("categoria") == "x"
+                    and coincide_interes(n)),
                    key=lambda n: n["fecha"], reverse=True)
     # el feed 'Siguiendo' trae ~1200 cuentas (de todo): el tab solo
     # muestra autores aprobados — el resto igual se ingirió y ya pasó
@@ -6862,14 +7885,15 @@ def vista_x(email: str) -> str:
                   cfg.get("x_permitidos", [])}
     posts = [n for n in posts
              if not n["fuente"].startswith("@")
-             or n["fuente"].lower().lstrip("@") in permitidos][:200]
+             or n["fuente"][1:].lower() in permitidos]
 
-    # 'Lo más comentado': clustering del radar COMPLETO (los ~1,100
-    # follows, no solo la whitelist) — mismo tema repetido en varias
-    # cuentas = de qué se habla hoy, tipo trending de tu propia red
+    # 'Lo más comentado': clustering del radar de interés (los ~1,100
+    # follows filtrados por coincide_interes) — mismo tema judicial
+    # repetido en varias cuentas = de qué se habla hoy en el TSJT
     h24 = (datetime.now() - timedelta(hours=24)).isoformat()
-    radar = [n for n in leer_jsonl(NOTICIAS, limite=0)
-             if n.get("categoria") == "x" and n.get("fecha", "") > h24]
+    radar = [n for n in _noticias_cache()
+             if n.get("categoria") == "x" and n.get("fecha", "") > h24
+             and coincide_interes(n)]
     clusters = []
     for rep, c in agrupar_noticias(radar, ventana_dias=1):
         if len(c) < 2:
@@ -6978,13 +8002,51 @@ def vista_x(email: str) -> str:
                  "</p>")
 
 
+def vista_telegram(email: str) -> str:
+    """Tab Telegram: RADAR de menciones — solo posts que tocan al
+    magistrado/TSJ, vengan del canal que vengan (local o foráneo).
+    El contenido general del canal no interesa; el sistema es un
+    monitor de Efraín Reséndez (regla del usuario 22/oct)."""
+    cfg = json.loads(CONFIG.read_text())
+    vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
+    tg = {f["nombre"] for f in cfg.get("fuentes", [])
+          if f.get("tipo") == "telegram"}
+    posts = sorted(
+        (n for n in _noticias_cache()
+         if (n["fuente"] in tg or n.get("via") in tg
+             or "t.me/" in (n.get("link") or ""))
+         and (n["fuente"] in vis or n.get("via") in vis
+              or "t.me/" in (n.get("link") or ""))
+         and RX_RESENDEZ.search(
+             normalizar((n["titulo"] or "")
+                        + " " + (n.get("resumen") or "")))),
+        key=lambda n: n["fecha"], reverse=True)[:200]
+    if not posts:
+        return ("<h1>Telegram</h1><p class='meta'>Sin menciones del "
+                "magistrado/TSJ en los canales rastreados — el radar "
+                "solo muestra posts que lo tocan, no el feed del "
+                "canal.</p>")
+    por_canal = {}
+    for n in posts:
+        por_canal.setdefault(n["fuente"], []).append(n)
+    resumen = " · ".join(f"{html.escape(k)} ({len(v)})"
+                         for k, v in sorted(
+                             por_canal.items(),
+                             key=lambda kv: -len(kv[1])))
+    cards = "".join(tarjeta_noticia(n) for n in posts)
+    return (f"<h1>Telegram</h1><p class='meta'>{len(posts)} posts · "
+            f"{len(por_canal)} canales</p>"
+            f"<p class='meta'>{resumen}</p>"
+            f"<h2 style='margin:1rem 0 .4rem'>Cronológico</h2>{cards}")
+
+
 def vista_interes(email: str, pagina: int = 1) -> str:
     """Sección Interés: notas (Tabasco o nacional) que tocan los temas
     y nombres de la lista judicial — coincide_interes hace el filtro
     de dos niveles."""
     cfg = json.loads(CONFIG.read_text())
     vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
-    noticias = [n for n in leer_jsonl(NOTICIAS, limite=0)
+    noticias = [n for n in _noticias_cache()
                 if (n["fuente"] in vis or n.get("via") in vis)
                 and coincide_interes(n)]
     # misma historia en varios medios → UNA tarjeta-grupo (mosaico +
@@ -7084,7 +8146,7 @@ def vista_seguimiento(email: str, pagina: int = 1) -> str:
     interés en la vista: sección en prueba solo para admin — el
     filtro llegó a esconder publicaciones correctas. No pasa por
     fuentes_visibles: es una sección propia, no el feed."""
-    noticias = [n for n in leer_jsonl(NOTICIAS, limite=0)
+    noticias = [n for n in _noticias_cache()
                 if n.get("categoria") == "seguimiento"]
     ordenadas = sorted(noticias, key=lambda n: n["fecha"],
                        reverse=True)
@@ -7130,7 +8192,11 @@ def _chip_nota(n: dict) -> tuple:
             f" style='font-size:.7rem;font-weight:600;color:#b03a2e;"
             f"background:#fdecea;border:1px solid #f0b8b3;"
             f"border-radius:10px;padding:1px 8px;text-decoration:none;"
-            f"white-space:nowrap'>nota&nbsp;→</a>")
+            f"white-space:nowrap'>nota&nbsp;→</a>"
+            # el URL real va oculto en pantalla pero APARECE al
+            # imprimir/exportar a PDF (reporte de entrega, 20/oct)
+            f"<span class='url-print' style='display:none'>"
+            f"{html.escape(n['u'])}</span>")
     return badge, link
 
 
@@ -7160,6 +8226,15 @@ def _cuerpo_sintesis(texto: str, notas_ref: list) -> str:
         p = p.strip()
         if not p:
             continue
+        # TODAS las citas [N#] del bloque — la dominical referencia
+        # varias notas por párrafo a media frase; antes solo se
+        # resolvía enlace si UN [N#] cerraba la línea, así que en la
+        # dominical no salía ni un solo enlace
+        refs = []
+        for mm in re.finditer(r"[\[(]N(\d+)(?:\|[^\])]*)?[\])]", p):
+            k = int(mm.group(1)) - 1
+            if 0 <= k < len(notas_ref) and k not in refs:
+                refs.append(k)
         sec = re.fullmatch(r"\*\*(.+?)\*\*", p)
         if sec or (p.isupper() and len(p) > 3):
             cuerpo += (f"<h3 style='margin:1rem 0 .4rem;color:#1a237e;"
@@ -7211,13 +8286,36 @@ def _cuerpo_sintesis(texto: str, notas_ref: list) -> str:
                                else _link_nota(p, notas_ref))
             cuerpo += (f"<p style='margin:.35rem 0'>{badge_n}"
                        f"{_resaltar_interes(txt)}{link_n}</p>")
+        # bloque de enlaces por párrafo/sección — colapsado en
+        # pantalla (<details>), el CSS de impresión lo expande para
+        # que salgan todos en el PDF: un renglón por cita [N#]
+        if refs:
+            lin = "<br>".join(
+                f"<a href='/nota?u={quote(notas_ref[k]['u'], safe='')}'"
+                f" style='color:#6b6b8a;text-decoration:none'>"
+                f"[N{k + 1}] {html.escape(notas_ref[k].get('f', ''))}"
+                f" — {html.escape(notas_ref[k]['u'])}</a>"
+                for k in refs if notas_ref[k].get("u"))
+            if lin:
+                cuerpo += (
+                    f"<details class='blk-refs' style='margin:.05rem 0 "
+                    f".55rem'><summary style='cursor:pointer;font-size:"
+                    f".66rem;color:#888'>enlaces ({len(refs)})</summary>"
+                    f"<div style='font-size:.62rem;color:#777;"
+                    f"line-height:1.45;word-break:break-all'>{lin}</div>"
+                    f"</details>")
     return cuerpo
 
 
-def vista_resumenes(email: str, msg: str = "") -> str:
-    """Síntesis ejecutivas generadas con Ollama (9:00, 15:00 y 21:00)."""
+def vista_resumenes(email: str, msg: str = "", dia: str = "") -> str:
+    """Síntesis ejecutivas indexadas por día — como las portadas:
+    tabs de fecha, siempre abre el día en curso y permite ver los
+    resúmenes y cierres de días anteriores."""
     cfg_r = json.loads(CONFIG.read_text())
     admin_v = es_admin(email, cfg_r)
+    # supervisión (Paolo): edita/borra/publica síntesis como el admin —
+    # publicar en X sigue siendo exclusivo del admin
+    sup_v = es_supervisor(email, cfg_r)
     # nombre de fuente → (categoría, tipo) para el cuadro por medio
     cat_f = {}
     for f in cfg_r.get("fuentes", []):
@@ -7238,6 +8336,21 @@ def vista_resumenes(email: str, msg: str = "") -> str:
     # cronológico real, más reciente arriba — a las 21:10 queda
     # cierre → nocturna → vespertina → matutina
     entradas.sort(key=lambda e: e.get("fecha", ""), reverse=True)
+    # index por día (?dia=YYYY-MM-DD) — default: el día en curso
+    hoy_s = datetime.now().strftime("%Y-%m-%d")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", dia or ""):
+        dia = hoy_s
+    dias = sorted({e.get("fecha", "")[:10] for e in entradas},
+                  reverse=True)[:10]
+    if hoy_s not in dias:
+        dias = [hoy_s] + dias
+    tabs_dia = ("<div class='tabs-cat'>" + "".join(
+        f"<a class='tab-cat{' on' if d == dia else ''}' "
+        f"href='/resumenes?dia={d}'>"
+        f"{'hoy ' if d == hoy_s else ''}{d[8:10]}/{d[5:7]}</a>"
+        for d in dias) + "</div>")
+    entradas = [e for e in entradas
+                if e.get("fecha", "").startswith(dia)]
     cards = ""
     for e in entradas[:30]:
         # borradores privados (mediodía) — solo admin los ve hasta
@@ -7249,7 +8362,9 @@ def vista_resumenes(email: str, msg: str = "") -> str:
         badge = ("<span style='background:#1a237e;color:#fff;padding:2px 8px;"
                  "border-radius:10px;font-size:.7rem'>"
                  + {"cierre": "CIERRE DIARIO",
-                    "mediodia": "MEDIODÍA"}.get(
+                    "mediodia": "MEDIODÍA",
+                    "semanal": "SEMANAL",
+                    "dominical": "ANÁLISIS DOMINICAL"}.get(
                      franja, franja.upper()) + "</span>")
         if e.get("privado"):
             badge += ("<span style='background:#c62828;color:#fff;"
@@ -7268,7 +8383,7 @@ def vista_resumenes(email: str, msg: str = "") -> str:
         chips = (f"{e.get('n_notas', 0)} notas de interés"
                  + (f" · {len(fuentes)} fuentes" if fuentes else ""))
         ctrl = ""
-        if admin_v:
+        if sup_v:
             ffecha = html.escape(e.get("fecha", ""), quote=True)
             if e.get("privado"):
                 # borrador de mediodía — el admin decide cuándo la
@@ -7299,7 +8414,7 @@ def vista_resumenes(email: str, msg: str = "") -> str:
             # publicar en X — solo admin (ni paolo): el post_x viene
             # pre-generado con el cierre, editable antes de publicar;
             # publicado = marca, no re-publicable
-            if franja == "cierre":
+            if franja == "cierre" and admin_v:
                 ffecha2 = html.escape(e.get("fecha", ""), quote=True)
                 if _x_publicado(e.get("fecha", "")):
                     ctrl += ("<p class='meta' style='color:#2e7d32'>"
@@ -7440,17 +8555,26 @@ def vista_resumenes(email: str, msg: str = "") -> str:
             f"style='margin:.7rem 0 .3rem'>"
             f"<summary style='font-size:.8rem;color:#5c6bc0;"
             f"cursor:pointer'>Acciones</summary>{botones}</details>")
+    # reporte express PDF — solo dirección (paolo) y admin
+    btn_pdf = ""
+    if admin_v or email == "paolo@anoticias.com":
+        btn_pdf = ("<p class='meta'>Reporte express: "
+                   "<a class='tab-cat on' href='/resumenes-pdf' "
+                   "onclick=\"showLoader('Generando reporte express "
+                   "— puede tardar ~1 min...')\">PDF del día ↗</a>"
+                   " — se arma al click con la información capturada "
+                   "hasta ahora.</p>")
     return (f"<h1>Síntesis Diaria "
-            f"{datetime.now().strftime('%d/%m/%y')}</h1>" + aviso
-            + "<p class='meta'>Resumen ejecutivo — "
-              "matutina 9:00 h, vespertina 15:00 h y nocturna "
-              "21:00 h, cierre 21:03 h.</p>" + cuadro_g
-            + acciones + selector
-            + (cards or "<p>Aún no hay síntesis — la primera sale a las "
-                        "9:00 h.</p>"))
+            f"{dia[8:10]}/{dia[5:7]}/{dia[2:4]}</h1>" + aviso
+            + tabs_dia
+            + "<p class='meta'>Digests matutina 9:00 h, vespertina "
+              "15:00 h y nocturna 21:00 h · análisis mediodía 12:00 h "
+              "y cierre 17:00 h.</p>" + cuadro_g
+            + btn_pdf + acciones + selector
+            + (cards or "<p>Sin síntesis este día.</p>"))
 
 
-def vista_reporte_resumenes(sel: list) -> str:
+def vista_reporte_resumenes(sel: list, admin: bool = False) -> str:
     """Reporte imprimible de entrega: encabezado con fecha larga +
     cuadro por tipo de medio + las síntesis elegidas (checkboxes en
     /resumenes). El botón Imprimir/PDF usa el diálogo del navegador."""
@@ -7479,7 +8603,8 @@ def vista_reporte_resumenes(sel: list) -> str:
         sel_set = set(sel)
         entradas = [e for e in entradas if e.get("fecha") in sel_set]
     entradas.sort(key=lambda e: {"matutina": 0, "vespertina": 1,
-                                 "nocturna": 2, "cierre": 3}
+                                 "nocturna": 2, "semanal": 3,
+                                 "cierre": 4}
                   .get(e.get("franja", ""), 9))
 
     def _grupo(ct: tuple) -> str:
@@ -7543,7 +8668,13 @@ def vista_reporte_resumenes(sel: list) -> str:
   mark {{ background: #fff3a0; padding: 0 .1em; }}
   a {{ color: #1a237e; }}
   @media print {{ .toolbar {{ display: none }}
-                  body {{ padding: 0 }} }}
+                  body {{ padding: 0 }}
+                  .url-print {{ display: block !important;
+                    font-size: .62rem; color: #555;
+                    word-break: break-all }}
+                  .blk-refs > * {{ display: block !important; }}
+                  .blk-refs > summary {{ display: none; }}
+                  .blk-refs {{ border: none; }} }}
   @page {{ margin: 1.8cm; }}
 </style></head><body>
 <div class="toolbar">
@@ -7555,6 +8686,21 @@ def vista_reporte_resumenes(sel: list) -> str:
 nocturna 21:00 h, cierre del día 21:03 h · {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
 {cuadro}
 {secciones or "<p>Sin síntesis seleccionadas.</p>"}
+<script>
+// Chrome no expande <details> cerrado con CSS — abrir al
+// imprimir y restaurar después
+window.addEventListener('beforeprint', function() {{
+  document.querySelectorAll('details.blk-refs').forEach(function(d) {{
+    if (!d.open) d.dataset._cerrado = '1';
+    d.open = true;
+  }});
+}});
+window.addEventListener('afterprint', function() {{
+  document.querySelectorAll('details.blk-refs').forEach(function(d) {{
+    if (d.dataset._cerrado) {{ d.open = false; delete d.dataset._cerrado; }}
+  }});
+}});
+</script>
 </body></html>"""
 
 
@@ -7568,6 +8714,10 @@ def _reporte_png(doc_html: str) -> bytes:
             pg = br.new_page(viewport={"width": 900})
             pg.set_content(doc_html, wait_until="load")
             pg.wait_for_timeout(400)
+            # los bloques de enlaces colapsados deben verse en la
+            # imagen — el screenshot no dispara beforeprint
+            pg.eval_on_selector_all(
+                "details.blk-refs", "els => els.forEach(d => d.open = true)")
             png = pg.screenshot(full_page=True)
             br.close()
             return png
@@ -7595,7 +8745,7 @@ def _notas_texto(vis: set) -> list:
     global _BUSCAR_CACHE
     mt = NOTICIAS.stat().st_mtime if NOTICIAS.exists() else 0
     if _BUSCAR_CACHE.get("mt") != mt:
-        notas = leer_jsonl(NOTICIAS, limite=0)
+        notas = _noticias_cache()
         textos = {n["link"]: normalizar(
             n["titulo"] + " " + n["fuente"] + " "
             + (n.get("autor") or "") + " "
@@ -7650,7 +8800,7 @@ def busqueda_viva_wp(q: str, cfg: dict, ya: set) -> list:
                      "link": it.get("url", ""), "fuente": nombre}
                     for it in data
                     if it.get("url") and it.get("url") not in ya
-                    and all(t in normalizar(it.get("title", ""))
+                    and all(termino_en(t, normalizar(it.get("title", "")))
                             for t in terms)]
         except Exception:
             return []
@@ -7662,7 +8812,48 @@ def busqueda_viva_wp(q: str, cfg: dict, ya: set) -> list:
     return out[:60]
 
 
-def vista_buscar(q: str, email: str) -> str:
+def busqueda_deep(q: str, ya: set) -> list:
+    """DEEP SEARCH: sale de nuestra base — consulta el RSS de Google
+    News por el término (mismo mecanismo que las fuentes 'gn:').
+    Trae notas de CUALQUIER medio, esté o no en el catálogo; no se
+    guardan en la base — son consulta, no ingesta."""
+    import feedparser
+    if not q.strip():
+        return []
+    url = ("https://news.google.com/rss/search?q=" + quote(q)
+           + "&hl=es-419&gl=MX&ceid=MX:es-419")
+    try:
+        r = requests.get(url, timeout=8,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return []
+        feed = feedparser.parse(r.content)
+    except Exception:
+        return []
+    out, vistos = [], set(ya)
+    for e in feed.entries:
+        link = e.get("link", "")
+        if not link or link in vistos:
+            continue
+        vistos.add(link)
+        # fecha legible si GN la trae parseable
+        ftxt = ""
+        if e.get("published_parsed"):
+            try:
+                ftxt = fmt_fecha(datetime(
+                    *e.published_parsed[:6]).isoformat())
+            except Exception:
+                pass
+        src = getattr(e.get("source"), "title", "") or ""
+        out.append({"titulo": html.unescape(e.get("title", "")),
+                    "link": link, "fuente": src or "Google News",
+                    "fecha": ftxt})
+        if len(out) >= 40:
+            break
+    return out
+
+
+def vista_buscar(q: str, email: str, deep: bool = False) -> str:
     agujas = _agujas_buscar(q)      # AND; "frase entre comillas" exacta
     cfg = json.loads(CONFIG.read_text())
     vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
@@ -7671,10 +8862,10 @@ def vista_buscar(q: str, email: str) -> str:
     alertas = [a for a in leer_jsonl(ALERTAS)
                if not a.get("usuario") or a["usuario"] == email]
     hits_n = [n for n, txt in notas_txt
-              if all(t in txt for t in agujas)]
+              if all(termino_en(t, txt) for t in agujas)]
     hits_a = [a for a in alertas if all(
-        t in normalizar(a["titulo"] + " " + a["reglas"]
-                        + " " + (a.get("autor") or ""))
+        termino_en(t, normalizar(a["titulo"] + " " + a["reglas"]
+                                 + " " + (a.get("autor") or "")))
         for t in agujas)]
     # si la alerta ya está como noticia en resultados, no duplicar
     links_n = {n["link"] for n in hits_n}
@@ -7687,21 +8878,52 @@ def vista_buscar(q: str, email: str) -> str:
         f"{html.escape(h['titulo'])}</a>"
         f"<div class='meta'>{html.escape(h['fuente'])} · en el medio ↗</div>"
         f"</div>" for h in vivos)
+    # DEEP SEARCH (?deep=1): sale a Google News — medios fuera del
+    # catálogo y hasta fuera del radar; links directos (no pasan por
+    # /nota: son URLs redirect de GN que no se pueden re-leer)
+    externos = busqueda_deep(
+        q, links_n | {a["link"] for a in hits_a}
+        | {v["link"] for v in vivos}) if deep else []
+    deep_html = "".join(
+        f"<div class='card'><a href='{html.escape(h['link'], quote=True)}'"
+        f" target='_blank' rel='noopener'>"
+        f"{html.escape(h['titulo'])}</a>"
+        f"<div class='meta'>{html.escape(h['fuente'])}"
+        f"{' · ' + h['fecha'] if h['fecha'] else ''} · web externa ↗</div>"
+        f"</div>" for h in externos)
     colores = {r["nombre"]: r.get("color", "") for r in perfil_usuario(email, cfg).get("reglas", [])}
     chips = trending_chips(noticias)
     regresar = (f"<a class='chip-trend' href='/noticias' "
                 f"style='background:#1a237e'>← Todas</a>")
     trending = f"<div class='trending'>{regresar}{chips}</div>" if chips else ""
+    # botón siempre visible: la base ya buscó; deep sale fuera
+    q_enc = quote(q)
+    btn_deep = (f"<p class='meta' style='margin:.6rem 0'>"
+                f"<a href='/buscar?q={q_enc}&deep=1'>"
+                f"<button class='btn-linea' style='font-size:.75rem'>"
+                f"⌕ Deep search — Google News y toda la web</button></a>"
+                f" <span style='font-size:.7rem;color:#888'>(tarda unos "
+                f"segundos; sale de la base)</span></p>"
+                if not deep else
+                f"<p class='meta' style='margin:.6rem 0'>"
+                f"<a href='/buscar?q={q_enc}'>"
+                f"<button class='btn-linea' style='font-size:.75rem'>"
+                f"← solo base local</button></a></p>")
     return (f"<h1>Buscar: {html.escape(q)}</h1>"
             f"{trending}"
             f"<p class='meta'>{len(hits_n)} notas · {len(hits_a)} alertas"
             f" · frase exacta: \"entre comillas\"</p>"
+            f"{btn_deep}"
             + "".join(card for _, card in sorted(
                 [(a["fecha"], tarjeta_alerta(a, colores)) for a in hits_a]
                 + [(n["fecha"], tarjeta_noticia(n)) for n in hits_n],
                 key=lambda x: x[0], reverse=True))
             + (f"<h2>En el archivo de los medios ({len(vivos)})</h2>"
-               + vivo_html if vivos else ""))
+               + vivo_html if vivos else "")
+            + (f"<h2>Deep search — web externa ({len(externos)})</h2>"
+               + (deep_html or "<p class='meta'>Google News no trajo "
+                 "nada para este término.</p>")
+               if deep else ""))
 
 
 def vista_config(email: str) -> str:
@@ -7715,6 +8937,21 @@ def vista_config(email: str) -> str:
   <b>La demo es solo lectura.</b> Las alertas requieren una cuenta —
   pídele al admin que te cree una para armar tus reglas.
 </div>"""
+    mis_proys = proyectos_usuario(email)
+
+    def _sel_alcance(actual: str = "") -> str:
+        """Alcance de la regla: personal (solo tú) o compartida con
+        uno de TUS proyectos — sus miembros la ven con tu nombre."""
+        return ("<select name='proyecto' title='Alcance de la alerta'>"
+                + f"<option value=''{' selected' if not actual else ''}>"
+                  "Personal</option>"
+                + "".join(
+                    f"<option value='{html.escape(p, quote=True)}'"
+                    f"{' selected' if p == actual else ''}>"
+                    f"Proyecto {html.escape(p)}</option>"
+                    for p in mis_proys)
+                + "</select>")
+
     cards = "".join(
         f"""<div class="card regla" style="border-left-color:{color}">
   <span class="badge" style="background:{color}">{html.escape(r['nombre'])}</span>
@@ -7730,6 +8967,7 @@ def vista_config(email: str) -> str:
     (ej: <code>villahermosa/tabasco</code>)</p>
     <div class="regla-pie">
       <input type="color" name="color" value="{color}" title="Color del badge">
+      {_sel_alcance(r.get('proyecto', ''))}
       <button name="accion" value="editar">Guardar</button>
       <button class="btn-rojo" name="accion" value="borrar"
               onclick="return confirm('¿Borrar esta regla?')">Borrar</button>
@@ -7739,12 +8977,16 @@ def vista_config(email: str) -> str:
         for i, r in enumerate(reglas)
         for color in [r.get("color") or color_regla(r["nombre"], {})]
     )
+    nota_alcance = ("<p class='meta'><b>Personal</b> = solo tú la ves · "
+                    "<b>Proyecto</b> = la ven tus compañeros de ese "
+                    "equipo, con tu nombre.</p>" if mis_proys else "")
     return f"""
 <h1>Mis reglas de alerta</h1>
 <p class="meta">Una regla dispara si la nota contiene TODAS sus palabras/frases
-(mínimo 2 — una sola palabra genera demasiado ruido). Son personales:
-nadie más ve ni edita las tuyas. Los cambios aplican al guardar — el
-backfill es inmediato y dispara un ciclo de revisión para noticias nuevas.</p>
+(mínimo 2 — una sola palabra genera demasiado ruido). Solo tú las editas.
+Los cambios aplican al guardar — el backfill es inmediato y dispara un
+ciclo de revisión para noticias nuevas.</p>
+{nota_alcance}
 <h2>Nueva regla</h2>
 <div class="card regla">
   <form method="post" action="/config">
@@ -7754,6 +8996,7 @@ backfill es inmediato y dispara un ciclo de revisión para noticias nuevas.</p>
     <input type="text" name="palabras" placeholder="tabasco, inundación — sinónimos con /: tabasco/villahermosa" required>
     <div class="regla-pie">
       <input type="color" name="color" value="#1a237e" title="Color del badge">
+      {_sel_alcance()}
       <button name="accion" value="agregar">Agregar regla</button>
     </div>
   </form>
@@ -7783,7 +9026,7 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
         # link de agregador: el servidor no puede resolverlo al artículo
         # real (GN redirige con JS) — pero el navegador del usuario sí.
         # Mostramos tarjeta con datos de la nota almacenada + botón.
-        nota = next((n for n in leer_jsonl(NOTICIAS)
+        nota = next((n for n in _noticias_cache()
                      if n["link"] == link), {})
         t = nota.get("titulo", "")
         f = nota.get("fuente", "")
@@ -7808,7 +9051,7 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
     if re.search(r"(^|\.)(x|twitter)\.com$", dominio):
         # el post ES el contenido — x.com anónimo solo enseña el
         # login-wall ('age-restricted'). Servir el texto guardado.
-        nota = next((n for n in leer_jsonl(NOTICIAS)
+        nota = next((n for n in _noticias_cache()
                      if n["link"] == link), {})
         t = nota.get("resumen") or nota.get("titulo", "")
         aut = nota.get("fuente", "")
@@ -7848,7 +9091,7 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
     except Exception as e:
         # el medio bloquea al servidor (403/WAF) — mostrar lo que tenemos
         # guardado de la nota en vez de una pantalla vacía
-        nota = next((n for n in leer_jsonl(NOTICIAS)
+        nota = next((n for n in _noticias_cache()
                      if n["link"] == link), {})
         t = nota.get("titulo", "")
         img = nota.get("imagen", "")
@@ -7901,7 +9144,7 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
     # byline: autor que vino en el feed → si no, metas de la página
     # (article:author / author / twitter:creator) — muchos medios
     # publican 'Redacción' o nada: se muestra lo que haya
-    nota_guardada = next((n for n in leer_jsonl(NOTICIAS)
+    nota_guardada = next((n for n in _noticias_cache()
                           if n["link"] == link), {})
     autor = (nota_guardada.get("autor")
              or _meta(r.text, "article:author")
@@ -8722,11 +9965,43 @@ function soloCat(cat) {
         tipo = ("admin" if es_admin(u_email, cfg)
                 else f"demo hasta {fmt_fecha(datetime.fromtimestamp(expira).isoformat())}"
                 if expira else "usuario")
+        proy = ", ".join(proyectos_usuario(u_email))
+        niv = u.get("nivel", "operacion")
+        etiqueta = f"{proy or 'sin proyecto'} · {niv}"
+        sel_niv = ("<select name='nivel'>"
+                   + "".join(
+                       f"<option value='{v}'"
+                       f"{' selected' if niv == v else ''}>{t}</option>"
+                       for v, t in (("operacion", "Operación"),
+                                    ("supervision", "Supervisión")))
+                   + "</select>")
         form = ""
-        if not es_admin(u_email, cfg):
+        if es_admin(u_email, cfg):
+            # degradar a operador — su perfil queda y ya se le pueden
+            # asignar proyectos/nivel; protege al último admin y a
+            # uno mismo
+            if u_email != email and len(cfg.get("admins", [])) > 1:
+                form = (
+                    f"<form method='post' action='/usuarios'>"
+                    f"<input type='hidden' name='email' "
+                    f"value='{html.escape(u_email, quote=True)}'>"
+                    f"<div class='regla-pie'>"
+                    f"<button name='accion' value='quitar_admin' "
+                    f"onclick=\"return confirm('¿Quitar admin a "
+                    f"{html.escape(u_email)}? Pasa a operador.')\">"
+                    f"Quitar admin → operador</button></div></form>")
+        else:
             form = (
                 f"<form method='post' action='/usuarios'>"
                 f"<input type='hidden' name='email' value='{html.escape(u_email, quote=True)}'>"
+                f"<label>Proyectos</label>"
+                f"<input type='text' name='proyecto' "
+                f"value='{html.escape(proy, quote=True)}' "
+                f"placeholder='tsjt, qroo…'>"
+                f"<label>Nivel</label>{sel_niv}"
+                f"<div class='regla-pie'>"
+                f"<button name='accion' value='perfil'>Guardar perfil</button>"
+                f"</div>"
                 f"<label>Nueva contraseña</label>"
                 f"<input type='text' name='password' "
                 f"placeholder='dejar vacío para no cambiar'>"
@@ -8740,7 +10015,7 @@ function soloCat(cat) {
                   "</div></form>")
         cards_u += f"""<div class="card regla" style="border-left-color:#4527a0">
   <strong>{html.escape(u_email)}</strong>
-  <span class="meta"> · {len(u.get('reglas', []))} reglas · {tipo}</span>
+  <span class="meta"> · {len(u.get('reglas', []))} reglas · {tipo} · {html.escape(etiqueta)}</span>
   {form}
 </div>"""
     gestion = f"""
@@ -8754,6 +10029,13 @@ que se autodestruye al expirar.</p>
     <input type="email" name="email" placeholder="correo@ejemplo.com" required>
     <label>Contraseña inicial</label>
     <input type="text" name="password" required>
+    <label>Proyectos <span class="meta">(equipos: solo ve alertas de sus proyectos — separa con coma si son varios)</span></label>
+    <input type="text" name="proyecto" placeholder="tsjt, qroo…">
+    <label>Nivel</label>
+    <select name="nivel">
+      <option value="operacion">Operación</option>
+      <option value="supervision">Supervisión</option>
+    </select>
     <div class="regla-pie">
       <button name="accion" value="crear">Crear usuario</button>
     </div>
@@ -8766,7 +10048,7 @@ que se autodestruye al expirar.</p>
 
 def vista_stats() -> str:
     """Estadísticas: totales, notas por fuente, por día, salud de feeds."""
-    noticias = leer_jsonl(NOTICIAS)
+    noticias = _noticias_cache()
     alertas = leer_jsonl(ALERTAS)
     estado = cargar_json(ESTADO_FUENTES, {})
 
@@ -8822,7 +10104,7 @@ def vista_stats() -> str:
 
 def exportar_reporte() -> bytes:
     """Registro completo en texto claro con formato: alertas + noticias."""
-    noticias = leer_jsonl(NOTICIAS)
+    noticias = _noticias_cache()
     alertas = leer_jsonl(ALERTAS)
     hoy = datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -8892,7 +10174,7 @@ MANIFEST = json.dumps({
     "id": "/",
     "name": "@noticias",
     "short_name": "@noticias",
-    "description": "Monitor de prensa: noticias, alertas y portadas",
+    "description": "Monitor de prensa del TSJT: noticias, alertas y síntesis ejecutivas",
     "lang": "es-MX",
     "start_url": "/",
     "scope": "/",
@@ -9192,8 +10474,10 @@ def render_pagina(contenido: str, q: str = "", base: str = "",
                   usuario: str = "", og_title: str = "",
                   og_desc: str = "") -> bytes:
     cfg = json.loads(CONFIG.read_text())
-    admin_tabs = ('<a href="/seguimiento">Seguimiento</a>'
-                  '<a href="/horarios">Horarios</a>'
+    # Seguimiento (radar de perfiles FB) fuera del nav — las 38
+    # fuentes fb están muertas (cuentas perdidas, fb_pausa);
+    # la ruta sigue viva por URL para consultar el histórico
+    admin_tabs = ('<a href="/horarios">Horarios</a>'
                   '<a href="/salud">Salud</a>'
                   '<a href="/stats">Stats</a>'
                   '<a href="/analitica">Analítica</a>'
@@ -9201,6 +10485,7 @@ def render_pagina(contenido: str, q: str = "", base: str = "",
     # guests (demo 24h): solo noticias/alertas/portadas — el producto
     # judicial (interés, columnas, síntesis, fuentes) es de pago
     tabs_reg = ('<a href="/x">X</a>'
+                '<a href="/telegram">TG</a>'
                 '<a href="/columnas">Columnas</a>'
                 '<a href="/interes">Interés</a>'
                 '<a href="/resumenes">Resúmenes</a>'
@@ -9221,11 +10506,12 @@ def render_pagina(contenido: str, q: str = "", base: str = "",
                          tabs_reg=tabs_reg, usuario=html.escape(usuario),
                          usuario_html=html.escape(nombre_u),
                          og_title=html.escape(og_title or
-                             "@noticias — Síntesis de prensa con alertas"),
+                             "@noticias — Monitor de prensa TSJT"),
                          og_desc=html.escape(og_desc or
-                             "Monitor de medios en tiempo real: destacadas, "
-                             "alertas por tema, noticias y estadísticas. "
-                             "Powered by Olmeca Code."),
+                             "Monitor de noticias del Poder Judicial de "
+                             "Tabasco: prensa del Magistrado Presidente y "
+                             "el TSJT, alertas por tema y síntesis "
+                             "ejecutivas. Powered by Olmeca Code."),
                          og_img=html.escape(og_img or
                              f"{base}/og.png")).encode()
 
@@ -9351,11 +10637,34 @@ def aplicar_accion_usuarios(form: dict, email: str) -> bool:
     accion = form.get("accion", [""])[0]
     pw = form.get("password", [""])[0]
 
+    # varios proyectos: 'tsjt, qroo' — el operador puede estar en 2+
+    proyectos = [p.strip().lower() for p in
+                 form.get("proyecto", [""])[0].split(",") if p.strip()]
+    nivel = form.get("nivel", [""])[0].strip().lower()
+    if nivel not in ("operacion", "supervision"):
+        nivel = "operacion"
     if accion == "crear" and objetivo and pw and objetivo not in usuarios:
         usuarios[objetivo] = {
             "reglas": [], "fuentes_ocultas": [], "expira": 0,
             "password": hash_password(pw),
+            "proyectos": proyectos, "nivel": nivel,
         }
+    elif accion == "perfil" and objetivo in usuarios \
+            and not es_admin(objetivo, cfg):
+        # reasignar equipo/nivel — admin define quién supervisa y a
+        # qué proyectos pertenece cada operador
+        usuarios[objetivo]["proyectos"] = proyectos
+        usuarios[objetivo].pop("proyecto", None)  # migra campo viejo
+        usuarios[objetivo]["nivel"] = nivel
+    elif accion == "quitar_admin" and objetivo != email \
+            and objetivo in cfg.get("admins", []) \
+            and len(cfg["admins"]) > 1:
+        # lo baja de admin a operador: su perfil (reglas, proyectos)
+        # queda intacto y ahora se le puede asignar equipo/nivel
+        cfg["admins"].remove(objetivo)
+        _escribir_json(CONFIG, cfg)
+        usuarios.setdefault(objetivo, {}).setdefault(
+            "nivel", "operacion")
     elif accion == "password" and objetivo in usuarios and pw:
         usuarios[objetivo]["password"] = hash_password(pw)
     elif not objetivo or es_admin(objetivo, cfg):
@@ -9379,12 +10688,15 @@ def backfill_regla(regla: dict, email: str) -> int:
           for a in leer_jsonl(ALERTAS)}
     n = 0
     with ALERTAS.open("a") as f:
-        for nota in leer_jsonl(NOTICIAS):
+        for nota in _noticias_cache():
             if (nota["link"], regla["nombre"], email) in ya:
                 continue
             texto = (f"{nota['titulo']} {nota.get('resumen', '')} "
                      f"{nota.get('autor', '')}")
-            if coincide(texto, regla):
+            # project-first: regla personal = libre; compartida = interés
+            if coincide(texto, regla) and (
+                    not regla.get("proyecto")
+                    or coincide_interes(nota)):
                 alerta = {
                     "fecha": nota["fecha"],
                     "fuente": nota["fuente"],
@@ -9401,7 +10713,79 @@ def backfill_regla(regla: dict, email: str) -> int:
                 f.write(json.dumps(alerta, ensure_ascii=False) + "\n")
                 ya.add((nota["link"], regla["nombre"], email))
                 n += 1
+    # UN solo correo-digest con el batch — el usuario pidió '1 solo
+    # correo con todo el batch de resultados' al crear la alerta;
+    # en vivo ya va un correo por cada alerta nueva
+    if n:
+        _enviar_digest_regla(regla, email, n)
+    # al admin siempre le llega aviso de regla creada — aunque el
+    # batch salga en 0 (así ve qué andan monitoreando los usuarios)
+    _aviso_admin_regla(regla, email, n)
     return n
+
+
+def _aviso_admin_regla(regla: dict, email: str, n: int) -> None:
+    """Correo al admin cada vez que un usuario crea/edita una alerta —
+    quien evalúa el sistema queda al tanto de qué reglas se dan de
+    alta, quién las hizo y cuánto material de interés traen."""
+    cfg = cargar_json(CONFIG, {})
+    correo = cfg.get("correo", {})
+    if not correo.get("habilitado"):
+        return
+    admins = [a for a in cfg.get("admins", []) if "@" in a]
+    if not admins:
+        return
+    try:
+        cuerpo = (
+            f"{email} creó/editó la alerta «{regla['nombre']}».\n\n"
+            f"Términos: {' + '.join(regla.get('requiere_todas', []))}\n"
+            f"Coincidencias en el archivo: {n}\n\n"
+                "Reglas PERSONALES disparan por palabras tal cual; "
+                "reglas COMPARTIDAS de proyecto exigen que la nota "
+                "también sea de interés del proyecto.")
+        msg = MIMEText(cuerpo, "plain", "utf-8")
+        msg["Subject"] = (f"[Monitor] Nueva alerta de "
+                          f"{email.split('@')[0]}: «{regla['nombre']}» "
+                          f"({n} coincidencias)")
+        msg["From"] = correo.get("remitente", correo["usuario"])
+        msg["To"] = ", ".join(admins)
+        _mandar_msg(correo, msg)
+        print(f"    ✉ aviso de regla → admin ({n} notas)")  # noqa
+    except Exception as e:
+        print(f"    [!] aviso de regla falló: {e}")
+
+
+def _enviar_digest_regla(regla: dict, email: str, n: int) -> None:
+    """Un solo correo-resumen al crear/editar la regla con el total
+    de coincidencias de interés halladas en el archivo."""
+    correo = cargar_json(CONFIG, {}).get("correo", {})
+    if not correo.get("habilitado") or "@" not in email:
+        return
+    try:
+        # las últimas 15 coincidencias de la regla para que el correo
+        # enseñe de qué trata sin volverse un muro
+        muestra = [a for a in leer_jsonl(ALERTAS, limite=400)
+                   if a.get("usuario") == email
+                   and a.get("reglas") == regla["nombre"]][-15:]
+        cuerpo = (
+            f"Tu regla «{regla['nombre']}» encontró {n} nota(s) de "
+            "interés en el archivo del monitor.\n\n"
+            + "\n".join(
+                f"• {a['fecha'][:10]} — {a['titulo']}\n  {a['link']}"
+                for a in muestra)
+            + (f"\n\n… y {n - len(muestra)} más en el tab Alertas del "
+               "monitor." if n > len(muestra) else "")
+            + "\n\nA partir de ahora te llegará un correo por cada "
+              "alerta nueva que dispare la regla.")
+        msg = MIMEText(cuerpo, "plain", "utf-8")
+        msg["Subject"] = (f"[Monitor] «{regla['nombre']}»: "
+                          f"{n} coincidencias de interés")
+        msg["From"] = correo.get("remitente", correo["usuario"])
+        msg["To"] = email
+        _mandar_msg(correo, msg)
+        print(f"    ✉ digest de regla → {email} ({n} notas)")
+    except Exception as e:
+        print(f"    [!] digest de regla falló: {e}")
 
 
 def aplicar_accion_config(form: dict, email: str) -> str:
@@ -9417,13 +10801,19 @@ def aplicar_accion_config(form: dict, email: str) -> str:
     if perfil.get("expira"):
         return "/config"
     destino = "/config"
+    # alcance de la regla: solo se acepta un proyecto del que el
+    # usuario es miembro (nadie mete alertas a un proyecto ajeno)
+    proy = form.get("proyecto", [""])[0].strip().lower()
+    if proy not in proyectos_usuario(email):
+        proy = ""
     if accion == "agregar":
         nombre = form.get("nombre", [""])[0].strip()
         palabras = [p.strip() for p in form.get("palabras", [""])[0].split(",") if p.strip()]
         # mínimo 2 palabras/frases: una sola dispara ruido puro
         if nombre and len(palabras) >= 2:
             regla = {"nombre": nombre, "requiere_todas": palabras,
-                     "color": form.get("color", [""])[0]}
+                     "color": form.get("color", [""])[0],
+                     "proyecto": proy}
             perfil["reglas"].append(regla)
             n = backfill_regla(regla, email)
             destino = f"/alertas?msg={n}"
@@ -9439,7 +10829,8 @@ def aplicar_accion_config(form: dict, email: str) -> str:
             palabras = [p.strip() for p in form.get("palabras", [""])[0].split(",") if p.strip()]
             if nombre and len(palabras) >= 2:
                 regla = {"nombre": nombre, "requiere_todas": palabras,
-                         "color": form.get("color", [""])[0]}
+                         "color": form.get("color", [""])[0],
+                         "proyecto": proy}
                 perfil["reglas"][idx] = regla
                 n = backfill_regla(regla, email)
                 destino = f"/alertas?msg={n}"
@@ -9506,8 +10897,12 @@ def servir_web(puerto: int):
                 self.client_address[0]
             # autenticado = sesión firmada: el límite por IP es para
             # anónimos/flood — un usuario logueado detrás de NAT
-            # compartido (oficina) no debe chocar con sus colegas
-            if not email and not ratelimit_ok(ip):
+            # compartido (oficina) no debe chocar con sus colegas.
+            # Los assets no cuentan: la página de portadas sola son ~40
+            # requests legítimas de imágenes por carga.
+            es_asset = re.search(r"\.(?:png|jpe?g|webp|gif|svg|ico|"
+                                 r"css|js|woff2?)$", ruta.path, re.I)
+            if not email and not es_asset and not ratelimit_ok(ip):
                 self._html("<h1 style='font-family:system-ui;padding:2rem'>"
                            "Demasiadas solicitudes — espera un minuto.</h1>"
                            .encode(), 429)
@@ -9555,8 +10950,17 @@ def servir_web(puerto: int):
                                   "/portadas")
                     or ruta.path.startswith(("/shots/", "/portadas/",
                                              "/brand/"))):
-                # sin sesión: cualquier ruta muestra el login
-                self._html(vista_login(base))
+                if ruta.path in ("/portadas-pdf",
+                                 "/resumenes-pdf"):
+                    self._html(
+                        "<div style='font-family:system-ui;padding:3rem;"
+                        "text-align:center'><h1>Disponible para usuarios "
+                        "registrados</h1><p class='meta'>La descarga de "
+                        "PDF requiere credenciales.</p>"
+                        "<a href='/'>Iniciar sesión</a></div>")
+                else:
+                    # sin sesión: cualquier ruta muestra el login
+                    self._html(vista_login(base))
                 return
             if ruta.path == "/salir":
                 self.send_response(303)
@@ -9572,7 +10976,10 @@ def servir_web(puerto: int):
             elif ruta.path == "/destacadas":
                 self._html(render_pagina(
                     vista_destacadas(email, params.get("cat", [""])[0]),
-                    base=base, usuario=email))
+                    base=base, usuario=email,
+                    og_title="Destacadas — @noticias",
+                    og_desc="Los temas que dominan la conversación "
+                            "mediática del día."))
             elif ruta.path == "/alertas":
                 msg = params.get("msg", [""])[0]
                 self._html(render_pagina(vista_alertas(email, msg),
@@ -9589,12 +10996,25 @@ def servir_web(puerto: int):
                     dia = ""
                 self._html(render_pagina(
                     vista_noticias(email, p, dia), base=base,
-                    usuario=email))
+                    usuario=email,
+                    og_title="Noticias — @noticias",
+                    og_desc="Feed general de la prensa monitoreada, "
+                            "en tiempo real."))
                 _marcar_visto(email, "visto_noticias")
             elif ruta.path == "/x":
                 self._html(render_pagina(vista_x(email), base=base,
-                                         usuario=email))
+                                         usuario=email,
+                                         og_title="Radar X — @noticias",
+                                         og_desc="Lo que publican las cuentas curadas y lo "
+                                                 "más comentado en X."))
                 _marcar_visto(email, "visto_x")
+            elif ruta.path == "/telegram":
+                self._html(render_pagina(
+                    vista_telegram(email), base=base, usuario=email,
+                    og_title="Telegram — @noticias",
+                    og_desc="Mensajes de los canales de Telegram "
+                            "monitoreados."))
+                _marcar_visto(email, "visto_telegram")
             elif ruta.path == "/seguimiento":
                 # sección en prueba — solo admin mientras afinamos
                 # el filtro de seguimientos
@@ -9614,8 +11034,10 @@ def servir_web(puerto: int):
                 _marcar_visto(email, "visto_seguimiento")
             elif ruta.path == "/buscar":
                 q = params.get("q", [""])[0]
-                self._html(render_pagina(vista_buscar(q, email), q=q,
-                                         base=base, usuario=email))
+                self._html(render_pagina(
+                    vista_buscar(q, email,
+                                 deep=params.get("deep", [""])[0] == "1"),
+                    q=q, base=base, usuario=email))
             elif ruta.path == "/config":
                 self._html(render_pagina(vista_config(email), base=base,
                                          usuario=email))
@@ -9638,8 +11060,7 @@ def servir_web(puerto: int):
                 cfg_h = json.loads(CONFIG.read_text())
                 if not es_admin(email, cfg_h):
                     self._html(render_pagina("<h1>Solo admin</h1>",
-                                             base=base, usuario=email),
-                               403)
+                                             base=base, usuario=email))
                 else:
                     # el editor es schedule.html — se regenera en cada
                     # GET para que la línea de tiempo esté al momento
@@ -9665,17 +11086,29 @@ def servir_web(puerto: int):
                                              base=base, usuario=email))
             elif ruta.path == "/columnas":
                 self._html(render_pagina(vista_columnas(email),
-                                         base=base, usuario=email))
+                                         base=base, usuario=email,
+                                         og_title="Columnas — @noticias",
+                                         og_desc="Opinión y columnas de la prensa "
+                                                 "monitoreada."))
             elif ruta.path == "/interes":
                 self._html(render_pagina(vista_interes(
                     email, int(params.get("p", ["1"])[0])),
                     base=base, usuario=email,
+                    og_title="Interés — @noticias",
+                    og_desc="Agenda de prensa del TSJT: notas del "
+                            "Magistrado Presidente, el Poder Judicial "
+                            "y actores clave.",
                     og_img=f"{base}/brand/01int.jpg"))
                 _marcar_visto(email, "visto_interes")
             elif ruta.path == "/resumenes":
                 self._html(render_pagina(vista_resumenes(
-                    email, params.get("msg", [""])[0]),
+                    email, params.get("msg", [""])[0],
+                    params.get("dia", [""])[0]),
                     base=base, usuario=email,
+                    og_title="Síntesis — @noticias",
+                    og_desc="Síntesis ejecutivas de prensa: mediodía, "
+                            "cierre, semanal y dominical, con citas a "
+                            "cada nota.",
                     og_img=f"{base}/brand/01res.jpg"))
             elif ruta.path == "/resumenes/reporte":
                 # reporte imprimible: para todos los registrados —
@@ -9706,20 +11139,118 @@ def servir_web(puerto: int):
                         self._html(doc)   # fallback al HTML imprimible
                 else:
                     self._html(doc)
+            elif ruta.path == "/portadas-pdf":
+                # PDF 'en vivo': se arma al momento con todo lo que ya
+                # cayó en el día — distinto del snapshot enviado 06:30
+                cfg_p = json.loads(CONFIG.read_text())
+                sec = params.get("sec", ["tabasco"])[0]
+                dia_s = params.get("dia", [""])[0]
+                dir_d = (PORTADAS_DIR / dia_s
+                         if re.fullmatch(r"[a-z]{3}/\d{2}", dia_s)
+                         else _dir_dia())
+                data, _f = _armar_pdf_portadas(
+                    cfg_p.get("portadas", {}).get("medios", []),
+                    sec, dir_d)
+                if data:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/pdf")
+                    _nom_dia = dia_s.replace("/", "-") or \
+                        datetime.now().strftime("%Y-%m-%d")
+                    self.send_header(
+                        "Content-Disposition",
+                        f'inline; filename="portadas_{sec}_'
+                        f'{_nom_dia}.pdf"')
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(data)
+                else:
+                    self.send_error(404)
+            elif ruta.path == "/resumenes-pdf":
+                # reporte express del día — solo paolo y admin;
+                # async: arranca hilo, la UI consulta estado y puede
+                # cancelar (el resultado del LLM se desecha)
+                cfg_r = json.loads(CONFIG.read_text())
+                if not (es_admin(email, cfg_r)
+                        or email == "paolo@anoticias.com"):
+                    self._html(
+                        "<div style='font-family:system-ui;padding:3rem;"
+                        "text-align:center'><h1>Solo personal "
+                        "autorizado</h1><p class='meta'>El reporte "
+                        "express está reservado para dirección y "
+                        "administración.</p>"
+                        "<a href='/resumenes'>Volver</a></div>")
+                    return
+                st_r = _REPORTE_EXPRESS.get(email, {})
+                op = params.get("op", [""])[0]
+                if op == "estado":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(
+                        {"e": st_r.get("estado", "idle")}).encode())
+                elif op == "cancelar":
+                    st_r["estado"] = "cancelado"
+                    st_r["pdf"] = None
+                    self.send_response(303)
+                    self.send_header("Location", "/resumenes")
+                    self.end_headers()
+                elif op == "descargar":
+                    if st_r.get("estado") == "listo" and \
+                            st_r.get("pdf"):
+                        self.send_response(200)
+                        self.send_header("Content-Type",
+                                         "application/pdf")
+                        self.send_header(
+                            "Content-Disposition",
+                            'inline; filename="reporte_express_'
+                            f'{datetime.now().strftime("%Y-%m-%d")}'
+                            '.pdf"')
+                        self.send_header("Cache-Control", "no-store")
+                        self.end_headers()
+                        self.wfile.write(st_r["pdf"])
+                        st_r.clear()   # consumo único
+                    else:
+                        self.send_response(303)
+                        self.send_header("Location", "/resumenes-pdf")
+                        self.end_headers()
+                else:
+                    if st_r.get("estado") != "generando":
+                        _REPORTE_EXPRESS[email] = {
+                            "estado": "generando", "pdf": None}
+                        threading.Thread(
+                            target=_worker_reporte_express,
+                            args=(email, cfg_r), daemon=True,
+                            name="reporte-express").start()
+                    self._html(render_pagina(
+                        _vista_reporte_progreso("generando"),
+                        base=base, usuario=email))
             elif ruta.path == "/portadas":
-                sec = params.get("sec", ["nacional"])[0]
+                sec = params.get("sec", ["tabasco"])[0]
                 self._html(render_pagina(
-                    vista_portadas(sec, params.get("dia", [""])[0]),
+                    vista_portadas(sec, params.get("dia", [""])[0],
+                                   admin=es_admin(email, json.loads(
+                                       CONFIG.read_text())),
+                                   logueado=bool(email)),
                     base=base, usuario=email,
                     og_title="Portadas de prensa — Nacional y Tabasco",
                     og_desc="Primeras planas de diarios nacionales y de "
-                            "Tabasco, actualizadas cada mañana."))
+                            "Tabasco, actualizadas cada mañana.",
+                    og_img=f"{base}/brand/01port.jpg"))
             elif ruta.path.startswith("/portadas/"):
                 p = (PORTADAS_DIR / ruta.path.split("/", 2)[2]).resolve()
                 tipos = {".png": "image/png", ".jpg": "image/jpeg",
                          ".jpeg": "image/jpeg", ".pdf": "application/pdf"}
                 raiz = PORTADAS_DIR.resolve()
-                if p.is_relative_to(raiz) and p != raiz \
+                if p.suffix == ".pdf" and not email:
+                    # descarga de PDF solo con credenciales
+                    self._html(
+                        "<div style='font-family:system-ui;padding:3rem;"
+                        "text-align:center'><h1>Disponible para usuarios "
+                        "registrados</h1><p class='meta'>La descarga del "
+                        "PDF de portadas requiere credenciales.</p>"
+                        "<a href='/'>Iniciar sesión</a></div>")
+                elif p.is_relative_to(raiz) and p != raiz \
                         and p.is_file() and p.suffix in tipos:
                     self.send_response(200)
                     self.send_header("Content-Type", tipos[p.suffix])
@@ -9911,24 +11442,75 @@ def servir_web(puerto: int):
                                            "incorrectos."))
                 return
             if ruta.path == "/invitado":
+                # cool-down por IP: la demo gratis no se puede re-pedir
+                # en DEMO_BLOQUEO_MIN — sin esto bastaba dar POST otra vez
+                ips = cargar_json(DEMO_IPS, {})
+                resta = DEMO_BLOQUEO_MIN * 60 - (time.time() - ips.get(ip, 0))
+                if resta > 0:
+                    seg = int(resta)
+                    self._html(render_pagina(
+                        "<h1>Demo de invitado</h1>"
+                        "<div class='card' style='text-align:center;padding:2rem'>"
+                        "<p class='meta'>La sesión gratis ya se usó desde esta "
+                        "conexión.</p>"
+                        "<p style='font-size:2rem;font-weight:700;margin:.6rem 0'>"
+                        "faltan <span id='cd'>--:--</span></p>"
+                        "<p class='meta'>para renovar tu sesión de INVITADO</p>"
+                        "</div>"
+                        "<script>var s=" + str(seg) + ";"
+                        "var e=document.getElementById('cd');"
+                        "function t(){var m=Math.floor(s/60),x=s%60;"
+                        "e.textContent=(m<10?'0':'')+m+':'+(x<10?'0':'')+x;"
+                        "if(s>0){s--;setTimeout(t,1000);}}</script>"
+                        "<script>t();</script>",
+                        base=base))
+                    return
                 usuarios = cargar_usuarios()
                 email = f"guest-{secrets.token_hex(4)}@demo.local"
                 usuarios[email] = {
                     "reglas": [], "fuentes_ocultas": [],
-                    "expira": time.time() + DEMO_HORAS * 3600,
+                    "expira": time.time() + DEMO_MINUTOS * 60,
                     "password": "",
                 }
                 guardar_usuarios(usuarios)
+                ips[ip] = time.time()
+                _escribir_json(DEMO_IPS, ips)
                 self.send_response(303)
-                self.send_header("Location", "/noticias")
+                self.send_header("Location", home_usuario(email))
                 self.send_header("Set-Cookie", cookie_sesion(email, https))
+                self.end_headers()
+                return
+
+            if ruta.path == "/alertas/rastrear":
+                email = self._usuario()
+                if not email or "@demo.local" in email:
+                    self.send_response(303)
+                    self.send_header("Location", "/alertas")
+                    self.end_headers()
+                    return
+                regla_nom = form.get("regla", [""])[0]
+                cfg_r = json.loads(CONFIG.read_text())
+                perfil = perfil_usuario(email, cfg_r)
+                if (regla_nom in {r["nombre"]
+                                  for r in perfil.get("reglas", [])}
+                        and not _RASTREO.get(email, {}).get("en_curso")):
+                    _RASTREO[email] = {"en_curso": True,
+                                       "encontradas": 0,
+                                       "regla": regla_nom,
+                                       "estado": "rastreando"}
+                    threading.Thread(
+                        target=rastrear_archivo,
+                        args=(email, regla_nom, cfg_r), daemon=True,
+                        name="rastreo").start()
+                self.send_response(303)
+                self.send_header("Location", "/alertas")
                 self.end_headers()
                 return
 
             if ruta.path == "/resumenes/editar":
                 email = self._usuario()
                 cfg_e = json.loads(CONFIG.read_text())
-                if not email or not es_admin(email, cfg_e):
+                if not email or not es_supervisor(email, cfg_e):
                     self.send_response(303)
                     self.send_header("Location", "/resumenes")
                     self.end_headers()
@@ -10038,9 +11620,10 @@ def servir_web(puerto: int):
                             start()
                 else:
                     h = datetime.now().hour
-                    franja = ("matutina" if h < 9 else
-                              "mediodia" if h < 12 else
-                              "vespertina" if h < 15 else "nocturna")
+                    wd = datetime.now().weekday()
+                    franja = ("semanal" if wd == 5 else
+                              "dominical" if wd == 6 else
+                              "mediodia" if h < 15 else "mediodia")
                     if franja not in _GENERANDO:
                         _GENERANDO.add(franja)
                         threading.Thread(target=_gen_bg,
@@ -10173,14 +11756,15 @@ def main():
                 limpiar_portadas()
                 marcar_limpia_portadas()
             checar_ip_correo()   # 1×/día: avisa si la IP de Brevo cambió
-            for franja in ("matutina", "vespertina", "nocturna"):
+            for franja in ("matutina", "mediodia", "vespertina",
+                           "nocturna", "semanal", "dominical"):
                 if toca_sintesis(franja):
                     threading.Thread(target=generar_sintesis,
                                      args=(cfg, franja), daemon=True,
                                      name=f"sintesis-{franja}").start()
-            # cierre del día: automático 21:03, 3 min tras la
-            # nocturna — genera la tarjeta y la manda por mail
-            # (el post a X sigue siendo botón — humano)
+            # cierre del día: automático 17:00 lun-vie — genera la
+            # tarjeta y la manda por mail (el post a X sigue siendo
+            # botón — humano)
             if toca_sintesis("cierre") and "cierre" not in _GENERANDO:
                 _GENERANDO.add("cierre")
                 threading.Thread(target=_gen_bg,

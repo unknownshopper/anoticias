@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Directorio de periodistas · Tabasco</title>
+<style>
+  :root { --ink:#1a1a1a; --mut:#666; --bor:#e2e2e2; --bg:#f6f5f2; --ok:#1a9c4b; --bad:#d33; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.45 "Segoe UI", system-ui, sans-serif; color:var(--ink); background:var(--bg); }
+  header { background:var(--ink); color:#fff; padding:1rem 1.2rem; }
+  header h1 { margin:0; font-size:1.15rem; font-weight:600; }
+  header p { margin:.2rem 0 0; font-size:.8rem; color:#bbb; }
+  main { max-width:1100px; margin:1.2rem auto; padding:0 1rem; }
+  table { width:100%; border-collapse:collapse; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  th,td { padding:.5rem .7rem; text-align:left; border-bottom:1px solid var(--bor); vertical-align:top; }
+  th { font-size:.72rem; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); background:#fafafa; position:sticky; top:0; }
+  tr:hover td { background:#fbfaf7; }
+  .num { color:var(--mut); font-size:.8rem; width:2rem; }
+  .nom { font-weight:600; }
+  .rol { color:var(--mut); font-size:.85rem; }
+  .enl a { display:block; color:#1a56a8; text-decoration:none; font-size:.82rem; word-break:break-all; }
+  .enl a:hover { text-decoration:underline; }
+  .enl a + a { margin-top:.2rem; }
+  .enl .na { color:var(--mut); font-size:.8rem; font-style:italic; }
+  .dot { width:12px; height:12px; border-radius:50%; display:inline-block; }
+  .v { background:var(--ok); }
+  .r { background:var(--bad); }
+  .a { background:#e0a800; }
+  .medio { font-size:.78rem; color:var(--mut); }
+  footer { max-width:1100px; margin:0 auto 2rem; padding:0 1rem; font-size:.75rem; color:var(--mut); }
+  .nota { font-size:.72rem; color:var(--bad); display:block; }
+  th[data-col] { cursor:pointer; user-select:none; }
+  th[data-col]:hover { color:var(--ink); }
+  th .ord { font-size:.65rem; margin-left:.25rem; }
+  tr.filtros td { padding:.3rem .5rem; background:#fff; }
+  tr.filtros input, tr.filtros select { width:100%; padding:.25rem .4rem;
+       font-size:.8rem; border:1px solid var(--bor); border-radius:4px;
+       background:#fafafa; }
+  .vac { text-align:center; color:var(--mut); font-style:italic; padding:1rem; }
+  #contador { font-size:.78rem; color:var(--mut); margin:0 0 .5rem; }
+  .btn { font-size:.72rem; padding:.15rem .55rem; border:1px solid #1a56a8;
+         border-radius:4px; background:#fff; color:#1a56a8; cursor:pointer; }
+  .btn:hover { background:#1a56a8; color:#fff; }
+  .si { font-size:.75rem; color:var(--ok); font-weight:600; }
+  .na2 { font-size:.75rem; color:var(--mut); }
+  #toast { position:fixed; bottom:1rem; left:50%; transform:translateX(-50%);
+           background:var(--ink); color:#fff; padding:.5rem 1.2rem;
+           border-radius:6px; font-size:.8rem; opacity:0;
+           transition:opacity .25s; pointer-events:none; }
+  #integratodo { margin:0 0 .6rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Directorio de periodistas y portales · Tabasco</h1>
+  <p>Verificado 14/oct/2026 — verde: activo · ámbar: duplicado/redirige · rojo: sin enlace</p>
+</header>
+<main>
+<p id="contador"></p>
+<p id="res_int"></p>
+<table id="tabla">
+<thead>
+<tr><th>#</th><th data-col="nom">Periodista <span class="ord"></span></th>
+    <th data-col="rol">Columna / rol <span class="ord"></span></th>
+    <th>Enlace(s)</th>
+    <th data-col="medio">Medio <span class="ord"></span></th>
+    <th data-col="act">Activa <span class="ord"></span></th>
+    <th>Integrada</th></tr>
+<tr class="filtros">
+  <td></td>
+  <td><input id="f-nom" placeholder="filtrar nombre…"></td>
+  <td><input id="f-rol" placeholder="filtrar columna…"></td>
+  <td></td>
+  <td><select id="f-medio"><option value="">— todos —</option></select></td>
+  <td><select id="f-act"><option value="">todas</option>
+      <option value="v">verde — activo</option>
+      <option value="a">ámbar — revisar</option>
+      <option value="r">rojo — sin enlace</option></select></td>
+  <td><button class="btn" id="integratodo" title="copia JSON de todas las que faltan">Integrar todo</button></td>
+</tr>
+</thead>
+<tbody>
+<tr><td class="num">1</td><td class="nom">Juan Manuel Burgos Carbonell</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/manuel.carbonell.625724">fb/manuel.carbonell.625724</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">2</td><td class="nom">Francisco Rojas Soberano</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/posepolitica">fb/posepolitica</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">3</td><td class="nom">Juan Ochoa Vidal</td><td class="rol">columnista</td><td class="enl"><a href="https://www.facebook.com/juanochoavidal">fb/juanochoavidal</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">4</td><td class="nom">Arturo Enrique García</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/arturo.enrike.garcia.arias.2025">fb/arturo.enrike.garcia…</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">5</td><td class="nom">Eugenio Hernández Sasso</td><td class="rol">columna Democracia Virtual</td><td class="enl"><a href="https://www.facebook.com/democraciavirtual.mx">fb/democraciavirtual.mx</a></td><td class="medio">Democracia Virtual</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">6</td><td class="nom">Leandro de la O de la O</td><td class="rol">portal Papiro</td><td class="enl"><a href="https://www.facebook.com/entre.lineas.de.leandro.de.la.o">fb/entre.lineas.de…</a><a href="https://www.facebook.com/profile.php?id=61582368755757">fb/profile 61582368755757</a></td><td class="medio">Diario Avance</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">7</td><td class="nom">Ignacio Ríos</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/ignacio.rios.583">fb/ignacio.rios.583</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">8</td><td class="nom">Roberto Rivero Ross</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/RRReditor">fb/RRReditor</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">9</td><td class="nom">Gilberto Núñez García</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/elheraldodetab">fb/elheraldodetab</a></td><td class="medio">El Heraldo de Tabasco</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">10</td><td class="nom">Carlos Castro Domínguez</td><td class="rol">fotógrafo</td><td class="enl"><a href="https://www.facebook.com/carlosa.castro.568">fb/carlosa.castro.568</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">11</td><td class="nom">Felipe de Jesús Rosales</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/ElMomentoTabascoOF">fb/ElMomentoTabascoOF</a></td><td class="medio">El Momento Tabasco</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">12</td><td class="nom">Daniel Castro Jiménez</td><td class="rol">columna Cabala</td><td class="enl"><a href="https://www.facebook.com/daniel.castro.37604303">fb/daniel.castro.37604303</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">13</td><td class="nom">Luis Degrayn Escalante</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/profile.php?id=100084105275798">fb/profile 100084105275798</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">14</td><td class="nom">Francisco Uribe García</td><td class="rol">columnista</td><td class="enl"><a href="https://www.facebook.com/francisco.uribe.65789">fb/francisco.uribe.65789</a></td><td class="medio">Novedades</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">15</td><td class="nom">Juan Diego Morales Arias</td><td class="rol">portal</td><td class="enl"><a href="https://www.facebook.com/profile.php?id=100084105275798">fb/profile 100084105275798</a><span class="nota">mismo ID que #13 — probable error del listado</span></td><td class="medio">Amanecer de Tabasco</td><td><span class="dot a"></span></td></tr>
+<tr><td class="num">16</td><td class="nom">Filiberto Lastra Torres</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/filiberto.lastra">fb/filiberto.lastra</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">17</td><td class="nom">Mario Gómez González</td><td class="rol">columna Para Usted</td><td class="enl"><a href="https://www.facebook.com/marioantonio.gomezgonzalez">fb/marioantonio.gomezgonzalez</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">18</td><td class="nom">Emery Hernández Marín</td><td class="rol">directora</td><td class="enl"><a href="https://www.facebook.com/RevistajaguarPFLC">fb/RevistajaguarPFLC</a></td><td class="medio">Revista Jaguar</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">19</td><td class="nom">Luis Felipe Sandoval</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/luis.ruizsandoval.1">fb/luis.ruizsandoval.1</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">20</td><td class="nom">Roque Osvaldo Jésus Pérez</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/Enroque64">fb/Enroque64</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">21</td><td class="nom">Manuel Fernando Hernández Arias</td><td class="rol">portal</td><td class="enl"><a href="https://www.facebook.com/FernandoHernandezCharro">fb/FernandoHernandezCharro</a></td><td class="medio">Conectados</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">22</td><td class="nom">Patricia del Carmen Valencia Ramón</td><td class="rol">reportera</td><td class="enl"><a href="https://www.facebook.com/diariodetabasco">fb/diariodetabasco</a></td><td class="medio">Diario de Tabasco</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">23</td><td class="nom">Jorge Luis Hernández Ramos</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/profile.php?id=61582274703596">fb/profile 61582274703596</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">24</td><td class="nom">Blanca Estela Ferrer Coop</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/blancaestela.ferrercoop.92">fb/blancaestela.ferrercoop.92</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">25</td><td class="nom">Javier Chávez Toledo</td><td class="rol">fotógrafo</td><td class="enl"><a href="https://www.facebook.com/javier.chavez.77028">fb/javier.chavez.77028</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">26</td><td class="nom">David Sarracino Guzmán</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/exodo.detabasco.39">fb/exodo.detabasco.39</a></td><td class="medio">Éxodo de Tabasco</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">27</td><td class="nom">Jesús Sosa</td><td class="rol">portal El Líder, canal 51</td><td class="enl"><a href="https://www.facebook.com/jesus.sosa.326707">fb/jesus.sosa.326707</a></td><td class="medio">El Líder</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">28</td><td class="nom">Jorge Macario Rodríguez</td><td class="rol">director</td><td class="enl"><a href="https://www.facebook.com/jorge.macario.rodriguez">fb/jorge.macario.rodriguez</a></td><td class="medio">El Debate</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">29</td><td class="nom">Iván Aguirre Aguilar</td><td class="rol">columna Tras el telón</td><td class="enl"><a href="https://www.facebook.com/ivan.a.aguilar2">fb/ivan.a.aguilar2</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">30</td><td class="nom">Alfredo Zavala Chablé</td><td class="rol">reportero</td><td class="enl"><a href="https://www.facebook.com/alfredo.zavala.chable.2025">fb/alfredo.zavala.chable.2025</a></td><td class="medio">Titán</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">31</td><td class="nom">Jorge Bocanegra Saurett</td><td class="rol">director</td><td class="enl"><a href="https://www.facebook.com/jbocanegrasaurett">fb/jbocanegrasaurett</a></td><td class="medio">El Pentágono</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">32</td><td class="nom">Rubén Góngora Concepción</td><td class="rol">portal digital</td><td class="enl"><a href="https://www.facebook.com/sur.tabasco">fb/sur.tabasco</a></td><td class="medio">Sur Tabasco</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">33</td><td class="nom">Carlos Manuel Pérez Rodríguez</td><td class="rol">fotógrafo</td><td class="enl"><a href="https://www.facebook.com/ElEdenEnlaRed">fb/ElEdenEnlaRed</a></td><td class="medio">El Edén en la Red</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">34</td><td class="nom">Felipe Laynez</td><td class="rol">portal</td><td class="enl"><a href="https://www.facebook.com/profile.php?id=100069125077405">fb/profile 100069125077405</a></td><td class="medio">Noticieros Tabasco</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">35</td><td class="nom">Rafael Núñez Martín</td><td class="rol">revista</td><td class="enl"><a href="https://www.facebook.com/profile.php?id=100063504866497">fb/profile 100063504866497</a></td><td class="medio">Portada Empresarial</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">36</td><td class="nom">Mario Díaz Uribe</td><td class="rol">portal</td><td class="enl"><a href="https://www.facebook.com/profile.php?id=100028989626607">fb/profile 100028989626607</a></td><td class="medio">Tabasco 2000</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">37</td><td class="nom">María de la Fé Díaz Izquierdo</td><td class="rol">directora</td><td class="enl"><a href="https://www.facebook.com/elsoldelsureste">fb/elsoldelsureste</a></td><td class="medio">Diario El Sol de Tabasco</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">38</td><td class="nom">Josué Pérez Hernández</td><td class="rol">portal</td><td class="enl"><a href="https://www.facebook.com/profile.php?id=61594081510761">fb/profile 61594081510761</a></td><td class="medio">Plumazo Digital</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">39</td><td class="nom">Melesia del Carmen Rodríguez</td><td class="rol">portal</td><td class="enl"><a href="https://www.facebook.com/ElMundoInformativoI">fb/ElMundoInformativoI</a></td><td class="medio">El Mundo Informativo</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">40</td><td class="nom">Andrés Juárez Sánchez</td><td class="rol">reportero</td><td class="enl"><a href="https://www.facebook.com/Tabascohoymx">fb/Tabascohoymx</a></td><td class="medio">Tabasco Hoy</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">41</td><td class="nom">Miguel Canseco Cruz</td><td class="rol">portal</td><td class="enl"><a href="https://www.facebook.com/miguel.canseco.975074">fb/miguel.canseco.975074</a></td><td class="medio">Iche Kareka</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">42</td><td class="nom">Ángel Felipe Aguirre Popocatl</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/angel.aguirrepopocatl">fb/angel.aguirrepopocatl</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">43</td><td class="nom">José Manuel Zurita Oropeza</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/pepe.zurita.oropeza">fb/pepe.zurita.oropeza</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">44</td><td class="nom">Joel Rubio Méndez</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/joel.rubiomendez">fb/joel.rubiomendez</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">45</td><td class="nom">Miguel Ángel Hernández Hernández</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/miguel.fenix.31">fb/miguel.fenix.31</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">46</td><td class="nom">Jacinto López</td><td class="rol"></td><td class="enl"><a href="https://ojovisor-jacintolopezcruz.blogspot.com/">ojovisor-jacintolopezcruz.blogspot.com</a></td><td class="medio">Ojo Visor</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">47</td><td class="nom">Yogui Montero Hernández</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/contraenfoque">fb/contraenfoque</a></td><td class="medio">Contraenfoque</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">48</td><td class="nom">Ana María Arrambide</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/profile.php?id=100084439072574">fb/profile 100084439072574</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">49</td><td class="nom">Víctor Ek May</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/victor.ek.may.2025">fb/victor.ek.may.2025</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">50</td><td class="nom">Gabino García</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/gabbino.garcia">fb/gabbino.garcia</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">51</td><td class="nom">Gerardo Paralizabal</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/gerardo.paralizabal.1">fb/gerardo.paralizabal.1</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">52</td><td class="nom">Juan Carlos Flores Soberano</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/juancarlos.floressoberano">fb/juancarlos.floressoberano</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">53</td><td class="nom">Rocío Jiménez Martínez</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/share/1JLHxercFA/">fb/share 1JLHxercFA</a><a href="https://x.com/rociojimenez15">x.com/rociojimenez15</a><a href="https://www.instagram.com/rociojimenez15">instagram.com/rociojimenez15</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">54</td><td class="nom">Erwin Macario Rodríguez</td><td class="rol">columna Transparencia Política</td><td class="enl"><a href="https://www.facebook.com/NoticiasDelEden">fb/NoticiasDelEden</a></td><td class="medio">Noticias del Edén</td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">55</td><td class="nom">Luis Iván Sánchez de la Cruz</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/LuisIvanSanche/">fb/LuisIvanSanche</a><span class="nota">URL localizada — no venía en el PDF</span></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">56</td><td class="nom">Ricardo Sashiel Rivera Pizarro</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/sashieldine">fb/sashieldine</a><span class="nota">URL localizada — no venía en el PDF</span></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">57</td><td class="nom">Francisco Castillo</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/profile.php?id=100006195308651">fb/profile 100006195308651</a></td><td class="medio"></td><td><span class="dot v"></span></td></tr>
+<tr><td class="num">58</td><td class="nom">Adelina Chable Morales</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/rodolfomanuel.chablemorales">fb/rodolfomanuel.chablemorales</a><span class="nota">el handle dice "rodolfomanuel" — no coincide con el nombre</span></td><td class="medio"></td><td><span class="dot a"></span></td></tr>
+<tr><td class="num">59</td><td class="nom">Manuel Antonio Ascencio</td><td class="rol"></td><td class="enl"><a href="https://www.facebook.com/share/1LMQS8mJsY/">fb/share 1LMQS8mJsY</a><span class="nota">redirige a fb/altoimpactosureste — página de portal, no perfil</span></td><td class="medio">Alto Impacto Sureste</td><td><span class="dot a"></span></td></tr>
+</tbody>
+</table>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const filas = [...document.querySelectorAll('#tabla tbody tr')];
+const norm = s => s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+const celda = (tr,c) => tr.querySelector('td.'+c)?.textContent.trim() || '';
+const estado = tr => tr.querySelector('.dot')?.className.replace('dot','').trim() || '';
+
+// select de medios con valores únicos
+const medios = [...new Set(filas.map(f => celda(f,'medio')).filter(Boolean))].sort();
+$('#f-medio').innerHTML += medios.map(m => `<option>${m}</option>`).join('');
+
+// restaurar estado guardado (la página puede recargarse sola)
+const saved = JSON.parse(localStorage.getItem('per_filtros') || '{}');
+let colOrd = saved.ord || '', dir = saved.dir || 1;
+for (const id of ['f-nom','f-rol','f-medio','f-act'])
+  if (saved[id] != null) $('#'+id).value = saved[id];
+
+function guardar() {
+  localStorage.setItem('per_filtros', JSON.stringify({
+    'f-nom': $('#f-nom').value, 'f-rol': $('#f-rol').value,
+    'f-medio': $('#f-medio').value, 'f-act': $('#f-act').value,
+    ord: colOrd, dir }));
+}
+
+function filtrar() {
+  const n = norm($('#f-nom').value), r = norm($('#f-rol').value),
+        md = $('#f-medio').value, ac = $('#f-act').value;
+  let vis = 0;
+  for (const f of filas) {
+    const ok = (!n || norm(celda(f,'nom')).includes(n))
+            && (!r || norm(celda(f,'rol')).includes(r))
+            && (!md || celda(f,'medio') === md)
+            && (!ac || estado(f) === ac);
+    f.style.display = ok ? '' : 'none';
+    if (ok) vis++;
+  }
+  $('#contador').textContent = `${vis} de ${filas.length} registros`;
+  guardar();
+}
+['f-nom','f-rol','f-medio','f-act'].forEach(id => {
+  $('#'+id).addEventListener('input', filtrar);
+  $('#'+id).addEventListener('change', filtrar);
+});
+
+// ordenar al clicar el encabezado
+function ordenar(col, th) {
+  if (th) dir = (colOrd === col) ? -dir : 1;
+  colOrd = col;
+  const tbody = document.querySelector('#tabla tbody');
+  const peso = {v:0, a:1, r:2};   // verde primero, luego ámbar, luego rojo
+  const val = f => col === 'act' ? peso[estado(f)] ?? 9
+                                 : norm(celda(f, col));
+  filas.sort((a,b) => (val(a) > val(b) ? 1 : val(a) < val(b) ? -1 : 0) * dir)
+       .forEach(f => tbody.appendChild(f));
+  document.querySelectorAll('.ord').forEach(s => s.textContent = '');
+  const h = th || document.querySelector(`th[data-col="${col}"]`);
+  if (h) h.querySelector('.ord').textContent = dir > 0 ? '▲' : '▼';
+}
+document.querySelectorAll('th[data-col]').forEach(th => {
+  th.addEventListener('click', () => ordenar(th.dataset.col, th));
+});
+if (colOrd) ordenar(colOrd, null);
+
+// --- columna Integrada -------------------------------------------
+// FB ya presentes en config.json (fuentes + portadas.medios)
+const INTEGRADAS = new Set([
+  // medios que ya estaban en config antes de la integración
+  'elheraldodetab', 'elmomentotabascoof', 'tabascohoymx', 'elsoldelsureste',
+  'buengobiernotab', 'capitaledomex', 'itpetabasco', 'manuelandrade.oficial',
+  'reporteindigocom', 'diarioahoratabasco', 'encambiodiariotabasco',
+  'pjetab.tsj', 'tabascoaldia', 'television.tabasquena', 'viborianuscolumna',
+  'xevtfm', 'profile.php?id=100064802539103', 'profile.php?id=100090074148261',
+  // integradas a fuentes el 14/oct (sesión chucky)
+  'manuel.carbonell.625724','posepolitica','juanochoavidal',
+  'arturo.enrike.garcia.arias.2025','democraciavirtual.mx',
+  'entre.lineas.de.leandro.de.la.o','ignacio.rios.583','rrreditor',
+  'carlosa.castro.568','daniel.castro.37604303',
+  'profile.php?id=100084105275798','francisco.uribe.65789',
+  'filiberto.lastra','marioantonio.gomezgonzalez','revistajaguarpflc',
+  'luis.ruizsandoval.1','enroque64','fernandohernandezcharro',
+  'diariodetabasco','profile.php?id=61582274703596',
+  'blancaestela.ferrercoop.92','javier.chavez.77028','exodo.detabasco.39',
+  'jesus.sosa.326707','jorge.macario.rodriguez','ivan.a.aguilar2',
+  'alfredo.zavala.chable.2025','jbocanegrasaurett','sur.tabasco',
+  'eledenenlared','profile.php?id=100069125077405',
+  'profile.php?id=100063504866497','profile.php?id=100028989626607',
+  'profile.php?id=61594081510761','elmundoinformativoi',
+  'miguel.canseco.975074','angel.aguirrepopocatl','pepe.zurita.oropeza',
+  'joel.rubiomendez','miguel.fenix.31','contraenfoque',
+  'profile.php?id=100084439072574','victor.ek.may.2025','gabbino.garcia',
+  'gerardo.paralizabal.1','juancarlos.floressoberano','share/1jlhxercfa',
+  'noticiasdeleden','profile.php?id=100006195308651',
+  'luisivansanche','sashieldine'
+].map(s => s.toLowerCase()));
+
+const llave = u => {
+  try {
+    const p = new URL(u).pathname.toLowerCase().replace(/\/$/, '');
+    const id = new URL(u).searchParams.get('id');
+    return id ? `profile.php?id=${id}` : p.slice(1);
+  } catch { return ''; }
+};
+
+function toast(msg) {
+  let t = document.getElementById('toast');
+  if (!t) { t = document.createElement('div'); t.id = 'toast'; document.body.append(t); }
+  t.textContent = msg; t.style.opacity = 1;
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.opacity = 0, 2600);
+}
+
+function copiar(txt, msg) {
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(txt).then(() => toast(msg))
+      .catch(() => copiarLegacy(txt, msg));
+  } else copiarLegacy(txt, msg);
+}
+function copiarLegacy(txt, msg) {
+  const ta = document.createElement('textarea');
+  ta.value = txt; document.body.append(ta); ta.select();
+  document.execCommand('copy'); ta.remove(); toast(msg);
+}
+
+// entradas tipo `fuentes` para el scraper de posts (sesión chucky)
+const plantilla = (nom, url, rol) => ({
+  nombre: nom, url, tipo: 'fb',
+  categoria: /column|periodis|editorial|an.lisis/i.test(rol)
+             ? 'columnas' : 'redes'
+});
+
+const pendientes = [];
+for (const f of filas) {
+  const td = document.createElement('td');
+  td.className = 'int';
+  const link = f.querySelector('.enl a[href*="facebook"]');
+  const ok_ = estado(f) === 'v';
+  if (!link) { td.innerHTML = '<span class="na2">sin enlace</span>'; }
+  else if (!ok_) { td.innerHTML = '<span class="na2">revisar</span>'; }
+  else if (INTEGRADAS.has(llave(link.href))) {
+    td.innerHTML = '<span class="si">✓ integrada</span>';
+  } else {
+    const nom = celda(f, 'nom'), url = link.href;
+    const obj = plantilla(nom, url, celda(f, 'rol'));
+    pendientes.push(obj);
+    const b = document.createElement('button');
+    b.className = 'btn'; b.textContent = 'Integrar';
+    b.onclick = () => {
+      copiar(JSON.stringify(obj, null, 2),
+             'JSON copiado — pégalo en config.json → fuentes');
+    };
+    td.appendChild(b);
+  }
+  f.appendChild(td);
+}
+const nInt = filas.length - pendientes.length -
+             document.querySelectorAll('.int .na2').length;
+document.getElementById('res_int').innerHTML =
+  `<b>${nInt}</b> medios ya estaban integrados · ` +
+  `<b>${pendientes.length}</b> pendientes por integrar`;
+
+
+document.getElementById('integratodo').onclick = () => {
+  copiar(JSON.stringify(pendientes, null, 2),
+         `${pendientes.length} entradas JSON copiadas — pégalas en config.json → fuentes`);
+};
+
+filtrar();
+</script>
+<footer>Fuente: periodistas.pdf (listado recibido 14/oct/2026) · Verificación automática con sesión FB</footer>
+</body>
+</html>

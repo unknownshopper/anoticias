@@ -31,5 +31,9 @@
   "ollama": {
     "modelo": "llama3.2",
     "url": "http://127.0.0.1:11434/api/generate"
+  },
+  "gemini": {
+    "api_key": "",
+    "modelo": "gemini-3.1-flash-lite"
   }
 }
