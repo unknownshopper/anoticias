@@ -426,9 +426,19 @@ def enviar_correo(cfg: dict, alerta: dict):
     if alerta.get("categoria") == "desarrollo":
         return   # cluster que crece → un correo por ciclo = spam;
                  # es señal de dashboard, no regla del usuario
-    # alertas de un usuario van a SU correo; las globales al destinatario fijo
-    destinatario = alerta.get("usuario") or correo.get("destinatario", "")
-    if not destinatario or "@" not in destinatario:
+    # alertas de un usuario van a SU correo; las colectivas a todo el proyecto
+    dests = set()
+    if alerta.get("usuario") and "@" in alerta["usuario"]:
+        dests.add(alerta["usuario"])
+    for p in alerta.get("proyectos", []):
+        for email in cargar_usuarios():
+            if "@" in email and p in proyectos_usuario(email):
+                dests.add(email)
+    if not dests:
+        d = correo.get("destinatario", "")
+        if "@" in d:
+            dests.add(d)
+    if not any("@" in d for d in dests):
         return
     try:
         cuerpo = (
@@ -441,7 +451,7 @@ def enviar_correo(cfg: dict, alerta: dict):
         msg = MIMEText(cuerpo, "plain", "utf-8")
         msg["Subject"] = f"[Monitor] {alerta['reglas']}: {alerta['titulo'][:80]}"
         msg["From"] = correo.get("remitente", correo["usuario"])
-        msg["To"] = destinatario
+        msg["To"] = ", ".join(sorted(dests))
         _mandar_msg(correo, msg)
         print("    ✉ correo enviado")
     except Exception as e:
@@ -1368,8 +1378,18 @@ def enviar_cierre_mail(cfg: dict, texto_cierre: str):
     correo = cfg.get("correo", {})
     if not correo.get("habilitado"):
         return
-    destinatario = correo.get("destinatario", "")
-    if not destinatario or "@" not in destinatario:
+    dests = set()
+    d = correo.get("destinatario", "")
+    if "@" in d:
+        dests.add(d)
+    for a in cfg.get("admins", []):
+        if "@" in a:
+            dests.add(a)
+    for email in cargar_usuarios():
+        if "@" in email and not email.endswith("@demo.local") \
+                and proyectos_usuario(email):
+            dests.add(email)
+    if not dests:
         return
     ultimas = {}
     for e in leer_jsonl(SINTESIS):
@@ -1389,7 +1409,7 @@ def enviar_cierre_mail(cfg: dict, texto_cierre: str):
         msg["Subject"] = (f"[Monitor] Cierre del día "
                           f"{datetime.now():%d/%m/%Y}")
         msg["From"] = correo.get("remitente", correo["usuario"])
-        msg["To"] = destinatario
+        msg["To"] = ", ".join(sorted(dests))
         _mandar_msg(correo, msg)
         print("[cierre] ✉ mail enviado")
     except Exception as e:
@@ -2042,12 +2062,14 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
             for email, perfil in usuarios.items():
                 if fuente["nombre"] not in fuentes_visibles(perfil, cfg):
                     continue
-                hits = [r["nombre"] for r in perfil.get("reglas", [])
-                        if coincide(texto, r)
-                        and (not r.get("proyecto")
-                             or coincide_interes(nota))]
-                if hits:
-                    hits_usuario.append((email, hits))
+                rule_hits = [r for r in perfil.get("reglas", [])
+                             if coincide(texto, r)
+                             and (not r.get("proyecto")
+                                  or coincide_interes(nota))]
+                if rule_hits:
+                    hits = [r["nombre"] for r in rule_hits]
+                    proys = {r.get("proyecto") for r in rule_hits if r.get("proyecto")}
+                    hits_usuario.append((email, hits, proys))
 
             if mostrar_todo:
                 print(f"  · [{fuente['nombre']}] {titulo}")
@@ -2070,10 +2092,11 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
                     registrar_alerta(alerta, cfg)
                     print(f"\n*** ALERTA: {alerta['reglas']} ***")
                     print(f"    {titulo}\n    {link}")
-                for email, hits in hits_usuario:
+                for email, hits, proys in hits_usuario:
                     alertas += 1
                     alerta = dict(base_alerta, reglas=", ".join(hits),
-                                  usuario=email)
+                                  usuario=email,
+                                  proyectos=sorted(proys))
                     registrar_alerta(alerta, cfg)
                     print(f"\n*** ALERTA ({email}): {alerta['reglas']} ***")
                     print(f"    {titulo}\n    {link}")
