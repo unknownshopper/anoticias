@@ -1748,14 +1748,16 @@ def _scrapear_x_posts(handle: str) -> list:
     return out
 
 
-def _feed_x(url: str) -> list:
+def _feed_x(url: str, cfg: dict) -> list:
     """Timeline de X. Fuente.url = 'x:handle' o 'x:buscar:<query>'.
-    Primero Nitter (gratis); si los espejos mueren cae al scraper con
-    sesión (x_session.json). La búsqueda no tiene espejo — va directo
-    a la sesión."""
+    Solo ingiere posts cuyo autor esté en x_permitidos; las otras
+    cuentas se ignoran aunque aparezcan en el feed."""
+    permitidos = {p.lower().lstrip("@") for p in cfg.get("x_permitidos", [])}
     if url.strip().lower().startswith("x:buscar:"):
         q = url.strip()[9:]
-        return _scrapear_x_posts("buscar:" + q) if q else []
+        posts = _scrapear_x_posts("buscar:" + q) if q else []
+        return [p for p in posts
+                if p.get("_autor", "").lstrip("@").lower() in permitidos]
     handle = _handle_x(url)
     if not handle:
         return []
@@ -1767,10 +1769,16 @@ def _feed_x(url: str) -> list:
                     if e.get("link"):
                         e["link"] = re.sub(r"^https?://[^/]+/",
                                            "https://x.com/", e["link"])
-                return d.entries
+                        autor = (e["link"].split("/")[3] or "").lower()
+                        e["_autor"] = "@" + autor
+                return [e for e in d.entries
+                        if (e.get("_autor") or "").lstrip("@").lower()
+                        in permitidos]
         except Exception:
             continue
-    return _scrapear_x_posts(handle)
+    posts = _scrapear_x_posts(handle)
+    return [p for p in posts
+            if p.get("_autor", "").lstrip("@").lower() in permitidos]
 
 
 def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
@@ -1870,7 +1878,7 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
             st["ok"] += 1
             st["ultimo_ok"] = datetime.now().isoformat(timespec="seconds")
         elif fuente.get("tipo") == "x":
-            entradas = _feed_x(fuente["url"])
+            entradas = _feed_x(fuente["url"], cfg)
             if not entradas:
                 st["err"] += 1
                 print(f"[!] {fuente['nombre']}: espejos X sin respuesta")
