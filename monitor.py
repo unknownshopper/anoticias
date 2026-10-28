@@ -9120,14 +9120,36 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
         r.close()
         r._content = b"".join(trozos)
     except Exception as e:
-        # el medio bloquea al servidor (403/WAF) — mostrar lo que tenemos
-        # guardado de la nota en vez de una pantalla vacía
+        # el medio bloquea al servidor (403/WAF) — intentar con r.jina.ai
+        # (lector de artículos web, sin redes sociales)
         nota = next((n for n in _noticias_cache()
                      if n["link"] == link), {})
+        jtxt = ""
+        try:
+            jurl = "https://r.jina.ai/http://" + quote(link, safe="/:")
+            rj = requests.get(jurl, timeout=(4, 12),
+                              headers={"User-Agent": "Mozilla/5.0"})
+            if rj.status_code == 200:
+                jtxt = rj.text.strip()
+        except Exception:
+            pass
         t = nota.get("titulo", "")
         img = nota.get("imagen", "")
         res = nota.get("resumen", "")
         aut = nota.get("autor", "")
+        cuerpo = (f"<p class='lede'>{html.escape(res[:600])}</p>" if res else "")
+        if jtxt:
+            cuerpo += ("<h2 style='font-size:1.1rem;margin:1.4rem 0 .6rem;'>"
+                       "Texto extraído del artículo</h2>"
+                       f"<div style='white-space:pre-wrap;line-height:1.6;"
+                       f"font-size:1rem;color:#222;'>"
+                       f"{html.escape(jtxt)}</div>")
+            explica = "<p class='meta'>El medio bloqueó al lector; se recuperó " \
+                      "el texto vía Jina AI.</p>"
+        else:
+            explica = (f"<p class='meta'>El medio bloqueó la lectura "
+                       f"({html.escape(str(e))}) — el texto completo está en "
+                       "el sitio original.</p>")
         return ("<div class='lector'>"
                 "<a href='javascript:history.back()'>← Regresar</a>"
                 f"<h1>{html.escape(t or 'No se pudo cargar la nota')}</h1>"
@@ -9137,15 +9159,13 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
                 + "</div>"
                 + (f"<img class='hero' src='{html.escape(url_https(img))}' "
                    f"onerror='this.remove()'>" if img else "")
-                + (f"<p class='lede'>{html.escape(res[:600])}</p>" if res else "")
-                + f"<p class='meta'>El medio bloqueó la lectura "
-                  f"({html.escape(str(e))}) — el texto completo está en "
-                  "el sitio original.</p>"
+                + cuerpo
+                + explica
                 + f"<a class='origen' href='{html.escape(link)}' "
                   f"target='_blank' rel='noopener'>Abrir en "
                   f"{html.escape(dominio)} ↗</a></div>",
                 {"titulo": t, "imagen": img,
-                 "desc": res[:200], "dominio": dominio})
+                 "desc": (jtxt or res)[:200], "dominio": dominio})
 
     titulo = _meta(r.text, "og:title") or _meta(r.text, "twitter:title") or ""
     if not titulo:
