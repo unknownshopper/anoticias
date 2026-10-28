@@ -4934,15 +4934,25 @@ def enviar_portadas(cfg: dict, pdfs: dict, fallos: list):
     correo = cfg.get("correo", {})
     if not correo.get("habilitado"):
         return
-    dest = (cfg.get("portadas", {}).get("destinatario")
-            or correo.get("destinatario", ""))
-    if not dest or "@" not in dest:
+    dests = set()
+    for d in (cfg.get("portadas", {}).get("destinatario", ""),
+              correo.get("destinatario", "")):
+        if "@" in d:
+            dests.add(d)
+    for a in cfg.get("admins", []):
+        if "@" in a:
+            dests.add(a)
+    for email in cargar_usuarios():
+        if "@" in email and not email.endswith("@demo.local") \
+                and proyectos_usuario(email):
+            dests.add(email)
+    if not dests:
         return
     hoy = datetime.now().strftime("%d/%m/%Y")
     msg = MIMEMultipart()
     msg["Subject"] = f"[Monitor] Portadas {hoy}"
     msg["From"] = correo.get("remitente", correo["usuario"])
-    msg["To"] = dest
+    msg["To"] = ", ".join(sorted(dests))
     cuerpo = (f"Primeras planas del {hoy}.\n\n"
               + (f"No respondieron: {', '.join(fallos)}." if fallos else ""))
     msg.attach(MIMEText(cuerpo, "plain", "utf-8"))
@@ -9131,6 +9141,11 @@ def vista_nota(link: str, captura: bool = False) -> tuple:
                               headers={"User-Agent": "Mozilla/5.0"})
             if rj.status_code == 200:
                 jtxt = rj.text.strip()
+                # si Jina también recibió el muro del WAF, no sirve
+                if any(m in jtxt for m in
+                       ("Algo ha salido mal", "Este sitio web se protege",
+                        "403: Forbidden", "403 Client Error", "Forbidden")):
+                    jtxt = ""
         except Exception:
             pass
         t = nota.get("titulo", "")
