@@ -10515,8 +10515,8 @@ def render_pagina(contenido: str, q: str = "", base: str = "",
                   if usuario and es_admin(usuario, cfg) else "")
     # guests (demo 24h): solo noticias/alertas/portadas — el producto
     # judicial (interés, columnas, síntesis, fuentes) es de pago
-    tabs_reg = ('<a href="/x">X</a>'
-                '<a href="/telegram">TG</a>'
+    # tab X oculto mientras la sesión está pausada
+    tabs_reg = ('<a href="/telegram">TG</a>'
                 '<a href="/columnas">Columnas</a>'
                 '<a href="/interes">Interés</a>'
                 '<a href="/resumenes">Resúmenes</a>'
@@ -11033,12 +11033,12 @@ def servir_web(puerto: int):
                             "en tiempo real."))
                 _marcar_visto(email, "visto_noticias")
             elif ruta.path == "/x":
-                self._html(render_pagina(vista_x(email), base=base,
-                                         usuario=email,
-                                         og_title="Radar X — @noticias",
-                                         og_desc="Lo que publican las cuentas curadas y lo "
-                                                 "más comentado en X."))
-                _marcar_visto(email, "visto_x")
+                self._html(render_pagina(
+                    "<h1>Radar X</h1>"
+                    "<p class='meta'>Sección temporalmente oculta.</p>",
+                    base=base, usuario=email,
+                    og_title="Radar X — @noticias",
+                    og_desc="Sección temporalmente oculta."))
             elif ruta.path == "/telegram":
                 self._html(render_pagina(
                     vista_telegram(email), base=base, usuario=email,
