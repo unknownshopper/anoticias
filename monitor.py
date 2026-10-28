@@ -4884,8 +4884,13 @@ def generar_pdfs_portadas(cfg: dict, marca: str = "pdf_fecha"):
     por correo y lista los que no respondieron.
     `marca` = llave del estado que registra qué emisión ya salió."""
     medios = cfg.get("portadas", {}).get("medios", [])
-    escribir_schedule_portadas(cfg)   # schedule.html siempre al día
     hoy = datetime.now().strftime("%Y-%m-%d")
+    # marcar inmediatamente para evitar que el loop principal vuelva a
+    # disparar otro hilo mientras este corre (el loop revisa cada 5 min)
+    est = cargar_json(ESTADO_PORTADAS, {})
+    est[marca] = hoy
+    _guardar_portadas(est)
+    escribir_schedule_portadas(cfg)   # schedule.html siempre al día
     fallos = []
     pdfs = {}
     dia = _dir_dia()
@@ -4898,11 +4903,8 @@ def generar_pdfs_portadas(cfg: dict, marca: str = "pdf_fecha"):
             pdf.write_bytes(data)
             pdfs[sec] = pdf
     enviar_portadas(cfg, pdfs, fallos)
-    est = cargar_json(ESTADO_PORTADAS, {})
-    est[marca] = hoy
-    _guardar_portadas(est)
     print(f"[portadas] {len(pdfs)} PDFs enviados ({marca}), fallos: "
-          f"{fallos or 'ninguno'}")
+          f"{fallos or 'ninguno'}\n")
 
 
 def limpiar_portadas():
