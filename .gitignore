@@ -23,12 +23,18 @@ portadas_estado.json
 *.bak*
 
 # sesiones y datos de X/FB — credenciales, NUNCA subir
-x_session.json
+x_session.json*
 fb_session_redes.json
-.x_login_profile/
+.x_login_profile*/
 x_posts.jsonl
 
 # exports y debug temporales
 x_siguiendo*.csv
+x_unfollow*.csv
+x_faltan_por_seguir.txt
 *_debug.png
 porrico_bottom.png
+
+# reportes generados y datos runtime locales
+auditoria_tsjt.html
+demo_ips.json

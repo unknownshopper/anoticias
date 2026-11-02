@@ -5375,7 +5375,7 @@ def escribir_schedule_portadas(cfg: dict):
         ".then(function(r){"
         "el.style.outline=r.ok?'2px solid #0a7a2f':'2px solid red';"
         "if(r.ok&&el.name.indexOf('del')===0)location.reload();})"
-        ".catch(function(){el.style.outline='2px solid red';});});"
+        ".catch(function(){el.style.outline='2px solid red';});});});"
         "</script>"
         "<p class=\"nota\">Aplica en el siguiente ciclo — sin reiniciar. "
         "El fin de ventana lo marca el PDF de las 06:45. Las capturas "
@@ -5529,12 +5529,12 @@ def checar_ip_correo():
 
 def vista_portadas(sec: str, dia: str = "", admin: bool = False,
                    logueado: bool = False) -> str:
-    """Tab Portadas: grid de las capturas por sección; ?dia=oct/06
-    navega subcarpetas para cotejar un día contra otro."""
+    """Tab Portadas: UNA sola grid con TODAS las capturas — locales
+    primero, nacionales después. ?dia=oct/06 navega subcarpetas para
+    cotejar un día contra otro. `sec` queda solo por compat de URL."""
     cfg = json.loads(CONFIG.read_text())
     port = cfg.get("portadas", {})
-    medios = [m for m in port.get("medios", [])
-              if m.get("seccion", "nacional") == sec]
+    medios = list(port.get("medios", []))
     est_v = cargar_json(ESTADO_PORTADAS, {})
     ultima = est_v.get("pdf_fecha", "")
     # avisos de salud: sesión FB caída + fuentes calladas (cálculo
@@ -5571,19 +5571,17 @@ def vista_portadas(sec: str, dia: str = "", admin: bool = False,
                   reverse=True) if PORTADAS_DIR.exists() else []
     tabs_dia = ("<div class='tabs-cat'>" + "".join(
         f"<a class='tab-cat{' on' if d == dia_sel else ''}' "
-        f"href='/portadas?sec={sec}&dia={d}'>{d}</a>" for d in dias)
+        f"href='/portadas?dia={d}'>{d}</a>" for d in dias)
         + "</div>") if dias else ""
-    # un solo botón PDF: se arma al click con lo capturado de ese
-    # día (los tardíos entran hasta ~9am); solo usuarios con sesión
-    pdf_block = (f"<p class='meta'>PDF: <a class='tab-cat on' "
-                 f"href='/portadas-pdf?sec={sec}&dia={dia_sel}' "
-                 f"target='_blank'>{dia_sel}</a></p>"
-                 if logueado else "")
-    tabs = ("<div class='tabs-cat'>"
-            + f"<a class='tab-cat{' on' if sec != 'tabasco' else ''}' "
-              "href='/portadas?sec=nacional'>Nacional</a>"
-            + f"<a class='tab-cat{' on' if sec == 'tabasco' else ''}' "
-              "href='/portadas?sec=tabasco'>Tabasco</a></div>")
+    # PDFs por sección al click (los tardíos entran hasta ~9am); solo
+    # usuarios con sesión
+    pdf_block = ("<p class='meta'>PDF: "
+                 + "".join(
+                     f"<a class='tab-cat on' "
+                     f"href='/portadas-pdf?sec={s}&dia={dia_sel}' "
+                     f"target='_blank'>{s}</a> "
+                     for s in ("tabasco", "nacional"))
+                 + "</p>" if logueado else "")
     # orden: la captura más reciente arriba; sin captura al final
     _m_idx = {m: f"{i + 1:02d}" for i, m in enumerate(
         ("ene", "feb", "mar", "abr", "may", "jun",
@@ -5594,10 +5592,20 @@ def vista_portadas(sec: str, dia: str = "", admin: bool = False,
     for ev in est_v.get("eventos", []):
         if ev.get("ok") and str(ev.get("d", "")).endswith(_dia_key):
             _hora_ev[ev.get("m", "")] = ev.get("t", "")
+    # locales primero, nacionales después; dentro de cada bloque el
+    # más reciente arriba (sort estable: primero hora, luego bloque)
     medios.sort(key=lambda m: _hora_ev.get(m["nombre"], ""),
                 reverse=True)
+    medios.sort(
+        key=lambda m: m.get("seccion", "nacional") == "nacional")
     cards = ""
+    _grupo = None
     for m in medios:
+        if m.get("seccion", "nacional") != _grupo:
+            _grupo = m.get("seccion", "nacional")
+            _rotulo = {"tabasco": "Local"}.get(_grupo, _grupo.title())
+            cards += (f"<h2 style='margin:1.1rem 0 .4rem'>"
+                      f"{html.escape(_rotulo)}</h2>")
         slug = _slug_portada(m["nombre"])
         img_f = _portada_img(slug, dir_sel)
         web_f = dir_sel / f"{slug}-web.png"
@@ -5633,8 +5641,8 @@ def vista_portadas(sec: str, dia: str = "", admin: bool = False,
         cards += (f"<div class='card' style='border-left-color:#7b1fa2'>"
                   f"<b>{html.escape(m['nombre'])}</b>{reciente}"
                   f"{link_m}{img}</div>")
-    return (f"<h1>Portadas — {sec.title()} — {dia_sel}</h1>"
-            f"{tabs}{tabs_dia}"
+    return (f"<h1>Portadas — {dia_sel}</h1>"
+            f"{tabs_dia}"
             f"<p class='meta'>Capturas del {ultima or '—'} · se regeneran a "
             f"las {html.escape(port.get('hora', '06:30'))}.</p>"
             + avisos + pdf_block + cards)
