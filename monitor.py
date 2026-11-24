@@ -11618,6 +11618,35 @@ _RED_CSS = """
 .rb svg{display:block;flex:none}
 .rb-n{background:#b03a2e;color:#fff;border-radius:8px;padding:0 5px;
   font-size:.62rem;font-weight:700;margin-left:2px;line-height:1.5}
+/* barra de acciones del tablero — botones grandes con presencia;
+   .rtb.acc marca la acción principal (asignar) */
+.red-bar{display:flex;gap:.45rem;align-items:center;flex-wrap:wrap;
+  margin:.15rem 0 .8rem}
+.rtb{display:inline-flex;align-items:center;justify-content:center;
+  gap:6px;height:34px;padding:0 16px;font-size:.82rem;font-weight:600;
+  letter-spacing:.01em;border-radius:10px;border:1px solid #4a5aa0;
+  background:linear-gradient(180deg,rgba(120,140,255,.16),
+  rgba(120,140,255,.05));color:#e6eaff;cursor:pointer;line-height:1;
+  font-family:inherit;white-space:nowrap;text-decoration:none;
+  box-sizing:border-box;transition:border-color .15s,box-shadow .15s,
+  background .15s;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 2px 8px rgba(0,0,0,.3)}
+.rtb:hover{border-color:#8f6bff;color:#fff;
+  background:linear-gradient(180deg,rgba(124,77,255,.32),
+  rgba(124,77,255,.14));box-shadow:0 0 14px #7c4dff66;
+  text-decoration:none}
+.rtb:disabled{opacity:.4;cursor:default}
+.rtb:disabled:hover{border-color:#4a5aa0;color:#e6eaff;
+  background:linear-gradient(180deg,rgba(120,140,255,.16),
+  rgba(120,140,255,.05));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 2px 8px rgba(0,0,0,.3)}
+.rtb.acc{background:linear-gradient(180deg,#5e35d8,#4527a0);
+  border-color:#8f6bff;color:#fff}
+.rtb.acc:hover{background:linear-gradient(180deg,#6d46e8,#512da8);
+  border-color:#8f6bff;color:#fff;box-shadow:0 0 16px #7c4dff88}
+.red-selpill{display:none;align-items:center;height:26px;padding:0 10px;
+  border-radius:13px;background:#3949ab;color:#fff;font-size:.72rem;
+  font-weight:700;letter-spacing:.02em}
 .rb-det{display:inline-block}
 .rb-det>summary{list-style:none}
 .rb-det>summary::-webkit-details-marker{display:none}
@@ -11649,7 +11678,7 @@ _RED_CSS = """
 .red-sel{float:right;margin:1px 0 0 .4rem;accent-color:#7c8cf8;
   cursor:pointer}
 #red-asig{position:relative;vertical-align:middle}
-#red-asig>summary{height:29px;box-sizing:border-box}
+#red-asig>summary{height:34px;box-sizing:border-box}
 .red-asig-menu{position:absolute;top:calc(100% + 6px);left:0;z-index:40;
   min-width:300px;background:rgba(13,18,48,.97);
   border:1px solid #3a4a80;border-radius:10px;padding:.6rem;
@@ -11764,6 +11793,15 @@ html.tema-claro .rb:hover{border-color:#1a237e;color:#1a237e;
   background:#fff;box-shadow:none}
 html.tema-claro .rb.on{background:#1a237e;border-color:#1a237e;
   color:#fff}
+html.tema-claro .rtb{background:linear-gradient(180deg,#fff,#eceff8);
+  border-color:#b8bedd;color:#333;
+  box-shadow:inset 0 1px 0 #fff,0 1px 4px rgba(0,0,0,.12)}
+html.tema-claro .rtb:hover{border-color:#1a237e;color:#1a237e;
+  background:linear-gradient(180deg,#fff,#e3e7f6);box-shadow:none}
+html.tema-claro .rtb.acc{background:linear-gradient(180deg,#3949ab,#283593);
+  border-color:#3949ab;color:#fff}
+html.tema-claro .rtb.acc:hover{background:#303f9f;color:#fff}
+html.tema-claro .red-selpill{background:#1a237e}
 html.tema-claro .rb-form select,html.tema-claro .rb-form input{
   background:#fff;color:#222;border-color:#ccc}
 html.tema-claro .red-asig-menu{background:#fff;border-color:#d0d0dc;
@@ -11991,11 +12029,8 @@ def vista_redaccion(email: str) -> str:
     # colaboradores × evento opcional, creable al vuelo)
     sel_bar = ""
     if not es_demo:
-        sel_bar += ("<span class='meta' id='red-sel' "
-                    "style='font-size:.78rem;align-self:center;"
-                    "margin:0 .3rem'></span>"
-                    "<button class='rb' id='red-copy' disabled "
-                    "style='margin:.1rem 0 .7rem' "
+        sel_bar += ("<span class='red-selpill' id='red-sel'></span>"
+                    "<button class='rtb' id='red-copy' disabled "
                     "title='Copiar los enlaces de las notas "
                     "seleccionadas'>⧉ compartir</button>")
     if sup:
@@ -12010,10 +12045,9 @@ def vista_redaccion(email: str) -> str:
             f"{html.escape(s.get('nombre', ''))}</option>"
             for s in cargar_seguimientos())
         sel_bar += (
-            "<details class='rb-det' id='red-asig' "
-            "style='margin:.1rem 0 .7rem'>"
-            "<summary class='rb' title='Asignar las notas "
-            "seleccionadas a colaboradores'>asignar "
+            "<details class='rb-det' id='red-asig'>"
+            "<summary class='rtb acc' title='Asignar las notas "
+            "seleccionadas a colaboradores'>➤ asignar "
             "<span id='red-asig-n' class='rb-n'></span></summary>"
             "<div class='red-asig-menu'>"
             "<form method='post' action='/redaccion/asignar' "
@@ -12034,22 +12068,20 @@ def vista_redaccion(email: str) -> str:
             "style='display:none'>"
             "<button class='rb'>asignar</button></form></div>"
             "</details>"
-            "<a class='rb' href='/bitacora' "
-            "style='margin:.1rem 0 .7rem' "
-            "title='Eventos / seguimientos'>eventos</a>")
+            "<a class='rtb' href='/bitacora' "
+            "title='Eventos / seguimientos'>≡ eventos</a>")
     return (_RED_CSS +
             f"<div class='meta' style='margin:.2rem 0 .7rem;font-size:.82rem'>"
             f"{len(areas)} medios · {len(posts)} publicaciones · "
             f"{nuevas_total} nuevas desde tu última visita · última "
             f"{fmt_fecha(ultimo) if ultimo else '—'} · arrastra ⠿ para "
             f"reordenar</div>"
-            "<button class='rb' id='red-tgl' "
-            "style='margin:.1rem 0 .7rem'>plegar todo</button>"
-            "<button class='rb' id='red-inicio' "
-            "style='margin:.1rem 0 .7rem' "
+            "<div class='red-bar'>"
+            "<button class='rtb' id='red-tgl'>⇕ plegar todo</button>"
+            "<button class='rtb' id='red-inicio' "
             "title='Volver al inicio — columnas a la izquierda y "
             "publicaciones arriba'>↺ inicio</button>"
-            + sel_bar
+            + sel_bar + "</div>"
             + _board_wrap("".join(cols))
             + "<script>"
             "var _drag=null;"
@@ -12085,7 +12117,7 @@ def vista_redaccion(email: str) -> str:
             "function _syncTgl(){if(!_tgl)return;"
             "var abiertas=document.querySelectorAll("
             "'.red-col:not(.closed)').length;"
-            "_tgl.textContent=abiertas?'plegar todo':'expandir todo'}"
+            "_tgl.textContent=abiertas?'⇕ plegar todo':'⇕ expandir todo'}"
             "if(_tgl)_tgl.addEventListener('click',function(){"
             "var cerrar=document.querySelectorAll("
             "'.red-col:not(.closed)').length>0;"
@@ -12114,8 +12146,9 @@ def vista_redaccion(email: str) -> str:
             ".map(function(c){return c.value})}"
             "function _syncSel(){var n=_selIds().length;"
             "var b=document.getElementById('red-sel');"
-            "if(b)b.textContent=n?'☑ '+n+' seleccionada'"
+            "if(b){b.textContent=n?'☑ '+n+' seleccionada'"
             "+(n>1?'s':''):'';"
+            "b.style.display=n?'inline-flex':'none'}"
             "var cp=document.getElementById('red-copy');"
             "if(cp)cp.disabled=!n;}"
             "document.addEventListener('change',function(e){"
