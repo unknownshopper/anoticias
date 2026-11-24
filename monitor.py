@@ -11612,9 +11612,15 @@ _RED_CSS = """
   display:flex;flex-direction:column;height:100%;
   backdrop-filter:blur(10px);box-shadow:0 6px 24px #0006}
 .red-col.drag{opacity:.4}
-.red-col h2{font-size:.9rem;margin:.15rem 0 .6rem;flex:none;color:#eef1ff;
-  display:flex;align-items:center;gap:.4rem;cursor:pointer;
-  user-select:none}
+/* encabezado de columna = banda con peso propio, no solo texto:
+   más alto, letra mayor, fondo con gradiente y borde */
+.red-col h2{font-size:1.05rem;font-weight:700;letter-spacing:.02em;
+  margin:.15rem 0 .7rem;padding:.55rem .65rem;flex:none;color:#fff;
+  display:flex;align-items:center;gap:.5rem;cursor:pointer;
+  user-select:none;border-radius:9px;border:1px solid #3a4a80;
+  background:linear-gradient(180deg,rgba(120,140,255,.18),
+  rgba(120,140,255,.06));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.09)}
 .red-col h2::before{content:'⠿';color:#4a5a9e;font-size:.9rem}
 .red-col h2::after{content:'◂';color:#8a93b8;font-size:.75rem;
   transition:transform .15s}
@@ -11818,7 +11824,9 @@ _RED_CSS = """
 /* tema claro — mismas piezas en look clásico */
 html.tema-claro .red-col{background:#f4f4f6;border-color:#e2e2e8;
   box-shadow:none;backdrop-filter:none}
-html.tema-claro .red-col h2{color:#333}
+html.tema-claro .red-col h2{color:#1a237e;
+  background:linear-gradient(180deg,#fff,#e8ecf8);
+  border-color:#c5cbe8;box-shadow:none}
 html.tema-claro .red-col h2::before{color:#bbb}
 html.tema-claro .red-col h2::after{color:#999}
 html.tema-claro .red-col h2 .area-ico{color:#5a5a6e}
