@@ -6790,8 +6790,9 @@ document.addEventListener('wheel',function(e){{
 document.addEventListener('toggle',function(e){{
   var d=e.target;
   if(!d.classList||!d.classList.contains('compartirc'))return;
-  var m=d.querySelector('.menu-share');if(!m)return;
+  var m=d._share||d.querySelector('.menu-share');if(!m)return;
   if(d.open){{
+    d._share=m;
     var s=d.querySelector('summary').getBoundingClientRect();
     m.style.cssText='position:fixed;z-index:9999;display:flex;';
     document.body.appendChild(m);
@@ -6801,14 +6802,15 @@ document.addEventListener('toggle',function(e){{
     m.style.top=top+'px';
     m.style.left=Math.max(8,Math.min(s.left,innerWidth-262))+'px';
   }}else{{
-    m.style.display='none';
+    m.style.cssText='';
     if(m.parentNode!==d)d.appendChild(m);
+    d._share=null;
   }}
 }},true);
 document.addEventListener('click',function(e){{
   document.querySelectorAll('details.compartirc[open]').forEach(
     function(d){{
-      var m=d.querySelector('.menu-share');
+      var m=d._share||d.querySelector('.menu-share');
       if((m&&m.contains(e.target))||d.contains(e.target))return;
       d.open=false;
     }});
