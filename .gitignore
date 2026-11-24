@@ -1,2 +1,32 @@
+# macOS / runtime
 ._*
 .DS_Store
+__pycache__/
+.venv/
+*.log
+.*_profile*/
+
+# estado vivo de la app (vive solo en el servidor, NO versionar)
+secret.txt
+config.json
+config.json.bak*
+usuarios.json
+usuarios.json.bak*
+*.jsonl
+*.jsonl.bak*
+vistos.json
+chats.json
+clusters.json
+demo_ips.json
+fuentes_estado.json
+portadas_estado.json
+sesiones_*.json
+x_session.json*
+asistente_*.json
+portadas/
+redaccion_media/
+
+# residuos del scrapeo X/FB (proyecto muerto)
+*.csv
+x_faltan_por_seguir.txt
+andrade_debug.png
