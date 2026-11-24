@@ -11409,14 +11409,14 @@ def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
                f"title='Seleccionar para compartir / asignar'>"
                if ret == "/redaccion" and not es_demo else "")
     # la tarjeta se puede arrastrar a la columna ★ Favoritos —
-    # herramienta operativa de supervisión (Paolo)
+    # personal por usuario real (invitados demo no tienen favoritos)
     drag_attr = (" draggable='true'" if ret == "/redaccion"
-                 and sup else "")
+                 and not es_demo else "")
 
     acciones = [
         f"<a class='rb' href='/redaccion/nota?id={pid}' "
         f"title='Ver la nota completa'>{ico_doc} ver noticia</a>"]
-    if sup:
+    if not es_demo:
         es_fav = email in (p.get("favoritos") or [])
         acciones.append(
             f"<button type='button' class='rb red-star"
@@ -11631,7 +11631,7 @@ _RED_CSS = """
   flex-direction:column;gap:.2rem;padding-right:.3rem}
 .red-asig-u{display:flex;gap:.4rem;align-items:baseline;
   font-size:.78rem;font-weight:400;cursor:pointer}
-/* columna ★ favoritos + arrastre de tarjetas (supervisión) */
+/* columna ★ favoritos + arrastre de tarjetas (usuarios reales) */
 .red-favcol h2 .red-nom{color:#f6c344}
 .red-favcol.drop-ok{outline:2px dashed #f6c344;outline-offset:2px;
   border-radius:8px}
@@ -11922,10 +11922,10 @@ def vista_redaccion(email: str) -> str:
     ultimo = posts[0].get("ts", "") if posts else ""
     sup = es_supervisor(email, cfg)
     es_demo = "@demo.local" in (email or "")
-    # ── columna ★ Favoritos — herramienta operativa de supervisión:
-    # Paolo arrastra tarjetas de cualquier medio; es la ÚNICA columna
-    # que acepta drops. Personal: cada supervisor ve las suyas ──
-    if sup:
+    # ── columna ★ Favoritos — personal por usuario real: cada quien
+    # arrastra tarjetas de cualquier medio a la suya; es la ÚNICA
+    # columna que acepta drops. Invitados demo no la tienen ──
+    if not es_demo:
         fav_posts = [p for p in posts
                      if email in (p.get("favoritos") or [])][:80]
         fav_cards = "".join(
@@ -12656,8 +12656,9 @@ def aplicar_accion_redaccion(ruta: str, form: dict, email: str) -> str:
         return volver or "/redaccion"
 
     if ruta.endswith("/favorito"):
-        # ★ personal de supervisión — la columna Favoritos del tablero
-        if not es_supervisor(email, cfg):
+        # ★ personal — la columna Favoritos del tablero; solo usuarios
+        # reales (los invitados demo no tienen favoritos)
+        if "@demo.local" in email:
             return "/area"
         favs = p.setdefault("favoritos", [])
         if form.get("op", ["add"])[0] == "del":
