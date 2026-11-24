@@ -12271,7 +12271,8 @@ def vista_redaccion(email: str) -> str:
             "var c=posts.querySelector('#p-'+pid);"
             "if(on){if(c)c.remove();_favSync();}"
             "else{_favAdd(pid);}});"
-            "</script>" + _RED_POLL_JS.replace("CTX", "tablero"))
+            "</script>" + _RED_POLL_JS.replace("CTX", "tablero")
+            .replace("VER", version_redaccion()))
 
 
 def _form_publicar(email: str, cfg: dict) -> str:
@@ -12360,7 +12361,8 @@ def vista_area(email: str, v: str = "area", msg: str = "",
             "</p>" if msg else ""),
            f"<div class='red-tabs'>{nav}</div>",
            chips,
-           _RED_POLL_JS.replace("CTX", "area")]
+           _RED_POLL_JS.replace("CTX", "area")
+           .replace("VER", version_redaccion())]
 
     if v == "avisos":
         mios = [p for p in posts
@@ -13064,7 +13066,9 @@ def vista_bitacora(email: str) -> str:
             + "<button class='rtb' id='bit-tgl'>⇕ plegar todo</button>"
             + "<button class='rtb' id='bit-inicio' title='Columnas a la "
               "izquierda y notas arriba'>↺ inicio</button></div>"
-            + _board_wrap("".join(cols)) + bit_js)
+            + _board_wrap("".join(cols)) + bit_js
+            + _RED_POLL_JS.replace("CTX", "tablero")
+            .replace("VER", version_redaccion()))
 
 
 def contador_redaccion(email: str, ctx: str) -> int:
@@ -13083,17 +13087,35 @@ def contador_redaccion(email: str, ctx: str) -> int:
     return sum(1 for p in posts if p.get("ts", "") > visto)
 
 
+def version_redaccion() -> str:
+    """Huella corta del estado vivo del módulo: cambia si hay notas
+    nuevas, se mueven de evento, se tocan asignaciones o cambian los
+    eventos mismos — el polling la compara para avisar "hay cambios"
+    en pestañas que quedaron abiertas con HTML viejo."""
+    h = hashlib.sha1()
+    for p in cargar_publicaciones():
+        h.update(json.dumps([p.get("id"), p.get("evento"),
+                             p.get("asignaciones")],
+                            sort_keys=True, default=str).encode())
+    for s in cargar_seguimientos():
+        h.update(json.dumps(s, sort_keys=True, default=str).encode())
+    return h.hexdigest()[:16]
+
+
 _RED_POLL_JS = """
 <script>
-/* polling inteligente: cada 45s pregunta si hay publicaciones nuevas;
-   si las hay muestra un botón flotante — NO recarga a ciegas */
+/* polling inteligente: cada 45s pregunta si hay publicaciones nuevas
+   O si el estado cambió (asignaciones/eventos desde otra sesión);
+   muestra un botón flotante — NO recarga a ciegas */
+var _ver='VER';
 setInterval(function(){
   fetch('/redaccion/contador?ctx=CTX').then(function(r){return r.json()})
   .then(function(d){
-    if(d.n>0&&!document.getElementById('red-nuevas')){
+    if((d.n>0||d.v!==_ver)&&!document.getElementById('red-nuevas')){
       var b=document.createElement('a');b.id='red-nuevas';b.href='#';
       b.className='red-pill';
-      b.textContent=d.n+' nueva'+(d.n>1?'s':'')+' — actualizar';
+      b.textContent=d.n>0?d.n+' nueva'+(d.n>1?'s':'')+' — actualizar'
+        :'hubo cambios — actualizar';
       b.onclick=function(e){e.preventDefault();location.reload()};
       document.body.appendChild(b);}}).catch(function(){});
 },45000);
@@ -14443,7 +14465,8 @@ def servir_web(puerto: int):
                                  "application/json; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write(json.dumps({"n": n}).encode())
+                self.wfile.write(json.dumps(
+                    {"n": n, "v": version_redaccion()}).encode())
             elif ruta.path == "/asistente/nota":
                 email = self._usuario()
                 cfg_a = json.loads(CONFIG.read_text())
