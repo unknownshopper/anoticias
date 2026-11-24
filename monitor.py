@@ -180,7 +180,7 @@ def password_valida(email: str, pw: str, cfg: dict) -> bool:
 def home_usuario(email: str) -> str:
     """Landing del perfil — 'home' en usuarios.json manda; si no, el
     producto redacción: supervisión → tablero de columnas, colaborador
-    → su área; el resto cae al monitor de prensa clásico."""
+    → su área; el resto cae al tablero (el monitor clásico murió)."""
     if "@demo.local" in email:
         return "/redaccion"   # invitado: deck en solo lectura
     prof = cargar_usuarios().get(email) or {}
@@ -195,7 +195,7 @@ def home_usuario(email: str) -> str:
         return "/redaccion"
     if area_de_usuario(email, cfg):
         return "/area"
-    return "/noticias"
+    return "/redaccion"
 
 
 def resolver_usuario(headers, cfg: dict) -> str:
@@ -11417,12 +11417,6 @@ def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
 
     # ── acciones ──
     sup = es_supervisor(email, cfg)
-    interes = p.get("interes") or []
-    mio = email in interes
-    ico_bookmark = ("<svg viewBox='0 0 16 16' width='11' height='11'>"
-                    "<path d='M3 1.5h10a.5.5 0 01.5.5v12.2a.2.2 0 01-.32.16"
-                    "L8 11.1l-5.18 3.26a.2.2 0 01-.32-.16V2a.5.5 0 01.5-.5z'/>"
-                    "</svg>")
     pendientes = [a for a in (p.get("asignaciones") or [])
                   if a.get("estado", "pendiente") == "pendiente"]
     nombres_pend = ", ".join(
@@ -11500,16 +11494,6 @@ def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
         f"<a class='rb' href='/redaccion/nota?id={pid}' "
         f"title='Ver la nota completa'>{ico_doc} ver noticia</a>",
         compartir]
-    if not es_demo:
-        acciones.append(
-            f"<form method='post' action='/redaccion/interes' "
-            f"style='display:inline'>"
-            f"<input type='hidden' name='id' value='{p.get('id')}'>" f"<input type='hidden' name='volver' value='{ret}'>"
-            f"<button class='rb{' on' if mio else ''}' "
-            f"title='{'Quitar de' if mio else 'Agregar a'} mi lista de interés'>"
-            f"{ico_bookmark} interés "
-            f"{'<b>' + str(len(interes)) + '</b>' if interes else ''}"
-            f"</button></form>")
 
     # ── asignaciones ──
     asignaciones = p.get("asignaciones") or []
@@ -12159,11 +12143,10 @@ def vista_area(email: str, v: str = "area", msg: str = "",
         mios = [p for p in posts
                 if any(a.get("para") == email and
                        a.get("estado", "pendiente") == "pendiente"
-                       for a in (p.get("asignaciones") or []))
-                or email in (p.get("interes") or [])]
+                       for a in (p.get("asignaciones") or []))]
         cuerpo = ("".join(_pub_card(p, email, cfg, ret='/area') for p in mios)
                   or "<p class='meta'>Sin avisos — aquí llegan las "
-                     "asignaciones pendientes y las marcas de interés.</p>")
+                     "asignaciones pendientes.</p>")
         out.append(f"<h2 style='font-size:1rem'>Avisos "
                    f"({len(mios)})</h2>{cuerpo}")
         return "".join(out)
@@ -12279,7 +12262,6 @@ def publicar_redaccion(partes: dict, email: str) -> str:
          "enlace": enlace if enlace.startswith("http") else "",
          "location": campo("location"),
          "media": media,
-         "interes": [],
          "asignaciones": []}
     if evento:
         p["evento"] = evento
@@ -12469,15 +12451,6 @@ def aplicar_accion_redaccion(ruta: str, form: dict, email: str) -> str:
                 "texto": texto})
             _reescribir_publicaciones(posts)
         return volver or f"/redaccion/nota?id={pid}"
-
-    if ruta.endswith("/interes"):
-        interes = p.setdefault("interes", [])
-        if email in interes:
-            interes.remove(email)
-        else:
-            interes.append(email)
-        _reescribir_publicaciones(posts)
-        return volver or "/redaccion"
 
     if ruta.endswith("/asignar"):
         # asignar es privilegio de supervisión (Paolo/admin)
@@ -12671,7 +12644,7 @@ def vista_bitacora(email: str) -> str:
         ev = p.get("evento")
         if ev in por_evento:
             por_evento[ev].append(p)
-        elif p.get("interes") or p.get("asignaciones"):
+        elif p.get("asignaciones"):
             por_revisar.append(p)
 
     n_pend = sum(1 for p in posts for a in (p.get("asignaciones") or [])
@@ -12927,12 +12900,6 @@ def vista_publicacion(email: str, pid: str) -> str:
                 f"{html.escape(a.get('nota',''))}</div>")
         asign_h = ("<h3 style='font-size:.85rem;margin-top:1rem'>"
                    "Seguimiento</h3>" + "".join(filas))
-    interes = p.get("interes") or []
-    interes_h = (f"<div class='meta' style='font-size:.72rem;margin-top:.6rem'>"
-                 f"{len(interes)} marcado(s) de interés: "
-                 + ", ".join(html.escape(_red_nombre(e)) for e in interes)
-                 + "</div>" if interes else "")
-
     autor = html.escape(p.get("nombre")
                         or _red_nombre(p.get("usuario", "")))
     # fila meta estilo nota periodística: autor · fecha · ubicación ·
@@ -13027,7 +12994,7 @@ def vista_publicacion(email: str, pid: str) -> str:
             f"<h1 class='nota-titulo'>{titulo_h}</h1>"
             + lead_h + meta_row +
             f"<div class='nota-cuerpo'>{cuerpo}</div>"
-            + "".join(media_h) + asign_h + interes_h + rel_h + com_h +
+            + "".join(media_h) + asign_h + rel_h + com_h +
             "</article>")
 
 
@@ -13500,24 +13467,16 @@ def render_pagina(contenido: str, q: str = "", base: str = "",
     # Seguimiento (radar de perfiles FB) fuera del nav — las 38
     # fuentes fb están muertas (cuentas perdidas, fb_pausa);
     # la ruta sigue viva por URL para consultar el histórico
-    admin_tabs = ('<a href="/horarios">Horarios</a>'
-                  '<a href="/salud">Salud</a>'
-                  '<a href="/stats">Stats</a>'
-                  '<a href="/analitica">Analítica</a>'
+    admin_tabs = ('<a href="/analitica">Analítica</a>'
                   if usuario and es_admin(usuario, cfg) else "")
-    # guests (demo 24h): solo noticias/alertas/portadas — el producto
-    # judicial (interés, columnas, síntesis, fuentes) es de pago
-    # tab X oculto mientras la sesión está pausada
     # redacción es el producto: supervisión y colaboradores ven SOLO
-    # sus secciones — el monitor de prensa queda empaquetado (las
-    # rutas viejas siguen vivas por URL, solo salen del menú)
+    # sus secciones — el monitor de prensa quedó muerto (scrapeo
+    # pausado): sus tabs salen del menú para todos (las rutas viejas
+    # siguen vivas por URL)
     en_redaccion = bool(usuario) and (
         "@demo.local" in usuario
         or es_supervisor(usuario, cfg) or area_de_usuario(usuario, cfg))
-    tabs_base = ("" if en_redaccion else
-                 '<a href="/noticias">Noticias</a>'
-                 '<a href="/alertas">Alertas</a>'
-                 '<a href="/portadas">Portadas</a>')
+    tabs_base = ""
     if usuario and "@demo.local" in usuario:
         # invitado: deck + chat (solo lectura) en modo demo
         tabs_reg = ('<a href="/redaccion">Redacción</a>'
@@ -13537,12 +13496,7 @@ def render_pagina(contenido: str, q: str = "", base: str = "",
             tabs_reg += '<a href="/bitacora">Bitácora</a>'
             tabs_reg += '<a href="/asistente">Asistente</a>'
     else:
-        tabs_reg = ('<a href="/telegram">TG</a>'
-                    '<a href="/columnas">Columnas</a>'
-                    '<a href="/interes">Interés</a>'
-                    '<a href="/resumenes">Resúmenes</a>'
-                    '<a href="/fuentes">Fuentes</a>'
-                    if "@demo.local" not in usuario else "")
+        tabs_reg = ""
     # nombre en el header: perfil 'nombre' si lo trae, si no el
     # local-part del email (paolo@… → paolo); guest → invitado
     if usuario:
@@ -14963,7 +14917,7 @@ def servir_web(puerto: int):
                 self.send_header("Location", destino)
                 self.end_headers()
                 return
-            if ruta.path in ("/redaccion/interes", "/redaccion/asignar",
+            if ruta.path in ("/redaccion/asignar",
                              "/redaccion/asignacion",
                              "/redaccion/comentar",
                              "/redaccion/orden",
