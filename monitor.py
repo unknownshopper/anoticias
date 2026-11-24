@@ -11583,6 +11583,9 @@ _RED_CSS = """
 .red-col h2 .area-ico{display:inline-flex;align-items:center;
   color:#9aa3c7}
 .red-col.closed .posts{display:none}
+/* al plegar, solo queda el h2 (lomo vertical en escritorio) — también
+   cubre bloques extra como en bitácora (subtítulo, equipo, form) */
+.red-col.closed>*:not(h2){display:none}
 .red-col .posts{flex:1;overflow-y:auto;min-height:0}
 .red-col .posts::-webkit-scrollbar{width:8px}
 .red-col .posts::-webkit-scrollbar-thumb{background:#2c3a72;
@@ -12944,7 +12947,7 @@ def vista_bitacora(email: str) -> str:
                         for p in pts) \
             or "<p class='meta' style='padding:.4rem'>sin notas</p>"
         return (f"<div class='red-col {cls_extra}'>"
-                f"<h2>{titulo_html}</h2>"
+                f"<h2><span class='red-nom'>{titulo_html}</span></h2>"
                 f"<div class='meta' style='font-size:.7rem;margin:-.3rem 0 "
                 f".6rem'>{subt}</div>{debajo}"
                 f"<div class='posts'>{cards}</div></div>")
@@ -13023,12 +13026,45 @@ def vista_bitacora(email: str) -> str:
         "Por revisar", "notas con interés o seguimiento sin evento",
         por_revisar))
 
+    # plegado de columnas: mismo comportamiento que el tablero
+    # (click en el título o "plegar todo"); en bitácora el estado no se
+    # persiste — es una vista de trabajo de una sola visita
+    bit_js = (
+        "<script>"
+        "var _bt=document.getElementById('bit-tgl');"
+        "function _bitSync(){if(!_bt)return;"
+        "var a=document.querySelectorAll('.red-col:not(.closed)').length;"
+        "_bt.textContent=a?'⇕ plegar todo':'⇕ expandir todo'}"
+        "if(_bt)_bt.addEventListener('click',function(){"
+        "var cerrar=document.querySelectorAll("
+        "'.red-col:not(.closed)').length>0;"
+        "document.querySelectorAll('.red-col').forEach(function(c){"
+        "if(matchMedia('(max-width:760px)').matches){"
+        "c.classList.toggle('open',!cerrar)}"
+        "else{c.classList.toggle('closed',cerrar)}});_bitSync()});"
+        "var _bi=document.getElementById('bit-inicio');"
+        "if(_bi)_bi.addEventListener('click',function(){"
+        "var b=document.querySelector('.red-board');"
+        "if(b)b.scrollLeft=0;"
+        "document.querySelectorAll('.red-col .posts').forEach("
+        "function(s){s.scrollTop=0});window.scrollTo(0,0)});"
+        "document.querySelectorAll('.red-col').forEach(function(c){"
+        "var h=c.querySelector('h2');if(!h)return;"
+        "h.addEventListener('click',function(){"
+        "if(matchMedia('(max-width:760px)').matches){"
+        "c.classList.toggle('open')}"
+        "else{c.classList.toggle('closed')}})});"
+        "_bitSync();</script>")
     return (_RED_CSS
             + "<div class='red-tabs'><a href='/redaccion'>← tablero</a>"
               "<a href='/redaccion/reporte'>Reporte</a></div>"
             + "<h2 style='font-size:1rem;margin:.2rem 0 .4rem'>Bitácora</h2>"
             + stats + nuevo
-            + _board_wrap("".join(cols)))
+            + "<div class='red-bar'>"
+            + "<button class='rtb' id='bit-tgl'>⇕ plegar todo</button>"
+            + "<button class='rtb' id='bit-inicio' title='Columnas a la "
+              "izquierda y notas arriba'>↺ inicio</button></div>"
+            + _board_wrap("".join(cols)) + bit_js)
 
 
 def contador_redaccion(email: str, ctx: str) -> int:
