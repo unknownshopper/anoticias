@@ -11408,10 +11408,21 @@ def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
     sel_box = (f"<input type='checkbox' class='red-sel' value='{pid}' "
                f"title='Seleccionar para compartir / asignar'>"
                if ret == "/redaccion" and not es_demo else "")
+    # la tarjeta se puede arrastrar a la columna ★ Favoritos —
+    # herramienta operativa de supervisión (Paolo)
+    drag_attr = (" draggable='true'" if ret == "/redaccion"
+                 and sup else "")
 
     acciones = [
         f"<a class='rb' href='/redaccion/nota?id={pid}' "
         f"title='Ver la nota completa'>{ico_doc} ver noticia</a>"]
+    if sup:
+        es_fav = email in (p.get("favoritos") or [])
+        acciones.append(
+            f"<button type='button' class='rb red-star"
+            f"{' on' if es_fav else ''}' data-pid='{pid}' "
+            f"title='{'Quitar de' if es_fav else 'Agregar a'} "
+            f"favoritos'>{'★' if es_fav else '☆'}</button>")
 
     # ── asignaciones ──
     asignaciones = p.get("asignaciones") or []
@@ -11493,7 +11504,8 @@ def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
             f"✗</button></form></div>")
 
     sec = "".join(secundario)
-    return (f"<div class='red-post' id='p-{p.get('id')}' style='"
+    return (f"<div class='red-post' id='p-{p.get('id')}'{drag_attr}"
+            f" style='"
             f"background:rgba(255,255,255,.05);border:1px solid #2c3a72;"
             f"border-radius:10px;padding:.55rem .65rem;"
             f"margin-bottom:.55rem'>"
@@ -11619,6 +11631,13 @@ _RED_CSS = """
   flex-direction:column;gap:.2rem;padding-right:.3rem}
 .red-asig-u{display:flex;gap:.4rem;align-items:baseline;
   font-size:.78rem;font-weight:400;cursor:pointer}
+/* columna ★ favoritos + arrastre de tarjetas (supervisión) */
+.red-favcol h2 .red-nom{color:#f6c344}
+.red-favcol.drop-ok{outline:2px dashed #f6c344;outline-offset:2px;
+  border-radius:8px}
+.red-post.drag-card{opacity:.45}
+.red-post[draggable=true]{cursor:grab}
+.red-star.on{color:#f6c344}
 .red-sub{margin-top:.35rem}
 .red-sub .rb{font-size:.62rem;height:22px;padding:0 8px}
 /* píldora flotante "N nuevas" — aparece sola cuando el polling
@@ -11903,6 +11922,31 @@ def vista_redaccion(email: str) -> str:
     ultimo = posts[0].get("ts", "") if posts else ""
     sup = es_supervisor(email, cfg)
     es_demo = "@demo.local" in (email or "")
+    # ── columna ★ Favoritos — herramienta operativa de supervisión:
+    # Paolo arrastra tarjetas de cualquier medio; es la ÚNICA columna
+    # que acepta drops. Personal: cada supervisor ve las suyas ──
+    if sup:
+        fav_posts = [p for p in posts
+                     if email in (p.get("favoritos") or [])][:80]
+        fav_cards = "".join(
+            _pub_card(p, email, cfg, ret='/redaccion')
+            for p in fav_posts) or (
+            "<p class='meta red-fav-empty'>arrastra notas aquí "
+            "o usa la ☆ de cada tarjeta</p>")
+        fav_col = (
+            "<div class='red-col red-favcol' data-area='favoritos'>"
+            "<h2><span class='red-nom'>★ Favoritos</span>"
+            f" <span class='meta red-n' style='font-weight:400'>"
+            f"{len(fav_posts)}</span></h2>"
+            f"<div class='posts'>{fav_cards}</div></div>")
+        if "favoritos" in orden:
+            fpos = orden.index("favoritos")
+            ins = sum(1 for a in areas
+                      if a.get("id") in orden
+                      and orden.index(a["id"]) < fpos)
+        else:
+            ins = 0
+        cols.insert(min(ins, len(cols)), fav_col)
     # barra de acciones del tablero: selección múltiple → compartir
     # (copia enlaces al portapapeles) / asignar (N notas × M
     # colaboradores × evento opcional, creable al vuelo)
@@ -11979,6 +12023,7 @@ def vista_redaccion(email: str) -> str:
             "c.addEventListener('dragend',function(){"
             "c.classList.remove('drag');_guardarOrden()});"
             "c.addEventListener('dragover',function(e){"
+            "if(!_drag)return;"
             "e.preventDefault();"
             "var r=this.getBoundingClientRect();"
             "board.insertBefore(_drag,(e.clientX-r.left)>r.width/2?"
@@ -12080,6 +12125,75 @@ def vista_redaccion(email: str) -> str:
             "document.addEventListener('click',function(e){"
             "var d=document.getElementById('red-asig');"
             "if(d&&d.open&&!d.contains(e.target))d.open=false;});"
+            # favoritos: arrastre de tarjetas → solo la columna
+            # ★ Favoritos acepta drops (herramienta de supervisión)
+            "var _cardPid=null;"
+            "var _favc=document.querySelector("
+            "'.red-col[data-area=favoritos]');"
+            "document.addEventListener('dragstart',function(e){"
+            "var card=e.target.closest&&e.target.closest('.red-post');"
+            "if(!card||card.getAttribute('draggable')!=='true'){"
+            "_cardPid=null;return;}"
+            "e.stopPropagation();_drag=null;"
+            "if(e.target.closest("
+            "'a,button,summary,input,select,textarea')){"
+            "_cardPid=null;return;}"
+            "_cardPid=card.id.slice(2);"
+            "e.dataTransfer.effectAllowed='copy';"
+            "card.classList.add('drag-card');},true);"
+            "document.addEventListener('dragend',function(e){"
+            "var card=e.target.closest&&e.target.closest('.red-post');"
+            "if(card)card.classList.remove('drag-card');"
+            "_cardPid=null;},true);"
+            "function _favSync(){if(!_favc)return;"
+            "var n=_favc.querySelectorAll('.posts .red-post').length;"
+            "var t=_favc.querySelector('.red-n');if(t)t.textContent=n;}"
+            "function _favAdd(pid){if(!_favc)return;"
+            "var posts=_favc.querySelector('.posts');"
+            "if(!posts||posts.querySelector('#p-'+pid))return;"
+            "var card=document.getElementById('p-'+pid);"
+            "if(!card)return;"
+            "posts.insertBefore(card.cloneNode(true),posts.firstChild);"
+            "var emp=posts.querySelector('.red-fav-empty');"
+            "if(emp)emp.remove();_favSync();}"
+            "if(_favc){"
+            "_favc.addEventListener('dragover',function(e){"
+            "if(!_cardPid)return;"
+            "e.preventDefault();e.stopPropagation();"
+            "e.dataTransfer.dropEffect='copy';"
+            "_favc.classList.add('drop-ok');},true);"
+            "_favc.addEventListener('dragleave',function(){"
+            "_favc.classList.remove('drop-ok')});"
+            "_favc.addEventListener('drop',function(e){"
+            "if(!_cardPid)return;"
+            "e.preventDefault();e.stopPropagation();"
+            "_favc.classList.remove('drop-ok');"
+            "var pid=_cardPid;"
+            "fetch('/redaccion/favorito',{method:'POST',"
+            "headers:{'Content-Type':'application/x-www-form-urlencoded'"
+            "},body:'id='+pid+'&op=add'});"
+            "[].forEach.call(document.querySelectorAll("
+            "'.red-star[data-pid=\"'+pid+'\"]'),function(b){"
+            "b.classList.add('on');b.textContent='★';});"
+            "_favAdd(pid)});}"
+            # estrella ☆/★ por tarjeta — mismo toggle sin arrastrar
+            "document.addEventListener('click',function(e){"
+            "var st=e.target.closest&&e.target.closest('.red-star');"
+            "if(!st)return;"
+            "var pid=st.dataset.pid;var on=st.classList.contains('on');"
+            "fetch('/redaccion/favorito',{method:'POST',"
+            "headers:{'Content-Type':'application/x-www-form-urlencoded'"
+            "},body:'id='+pid+'&op='+(on?'del':'add')});"
+            "[].forEach.call(document.querySelectorAll("
+            "'.red-star[data-pid=\"'+pid+'\"]'),function(b){"
+            "b.classList.toggle('on',!on);"
+            "b.textContent=on?'☆':'★';});"
+            "if(!_favc)return;"
+            "var posts=_favc.querySelector('.posts');"
+            "if(!posts)return;"
+            "var c=posts.querySelector('#p-'+pid);"
+            "if(on){if(c)c.remove();_favSync();}"
+            "else{_favAdd(pid);}});"
             "</script>" + _RED_POLL_JS.replace("CTX", "tablero"))
 
 
@@ -12538,6 +12652,19 @@ def aplicar_accion_redaccion(ruta: str, form: dict, email: str) -> str:
                 p2.setdefault("asignaciones", []).append({
                     "para": para, "por": email, "ts": ts_a,
                     "estado": "pendiente", "nota": nota})
+        _reescribir_publicaciones(posts)
+        return volver or "/redaccion"
+
+    if ruta.endswith("/favorito"):
+        # ★ personal de supervisión — la columna Favoritos del tablero
+        if not es_supervisor(email, cfg):
+            return "/area"
+        favs = p.setdefault("favoritos", [])
+        if form.get("op", ["add"])[0] == "del":
+            if email in favs:
+                favs.remove(email)
+        elif email not in favs:
+            favs.append(email)
         _reescribir_publicaciones(posts)
         return volver or "/redaccion"
 
@@ -14979,7 +15106,8 @@ def servir_web(puerto: int):
                 self.send_header("Location", destino)
                 self.end_headers()
                 return
-            if ruta.path in ("/redaccion/asignar",
+            if ruta.path in ("/redaccion/favorito",
+                             "/redaccion/asignar",
                              "/redaccion/asignacion",
                              "/redaccion/comentar",
                              "/redaccion/orden",
