@@ -78,6 +78,30 @@ Nota: records `mail`, `ftp`, `cpanel`, `webmail`, `webdisk`, `whm`, `cpcalendars
   parecían fuera de lugar). Ahora muestra `dd/mm/yy` fuera del
   año actual.
 
+## Sesión 2026-11-22 — Redacción colaborativa (feed interno por áreas)
+
+- [x] Publicación interna sin scraping: cada área de com. social
+  (prensa, tv, radio, redes, digital — `config.json → redaccion.areas`)
+  tiene colaboradores que publican nota + foto/video/PDF (subida o
+  enlace) + ubicación + flag URGENTE
+- [x] `/redaccion` — vista supervisión (Paolo/admin): columnas por
+  área, scroll horizontal, marca interés, asigna seguimiento a
+  cualquier usuario con nota
+- [x] `/area` — vista colaborador: publicar (multipart), feed de su
+  área, avisos (asignaciones pendientes + interés), feed general,
+  historial propio; puede cerrar asignaciones que le tocaron
+- [x] Persistencia: `redaccion.jsonl` + `redaccion_media/` (máx 40 MB
+  por archivo, solo jpg/png/gif/webp/mp4/webm/mov/m4v/pdf)
+- [x] `/media/<archivo>` servido con auth (invitados demo fuera)
+- [x] Nav: link "Redacción" para supervisión, "Mi área" para
+  colaboradores (se oculta a guests)
+- [ ] Asignar colaboradores reales a cada área (`miembros` en config
+  o `area` en su perfil de usuarios.json)
+- [ ] Notificaciones por correo/WhatsApp de asignaciones (hoy solo
+  badge en pestaña Avisos)
+- [ ] Pausar/desactivar el scraper de fondos si el producto migra a
+  solo-redacción (decisión de producto pendiente)
+
 ## Nice to have
 
 - [ ] Resúmenes con Ollama activados (`--resumir`, necesita ollama corriendo)

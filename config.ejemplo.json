@@ -35,5 +35,17 @@
   "gemini": {
     "api_key": "",
     "modelo": "gemini-3.1-flash-lite"
+  },
+  "redaccion": {
+    "areas": [
+      { "id": "tv", "nombre": "TV", "miembros": [] },
+      { "id": "radio", "nombre": "Radio", "miembros": [] },
+      { "id": "facebook", "nombre": "Facebook", "miembros": [] },
+      { "id": "x", "nombre": "X", "miembros": [] },
+      { "id": "instagram", "nombre": "Instagram", "miembros": [] },
+      { "id": "tiktok", "nombre": "TikTok", "miembros": [] },
+      { "id": "prensa", "nombre": "Prensa", "miembros": ["colaborador@correo.com"] },
+      { "id": "prensa_digital", "nombre": "Prensa digital", "miembros": [] }
+    ]
   }
 }

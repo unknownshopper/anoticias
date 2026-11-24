@@ -38,3 +38,15 @@ porrico_bottom.png
 # reportes generados y datos runtime locales
 auditoria_tsjt.html
 demo_ips.json
+
+# redacción colaborativa — publicaciones y media subidos
+redaccion.jsonl
+redaccion_media/
+redaccion_efrain_backup.jsonl
+
+# equipo/chat/asistente — datos privados de usuarios, no subir
+chats.json
+chat_msg.jsonl
+asistente_*.json
+seguimientos.jsonl
+sesiones_*.json

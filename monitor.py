@@ -40,8 +40,12 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote, urljoin, unquote
 import urllib.robotparser as robotparser
 
+import email as email_mod
 import feedparser
+import imaplib
 import requests
+from email.header import decode_header
+from email.utils import parsedate_to_datetime
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 socket.setdefaulttimeout(20)  # feedparser no trae timeout; evita que se cuelgue
@@ -174,11 +178,24 @@ def password_valida(email: str, pw: str, cfg: dict) -> bool:
 
 
 def home_usuario(email: str) -> str:
-    """Landing del perfil — 'home' en usuarios.json (p. ej. '/interes'
-    para quien solo consume la lista judicial). Solo rutas internas."""
-    home = (cargar_usuarios().get(email) or {}).get("home", "")
-    return home if home.startswith("/") and not home.startswith("//") \
-        else "/noticias"
+    """Landing del perfil — 'home' en usuarios.json manda; si no, el
+    producto redacción: supervisión → tablero de columnas, colaborador
+    → su área; el resto cae al monitor de prensa clásico."""
+    if "@demo.local" in email:
+        return "/redaccion"   # invitado: deck en solo lectura
+    prof = cargar_usuarios().get(email) or {}
+    home = prof.get("home", "")
+    if home.startswith("/") and not home.startswith("//"):
+        return home
+    try:
+        cfg = json.loads(CONFIG.read_text())
+    except Exception:
+        cfg = {}
+    if es_supervisor(email, cfg):
+        return "/redaccion"
+    if area_de_usuario(email, cfg):
+        return "/area"
+    return "/noticias"
 
 
 def resolver_usuario(headers, cfg: dict) -> str:
@@ -467,6 +484,8 @@ def url_https(url: str) -> str:
 _RL_HITS: dict = {}
 _RL_SKIP_IPS: set = set()
 _RL_SKIP_MT: float = 0
+_RL_AUTO: set = set()   # IPs que ya hicieron login exitoso en esta
+                        # sesión del proceso — exentas del rate limit
 
 
 def ratelimit_ok(ip: str, limite: int = 120, ventana: int = 60) -> bool:
@@ -481,7 +500,7 @@ def ratelimit_ok(ip: str, limite: int = 120, ventana: int = 60) -> bool:
                                .get("ratelimit_skip") or [])
     except Exception:
         pass
-    if ip in _RL_SKIP_IPS:
+    if ip in _RL_SKIP_IPS or ip in _RL_AUTO:
         return True
     ahora = time.time()
     hits = [t for t in _RL_HITS.get(ip, []) if ahora - t < ventana]
@@ -694,6 +713,84 @@ def _llm(cfg: dict, prompt: str, timeout: int = 120) -> str:
         return r.json().get("response", "").strip()
     except Exception as e:
         return f"(no se pudo resumir: {e})"
+
+
+def _gemini_transcribir(cfg: dict, ruta, mime: str) -> str:
+    """Transcripción de audio/video con Gemini multimodal (inline,
+    ≤18 MB). Devuelve el texto hablado o ''."""
+    key = _gemini_key(cfg)
+    if not key or ruta.stat().st_size > 18 * 1024 * 1024:
+        return ""
+    data = base64.b64encode(ruta.read_bytes()).decode()
+    prompt = ("Transcribe este audio/video en español. Devuelve SOLO "
+              "el texto hablado; si es largo, con marcas de tiempo "
+              "aproximadas. Si no hay voz, describe brevemente el "
+              "contenido en una línea.")
+    modelos = [cfg.get("gemini", {}).get("modelo_transcripcion",
+                                        cfg["gemini"].get(
+                                            "modelo", "")),
+               "gemini-2.5-flash", "gemini-2.0-flash"]
+    for modelo in modelos:
+        if not modelo:
+            continue
+        try:
+            r = requests.post(
+                "https://generativelanguage.googleapis.com/v1beta/"
+                f"models/{modelo}:generateContent",
+                params={"key": key},
+                json={"contents": [{"parts": [
+                    {"inline_data": {"mime_type": mime, "data": data}},
+                    {"text": prompt}]}]},
+                timeout=180)
+            parts = (r.json()["candidates"][0]["content"]
+                     .get("parts") or [])
+            txt = "".join(p.get("text", "") for p in parts
+                          if not p.get("thought")).strip()
+            if txt:
+                return txt
+        except Exception as e:
+            print(f"[transcribir] {modelo}: {e}")
+    return ""
+
+
+def _transcribir_adjuntos(cfg: dict, pid: str):
+    """Background: transcribe los adjuntos audio/video de una
+    publicación y guarda el texto en media[].texto (reescribe el
+    jsonl). Se llama en thread al publicar."""
+    posts = cargar_publicaciones()
+    p = next((x for x in posts if x.get("id") == pid), None)
+    if not p:
+        return
+    cambio = False
+    for m in p.get("media") or []:
+        if m.get("tipo") not in ("audio", "video") or m.get("texto"):
+            continue
+        src = m.get("src", "")
+        fp = RED_MEDIA / Path(src).name if src.startswith("/media/") \
+            else None
+        if not fp or not fp.is_file():
+            continue
+        mime = CTYPE_POR_EXT.get(fp.suffix.lower(),
+                                 "application/octet-stream")
+        txt = _gemini_transcribir(cfg, fp, mime)
+        # fallback: wav/ogg que el modelo no trague → mp3 con ffmpeg
+        if not txt and fp.suffix.lower() not in (".mp3", ".mp4", ".m4a"):
+            try:
+                tmp = fp.with_suffix(".mp3")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(fp), "-vn",
+                     "-acodec", "libmp3lame", "-q:a", "4",
+                     str(tmp)], check=True,
+                    capture_output=True, timeout=120)
+                txt = _gemini_transcribir(cfg, tmp, "audio/mpeg")
+            except Exception as e:
+                print(f"[transcribir] ffmpeg {fp.name}: {e}")
+        if txt:
+            m["texto"] = txt[:4000]
+            cambio = True
+            print(f"[transcribir] {pid}: {len(txt)} chars")
+    if cambio:
+        _reescribir_publicaciones(posts)
 
 
 def resumir_ollama(cfg: dict, titulo: str, resumen: str) -> str:
@@ -1366,7 +1463,7 @@ def _texto_pdf(titulo: str, subtitulo: str, cuerpo: str) -> bytes:
     buf = io.BytesIO()
     paginas[0].save(buf, "PDF", save_all=True,
                     append_images=paginas[1:], title=titulo,
-                    author="@noticias", creator="Olmeca Code")
+                    author="@noticias", creator="PIRIA")
     for im in paginas:
         im.close()
     return buf.getvalue()
@@ -1628,8 +1725,13 @@ def _scrapear_x_posts(handle: str) -> list:
     # cuenta (técnica acordada 22/oct — una carga de página por pasada)
     buscar = handle.lower().startswith("buscar:")
     es_home = handle.lower() == "home"
+    es_media = handle.lower().startswith("media:")
     if buscar:
         target = "https://x.com/search?q=" + quote(handle[7:]) + "&f=live"
+    elif es_media:
+        # pestaña Media: solo tweets CON foto — para portadas da ~4x
+        # más profundidad que el perfil (que mezcla retweets y texto)
+        target = f"https://x.com/{handle[6:]}/media"
     else:
         target = ("https://x.com/home" if es_home
                 else f"https://x.com/{handle}")
@@ -1781,6 +1883,92 @@ def _feed_x(url: str, cfg: dict) -> list:
             if p.get("_autor", "").lstrip("@").lower() in permitidos]
 
 
+def _correo_entradas(cfg: dict, st: dict) -> list:
+    """Buzón IMAP como fuente (9/nov): las alertas automáticas que
+    llegan por correo — Grok en X, Google Alerts… — entran al
+    pipeline normal (dedup, reglas, correos a operadores).
+
+    Lectura readonly por UID creciente: nada se marca leído ni se
+    borra, y st['imap_uid'] recuerda dónde quedó la última pasada.
+    Devuelve [] si el buzón está vacío o deshabilitado, None si el
+    login/la red falló."""
+    im = cfg.get("correo_lectura") or {}
+    if not (im.get("habilitado") and im.get("usuario")
+            and im.get("password")):
+        return []
+    try:
+        M = imaplib.IMAP4_SSL(im.get("host", "imap.gmail.com"),
+                              int(im.get("puerto", 993)))
+        M.login(im["usuario"], im["password"])
+        M.select(im.get("carpeta", "INBOX"), readonly=True)
+        desde = (datetime.now() - timedelta(days=3)).strftime(
+            "%d-%b-%Y")
+        _, data = M.uid("search", None, f"(SINCE {desde})")
+        ids = data[0].split()[-50:]
+        ult = int(st.get("imap_uid") or 0)
+        if not ult and ids:
+            # baseline: primera pasada solo siembra el UID — el buzón
+            # lleva correos viejos que no son alertas nuestras
+            st["imap_uid"] = int(ids[-1])
+            M.logout()
+            return []
+        rems = [s.lower() for s in im.get("remitentes", [])]
+        asunto_rx = (re.compile(im["asunto"], re.I)
+                     if im.get("asunto") else None)
+        ents, nuevo_ult = [], ult
+        for uid in ids:
+            u = int(uid)
+            if u <= ult:
+                continue
+            nuevo_ult = max(nuevo_ult, u)
+            _, msg = M.uid("fetch", uid, "(RFC822)")
+            m = email_mod.message_from_bytes(msg[0][1])
+            de = (m.get("From") or "").lower()
+            if rems and not any(s in de for s in rems):
+                continue
+            subj = "".join(
+                t.decode(cs or "utf-8", "replace")
+                if isinstance(t, bytes) else t
+                for t, cs in decode_header(m.get("Subject") or ""))
+            if asunto_rx and not asunto_rx.search(subj):
+                continue
+            cuerpo = ""
+            for parte in m.walk():
+                ct = parte.get_content_type()
+                if ct in ("text/plain", "text/html") and not cuerpo:
+                    cuerpo = (parte.get_payload(decode=True) or b"")\
+                        .decode(parte.get_content_charset("utf-8"),
+                                "replace")
+            cuerpo = re.sub(r"<[^>]+>", " ", cuerpo)
+            cuerpo = html.unescape(re.sub(r"\s+", " ", cuerpo))[:900]
+            links = [l for l in re.findall(
+                r'https?://[^\s"<>()\[\]]+', cuerpo)
+                if not re.search(
+                    r"unsubscribe|mailto|schema\.org|w3\.org", l, re.I)]
+            try:
+                pp = parsedate_to_datetime(m.get("Date"))\
+                    .timetuple()
+            except Exception:
+                pp = None
+            if not links:
+                links = [f"imap:{u}"]   # correo sin link rastreable
+            for lnk in dict.fromkeys(links):
+                h = re.search(
+                    r"(?:x|twitter)\.com/([A-Za-z0-9_]{1,20})/status",
+                    lnk)
+                ents.append({"link": lnk.split(",")[0].rstrip(".);"),
+                             "title": subj.strip() or "Alerta correo",
+                             "summary": cuerpo,
+                             "published_parsed": pp,
+                             "_autor": f"@{h[1]}" if h else ""})
+        M.logout()
+        st["imap_uid"] = nuevo_ult
+        return ents
+    except Exception as e:
+        print(f"[!] correo_lectura: {e}")
+        return None
+
+
 def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
     vistos = cargar_vistos()
     usuarios = cargar_usuarios()
@@ -1801,12 +1989,15 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
     delay = cfg.get("delay_fuentes", 1)
     agent = cfg.get(
         "user_agent",
-        "OlmecaCode-Monitor/1.0 (+mailto:the@unknownshoppers.com)")
+        "PIRIA-Monitor/1.0 (+mailto:the@unknownshoppers.com)")
     # X con ritmo propio: ~6 handles × Playwright cada 15 min era
     # mucho desgaste de sesión/CPU — pasa cada 30 min; el resto del
     # ciclo (RSS) sigue a los 15
     global _ULT_X, _X_ESP
-    # intervalo jittered 45-75 min — metrónomo exacto es huella de bot
+    # intervalo jittered 45-75 min (~cada hora) — metrónomo exacto
+    # es huella de bot. 9/nov: se probó 20-35min de día para alertas
+    # más rápidas pero se revirtió — el riesgo de rate-limit/ban en
+    # la cuenta no vale la velocidad extra
     correr_x = now - _ULT_X >= _X_ESP
     if correr_x:
         _ULT_X = now
@@ -1875,6 +2066,15 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
                         r"<[^>]+>", " ",
                         p.get("excerpt", {}).get("rendered", "")),
                     "published_parsed": pp})
+            st["ok"] += 1
+            st["ultimo_ok"] = datetime.now().isoformat(timespec="seconds")
+        elif fuente.get("tipo") == "imap":
+            # buzón de alertas (Grok/GA) — solo corre si correo_lectura
+            # está configurado; buzón vacío no es error
+            entradas = _correo_entradas(cfg, st)
+            if entradas is None:
+                st["err"] += 1
+                continue
             st["ok"] += 1
             st["ultimo_ok"] = datetime.now().isoformat(timespec="seconds")
         elif fuente.get("tipo") == "x":
@@ -1961,7 +2161,8 @@ def revisar(cfg: dict, mostrar_todo: bool, resumir: bool) -> int:
             # real — 'X · Siguiendo' queda como agregador en 'via'.
             # TODO pasa a la base (los ~1200 follows = radar para
             # alertas/Interés); el tab /x filtra por x_permitidos
-            if fuente.get("tipo") == "x" and entrada.get("_autor"):
+            if fuente.get("tipo") in ("x", "imap") \
+                    and entrada.get("_autor"):
                 medio = entrada["_autor"]
             if "news.google.com" in fuente["url"]:
                 src = entrada.get("source") or {}
@@ -3020,22 +3221,57 @@ def _bajar_portada_x(m: dict) -> list:
     """X: media del tweet de HOY (@xevtfm publica su plana ahí cuando
     su FB tarda). Sesión x_session.json; la img del DOM viene chica —
     pedir name=large. published_parsed es UTC → fecha local."""
-    handle = str(m.get("x", "")).lstrip("@").strip()
-    if not handle or not X_SESSION.exists():
+    handles = [h.lstrip("@").strip()
+               for h in str(m.get("x", "")).split(",") if h.strip()]
+    if not handles or not X_SESSION.exists():
         return []
-    try:
-        posts = _scrapear_x_posts(handle)
-    except Exception:
-        return []
+    # profundidad (5/nov): en cuentas que tuitean cada pocos minutos
+    # (xevtfm ~6/h) el tweet de portada queda a >30 posts del perfil —
+    # 1) búsqueda 'from:handle' con términos de plana llega horas atrás;
+    # 2) pestaña /media = solo tweets con foto (~4x más alcance);
+    # 3) perfil como último recurso
+    # handles alternos por coma (9/nov): XEVT a veces publica su plana
+    # en @EmmanuelSibilla (su dueño) — se agota cada handle antes de
+    # pasar al siguiente; el primero con plana usable gana
     hoy = datetime.now().date()
+    for handle in handles:
+        fuentes = (
+            f'buscar:from:{handle} portada OR "primera plana"'
+            ' OR contraportada OR "edicion impresa"'
+            ' OR "edicion digital"',
+            f"media:{handle}",
+            handle)
+        for src in fuentes:
+            try:
+                posts = _scrapear_x_posts(src)
+            except Exception:
+                continue
+            imgs = _portada_imgs_de_posts(m, handle, posts, hoy)
+            if imgs:
+                return imgs
+    return []
+
+
+def _portada_imgs_de_posts(m: dict, handle: str,
+                           posts: list, hoy) -> list:
+    """Filtra posts del autor de hoy y baja las imágenes que pasen los
+    candados de portada (texto que anuncie plana o imagen con formato
+    y densidad de primera)."""
     imgs = []
     for p_ in posts:
         if p_.get("_autor", "").lower() != f"@{handle}".lower():
             continue                    # retweets/ads
         pp = p_.get("published_parsed")
-        if not pp or datetime.fromtimestamp(
-                calendar.timegm(pp)).date() != hoy:
-            continue                    # solo tweets de hoy
+        if not pp:
+            continue
+        # posts de hoy o desde el mediodía de ayer — varios medios
+        # (Jaguar/LaDenuncia ~23:2x) tuitean la plana la víspera;
+        # la pasada de 01:00 los junta con los de las 7am (7/nov)
+        dt = datetime.fromtimestamp(calendar.timegm(pp))
+        if dt.date() != hoy and dt < datetime.combine(
+                hoy - timedelta(days=1), datetime.min.time()) \
+                .replace(hour=12):
+            continue
         # el medio tuitea titulares con foto todo el día — sin este
         # candado entraban memes/comunicados/fotos de nota como
         # 'portada' (16/oct: Levi's, FGET, gato). Pasa si el texto
@@ -4129,7 +4365,8 @@ def _captura_medio(m: dict, base: Path, tardia: bool,
             if not data:
                 print(f"[fb] {m['nombre']}: sin portada usable "
                       "(sin post de hoy o 0 imágenes bajadas)")
-        if m.get("x") and not data:
+        if m.get("x") and not data and _x_pasada_activa(
+                (cfg or {}).get("portadas") or {}):
             data = _bajar_portada_x(m)
             src_fb = bool(data)   # media social: mismo filtro
             if not data:
@@ -4581,7 +4818,11 @@ def capturar_portadas(cfg: dict):
         # indexación de FB y es lo que quemó a juan
         intervalo = (stamps.get(base.name + "_j", 30) if es_fb
                      else _cada_efectivo(m, port, ahora))
-        if (ahora - ult).total_seconds() < intervalo * 60:
+        # pasada X activa: los medios-x no esperan su intervalo —
+        # si el throttle los brincara, la pasada correría vacía
+        pasada_x = m.get("x") and _x_pasada_activa(port, ahora_m)
+        if not pasada_x and \
+                (ahora - ult).total_seconds() < intervalo * 60:
             continue   # le toca más tarde
         stamps[base.name] = ahora.isoformat()
         if es_fb:
@@ -4613,6 +4854,13 @@ def capturar_portadas(cfg: dict):
     if est.get("salud", {}).get("fecha") != ahora.strftime("%Y-%m-%d"):
         est["salud"] = _salud_fuentes(cfg, ahora)
         _guardar_portadas(est)
+        # auditoría de operadores: se regeneraba a mano y quedaba
+        # congelada (2/nov) — misma cadencia diaria que la salud
+        try:
+            subprocess.run([sys.executable, str(BASE / "gen_auditoria.py")],
+                           timeout=120)
+        except Exception:
+            pass
     escribir_schedule_portadas(cfg)   # refresca línea de tiempo
 
 
@@ -4873,7 +5121,7 @@ def _armar_pdf_portadas(medios: list, sec: str, dia,
         title=f"Portadas {sec.capitalize()} — {f.strftime('%d/%m/%Y')}",
         author="@noticias", subject="Portadas de medios impresos",
         keywords="portadas, prensa, Tabasco, monitoreo de medios",
-        creator="Olmeca Code")
+        creator="PIRIA")
     for i in imgs:
         i.close()
     return buf.getvalue(), fallos
@@ -4983,7 +5231,7 @@ def _ventana_medio(m: dict, port: dict) -> tuple:
     # desde madrugada sin riesgo de agarrar la edición vieja
     impresa = any(m.get(k) for k in
                   ("kiosko", "fb", "issuu", "flip", "pr", "pdf",
-                   "edicion", "json", "calameo", "flowpaper"))
+                   "edicion", "json", "calameo", "flowpaper", "x"))
     desde = _min(m.get("cap_desde") or port.get("hora_desde", "00:30"))
     hasta = _min(m.get("cap_hasta") or port.get("hora_cierre")
                  or port.get("hora_pdf", "06:30"))
@@ -4993,13 +5241,44 @@ def _ventana_medio(m: dict, port: dict) -> tuple:
     return desde, hasta
 
 
+def _x_pasada_activa(port: dict, ahora_m: int = None) -> bool:
+    """Compuerta X (5/nov): los medios con vía 'x' solo se intentan
+    durante las pasadas configuradas en port.x_pasadas — cada marca
+    abre una ventana de ~20 min (5 antes, 15 después). Fuera de ahí
+    no se gasta sesión de X en reintentos que darían lo mismo:
+    la búsqueda 'from:' y la pestaña /media ya llegan horas atrás."""
+    pasadas = port.get("x_pasadas") or []
+    if not pasadas:
+        return True      # sin config → comportamiento de siempre
+    if ahora_m is None:
+        ahora = datetime.now()
+        ahora_m = ahora.hour * 60 + ahora.minute
+    for h in pasadas:
+        try:
+            hh, mm = map(int, str(h).split(":"))
+        except Exception:
+            continue
+        marca = hh * 60 + mm
+        if marca - 5 <= ahora_m <= marca + 15:
+            return True
+    return False
+
+
 def _en_ventana(m: dict, port: dict, ahora_m: int) -> bool:
     # pausa de un solo día (ej. el medio no publicó hoy) — la fecha
     # vencida queda inerte, no hay que quitarla
     if m.get("skip_hoy") == datetime.now().strftime("%Y-%m-%d"):
         return False
     desde, hasta = _ventana_medio(m, port)
-    return desde <= ahora_m <= hasta
+    if desde <= ahora_m <= hasta:
+        return True
+    # pasada X posterior al cap_hasta (ej. la marca de las 08:45):
+    # medios con vía x pendientes entran un rato más aunque su ventana
+    # ya cerró — última chance de captura antes de que acabe el día
+    if m.get("x") and ahora_m > hasta and \
+            _x_pasada_activa(port, ahora_m):
+        return True
+    return False
 
 
 def _reglas_medio(m: dict) -> str:
@@ -5010,6 +5289,8 @@ def _reglas_medio(m: dict) -> str:
         r.append("JPG fechado de hoy/ayer en Kiosko")
     if m.get("fb"):
         r.append("Post de hoy con texto 'portada/edición'")
+    if m.get("x"):
+        r.append("Tweet de hoy con media (solo en pasadas X)")
     if m.get("issuu"):
         r.append("Doc más reciente del perfil Issuu")
     if m.get("flip"):
@@ -5419,12 +5700,14 @@ def toca_captura_portadas(cfg: dict) -> bool:
     if not medios or not _dia_portadas(port):
         return False
     ahora = datetime.now()
+    ahora_m = ahora.hour * 60 + ahora.minute
     cierre = max(_hhmm(port, "hora_cierre", "08:45"),
                  _hora_pdf_hoy(port, ahora))
-    if not (_hhmm(port, "hora_desde", "00:30")
-            <= ahora.hour * 60 + ahora.minute < cierre):
+    # la pasada X de cierre (ej. 08:45) corre aunque hora_cierre ya
+    # haya llegado — es justo la última oportunidad del día
+    if not (_hhmm(port, "hora_desde", "00:30") <= ahora_m < cierre) \
+            and not _x_pasada_activa(port, ahora_m):
         return False
-    ahora_m = ahora.hour * 60 + ahora.minute
     tardia = ahora_m >= _hhmm(port, "hora_web", "05:45")
     est = cargar_json(ESTADO_PORTADAS, {})
     stamps = est.get("cap_medios", {})
@@ -5967,7 +6250,8 @@ PAGINA = """<!DOCTYPE html>
 <!--email_off-->   <!-- Cloudflare: NO ofuscar correos (los ve el admin) -->
 <html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="60">
+<!-- refresh automático desactivado (22/nov): la redacción usa
+     polling inteligente; si se reactiva, restaurar el meta tag -->
 <meta name="theme-color" content="#1a237e">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -6018,6 +6302,7 @@ PAGINA = """<!DOCTYPE html>
   nav input {{ padding: .55rem .7rem; border-radius: 6px; border: none;
               font-size: 1rem; flex: 1; min-width: 0; }}
   main {{ max-width: 900px; margin: 0 auto; padding: 1rem; }}
+  main.wide {{ max-width: none; padding: 1rem 1.2rem; }}
 
   /* Tarjeta = área de toque completa (dedos, no mouse) */
   .card {{ display: block; background: #fff; border-left: 5px solid #d32f2f;
@@ -6300,6 +6585,60 @@ PAGINA = """<!DOCTYPE html>
       font-size: .72rem; font-weight: 600; text-transform: uppercase;
       letter-spacing: .03em; padding: .3rem .7rem; border-radius: 14px; }}
   .chip-trend:hover {{ background: #6a1b9a; }}
+  /* ── tema espacial Trillian ── */
+  body {{ background: #04050d; color: #dfe4ff; }}
+  body::before {{ content: ''; position: fixed; inset: 0; z-index: -2;
+    pointer-events: none;
+    background:
+      radial-gradient(ellipse 80% 55% at 70% -10%, #1a237e55, transparent 60%),
+      radial-gradient(ellipse 60% 45% at 10% 110%, #4a148c44, transparent 60%),
+      linear-gradient(180deg, #05060f 0%, #0a0e24 55%, #04050d 100%); }}
+  body::after {{ content: ''; position: fixed; inset: 0; z-index: -1;
+    pointer-events: none; opacity: .8;
+    background-image:
+      radial-gradient(1px 1px at 12% 22%, #ffffffcc 50%, transparent 51%),
+      radial-gradient(1.4px 1.4px at 68% 12%, #9fd8ff88 50%, transparent 51%),
+      radial-gradient(1px 1px at 84% 64%, #ffffffbb 50%, transparent 51%),
+      radial-gradient(2px 2px at 32% 78%, #b388ff66 50%, transparent 51%),
+      radial-gradient(1px 1px at 55% 45%, #ffffffaa 50%, transparent 51%),
+      radial-gradient(1.6px 1.6px at 8% 88%, #69f0ae66 50%, transparent 51%),
+      radial-gradient(1px 1px at 92% 30%, #ffffff99 50%, transparent 51%),
+      radial-gradient(1.2px 1.2px at 45% 8%, #ffd54f88 50%, transparent 51%);
+    background-size: 460px 460px, 560px 560px, 380px 380px,
+                     640px 640px, 520px 520px, 600px 600px,
+                     500px 500px, 720px 720px; }}
+  .card, nav, header, footer {{
+    background: rgba(13, 18, 48, .78) !important;
+    border-color: #2c3a72 !important; color: #dfe4ff;
+    backdrop-filter: blur(10px); }}
+  a {{ color: #8ab4ff; }}
+  a:hover {{ color: #c3d0ff; }}
+  .meta, .meta2, small {{ color: #9aa3c7 !important; }}
+  input[type=text], input[type=email], input[type=password],
+  input[type=search], textarea, select {{
+    background: #0d1330 !important; color: #eef1ff !important;
+    border-color: #33415f !important; }}
+  ::-webkit-scrollbar-thumb {{ background: #2c3a72; }}
+  .tema-btn {{ background: rgba(255,255,255,.07); border: 1px solid #3a4a80;
+    color: #cfd6ff; border-radius: 8px; width: 30px; height: 30px;
+    cursor: pointer; font-size: .95rem; line-height: 1; }}
+  .tema-btn:hover {{ border-color: #7c4dff; box-shadow: 0 0 10px #7c4dff55; }}
+  /* tema claro — revierte el espacio al look clásico claro */
+  html.tema-claro body {{ background: #f6f7f9; color: #222; }}
+  html.tema-claro body::before, html.tema-claro body::after {{ display: none; }}
+  html.tema-claro .card, html.tema-claro nav, html.tema-claro header,
+  html.tema-claro footer {{ background: #fff !important;
+    border-color: #ddd !important; color: #222; backdrop-filter: none; }}
+  html.tema-claro a {{ color: #1a237e; }}
+  html.tema-claro .meta, html.tema-claro .meta2, html.tema-claro small {{
+    color: #666 !important; }}
+  html.tema-claro input[type=text], html.tema-claro input[type=email],
+  html.tema-claro input[type=password], html.tema-claro input[type=search],
+  html.tema-claro textarea, html.tema-claro select {{
+    background: #fff !important; color: #222 !important;
+    border-color: #ccc !important; }}
+  html.tema-claro .tema-btn {{ background: #fff; border-color: #ccc;
+    color: #1a237e; }}
 </style></head><body>
 <nav>
   <div class="nav-top">
@@ -6310,21 +6649,20 @@ PAGINA = """<!DOCTYPE html>
       <button>Buscar</button>
     </form>
     <span class="nav-user" title="{usuario}">{usuario_html}</span>
+    <button id="tema-toggle" class="tema-btn" title="Cambiar tema">◐</button>
     <a href="/salir" class="salir-top" title="Cerrar sesión">salir</a>
   </div>
   <div class="nav-tabs">
-    <a href="/noticias">Noticias</a>
-    <a href="/alertas">Alertas</a>
-    <a href="/portadas">Portadas</a>
+    {tabs_base}
     {tabs_reg}
     {admin_tabs}
   </div>
 </nav>
-<main>
+<main{main_cls}>
 {contenido}
 </main>
 <div id="loader"><div class="card"><div class="spinner"></div><div class="txt" id="loader-txt">Cargando...</div></div></div>
-<footer><a href="/acerca" class="about">@</a> <a href="https://olmecacode.pages.dev/" class="about" target="_blank" rel="noopener" title="Olmeca Code">OC</a></footer>
+<footer><a href="/acerca" class="about">@</a> <a href="https://unknownshopper.github.io/PIRIA" class="about" target="_blank" rel="noopener" title="PIRIA">PIRIA</a></footer>
 <script>
 function showLoader(msg) {{
   var l = document.getElementById('loader');
@@ -6382,6 +6720,14 @@ if (_tabs && _activo) {{
     _tabs.addEventListener(ev, _rearmarNav, {{passive: true}});
   }});
 }}
+// alto del nav fijo → los encabezados sticky (columnas del deck en
+// móvil) se acomodan justo debajo sin taparse
+var _navEl = document.querySelector('nav');
+function _navH() {{
+  if (_navEl) document.documentElement.style.setProperty(
+    '--navh', _navEl.offsetHeight + 'px');
+}}
+_navH(); addEventListener('resize', _navH);
 // Contador en el ícono anclado (Badging API; solo aplica si la PWA
 // está instalada en el menú de inicio — en navegador normal se ignora)
 // + globito por tab con notas nuevas desde la última visita a cada una
@@ -6400,6 +6746,77 @@ fetch("/badge").then(r => r.json()).then(d => {{
     }}
   }});
 }}).catch(() => {{}});
+</script>
+<script>
+/* toggle de tema — oscuro espacial por defecto, 'claro' revierte;
+   persiste en localStorage del navegador */
+(function(){{
+  var k='tema@noticias';
+  if(localStorage.getItem(k)==='claro')document.documentElement.classList.add('tema-claro');
+  var b=document.getElementById('tema-toggle');
+  if(b)b.addEventListener('click',function(){{
+    var c=document.documentElement.classList.toggle('tema-claro');
+    localStorage.setItem(k,c?'claro':'oscuro');
+  }});
+}})();
+</script>
+<script>
+/* .media-strip (miniaturas de las tarjetas):
+   - arrastrar con el mouse mueve el scroll horizontal
+   - la rueda del mouse sobre la tira scrollea en horizontal */
+document.addEventListener('pointerdown',function(e){{
+  var s=e.target.closest('.media-strip');if(!s)return;
+  var sx=e.clientX,sl=s.scrollLeft,drag=false;
+  function mv(ev){{
+    var dx=ev.clientX-sx;
+    if(Math.abs(dx)>4){{drag=true;s.classList.add('dragging')}}
+    if(drag)s.scrollLeft=sl-dx;}}
+  function up(){{
+    s.classList.remove('dragging');
+    document.removeEventListener('pointermove',mv);
+    document.removeEventListener('pointerup',up);}}
+  document.addEventListener('pointermove',mv);
+  document.addEventListener('pointerup',up);
+}});
+document.addEventListener('wheel',function(e){{
+  var s=e.target.closest('.media-strip');if(!s)return;
+  if(Math.abs(e.deltaY)>Math.abs(e.deltaX)){{
+    e.preventDefault();s.scrollLeft+=e.deltaY;}}}},
+  {{passive:false}});
+// menú compartir (.compartirc): el dropdown vive dentro de la tarjeta
+// que está dentro de .posts con overflow → se recorta. Al abrirlo lo
+// movemos a <body> como position:fixed junto al botón: ya no hay
+// contenedor que lo corte. Se cierra con click fuera o al hacer scroll.
+document.addEventListener('toggle',function(e){{
+  var d=e.target;
+  if(!d.classList||!d.classList.contains('compartirc'))return;
+  var m=d.querySelector('.menu-share');if(!m)return;
+  if(d.open){{
+    var s=d.querySelector('summary').getBoundingClientRect();
+    m.style.cssText='position:fixed;z-index:9999;display:flex;';
+    document.body.appendChild(m);
+    var mh=m.offsetHeight;
+    var top=s.bottom+6;
+    if(top+mh>innerHeight-8)top=Math.max(8,s.top-mh-6);
+    m.style.top=top+'px';
+    m.style.left=Math.max(8,Math.min(s.left,innerWidth-262))+'px';
+  }}else{{
+    m.style.display='none';
+    if(m.parentNode!==d)d.appendChild(m);
+  }}
+}},true);
+document.addEventListener('click',function(e){{
+  document.querySelectorAll('details.compartirc[open]').forEach(
+    function(d){{
+      var m=d.querySelector('.menu-share');
+      if((m&&m.contains(e.target))||d.contains(e.target))return;
+      d.open=false;
+    }});
+}},true);
+addEventListener('scroll',function(){{
+  document.querySelectorAll('details.compartirc[open]').forEach(
+    function(d){{d.open=false}});
+}},true);
 </script>
 </body></html>"""
 
@@ -6491,6 +6908,15 @@ LOGIN = """<!DOCTYPE html>
   .inv button { background: none; border: 1px solid #1a237e;
                 color: #1a237e; font-weight: 500; }
   .error { color: #c62828; font-size: .9rem; margin-bottom: .8rem; }
+  .demo { margin-top: 1.6rem; text-align: left; }
+  .demo h3 { font-size: .78rem; color: #888; text-transform: uppercase;
+             letter-spacing: .06em; margin: 0 0 .5rem; font-weight: 600; }
+  .demo-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .4rem; }
+  .demo-grid button { background: #eef1f8; color: #1a237e; font-weight: 500;
+                      font-size: .82rem; padding: .55rem .4rem; margin: 0;
+                      border: 1px solid #d5d9ec; border-radius: 8px;
+                      min-height: 0; }
+  .demo-grid button:hover { background: #1a237e; color: #fff; }
   .pie { color: #c3c9d4; font-size: .8rem; margin-top: 2.5rem; }
 </style></head><body>
 <div class="login">
@@ -6507,15 +6933,19 @@ LOGIN = """<!DOCTYPE html>
   <form class="inv" method="post" action="/invitado">
     <button>Entrar como invitado</button>
   </form>
-  <p class="pie">Powered by <a href="https://olmecacode.pages.dev/" target="_blank" rel="noopener" style="color:#c3c9d4">Olmeca Code</a></p>
+  {demo}
+  <p class="pie">Powered by <a href="https://unknownshopper.github.io/PIRIA" target="_blank" rel="noopener" style="color:#c3c9d4">PIRIA</a></p>
 </div>
 </body></html>"""
 
 
 def vista_login(base: str, error: str = "") -> bytes:
     err = (f"<p class='error'>{html.escape(error)}</p>" if error else "")
+    # la grilla de acceso rápido quedó fuera — era para la demo con
+    # gente inventada; el login es email + password
     return (LOGIN.replace("{error}", err)
-                 .replace("{base}", base)).encode()
+                 .replace("{base}", base)
+                 .replace("{demo}", "")).encode()
 
 
 def badge_count(email: str) -> int:
@@ -8907,8 +9337,12 @@ def busqueda_deep(q: str, ya: set) -> list:
 def vista_buscar(q: str, email: str, deep: bool = False) -> str:
     agujas = _agujas_buscar(q)      # AND; "frase entre comillas" exacta
     cfg = json.loads(CONFIG.read_text())
+    # usuarios del panel de redacción: la búsqueda es solo contenido
+    # propio + alertas — nada de corpus del monitor ni consultas WP
+    en_red = ("@demo.local" in (email or "")
+              or es_supervisor(email, cfg) or area_de_usuario(email, cfg))
     vis = fuentes_visibles(perfil_usuario(email, cfg), cfg)
-    notas_txt = _notas_texto(vis)   # cache mtime — la parte lenta
+    notas_txt = [] if en_red else _notas_texto(vis)   # cache mtime
     noticias = [n for n, _ in notas_txt]
     alertas = [a for a in leer_jsonl(ALERTAS)
                if not a.get("usuario") or a["usuario"] == email]
@@ -8918,12 +9352,22 @@ def vista_buscar(q: str, email: str, deep: bool = False) -> str:
         termino_en(t, normalizar(a["titulo"] + " " + a["reglas"]
                                  + " " + (a.get("autor") or "")))
         for t in agujas)]
+    # redacción interna: las notas de los colaboradores también se
+    # buscan — para el equipo, la nota propia es el resultado clave
+    pubs = [p for p in cargar_publicaciones()
+            if all(termino_en(t, normalizar(
+                " ".join([p.get("titulo") or "", p.get("resumen") or "",
+                          p.get("texto") or "", p.get("nombre") or ""])))
+                for t in agujas)]
     # si la alerta ya está como noticia en resultados, no duplicar
     links_n = {n["link"] for n in hits_n}
     hits_a = [a for a in hits_a if a["link"] not in links_n]
-    # archivo vivo de los medios (WP): pesca notas que el feed no trajo
-    vivos = busqueda_viva_wp(q, cfg, links_n | {a["link"] for a in hits_a}) \
-        if q.strip() else []
+    # archivo vivo de los medios (WP): pesca notas que el feed no trajo.
+    # Solo para el monitor viejo — en redacción la búsqueda debe ser
+    # instantánea (las notas propias + alertas, sin salir a la web)
+    vivos = ([] if en_red or not q.strip() else
+             busqueda_viva_wp(q, cfg,
+                              links_n | {a["link"] for a in hits_a}))
     vivo_html = "".join(
         f"<div class='card'><a href='/nota?u={quote(h['link'], safe='')}'>"
         f"{html.escape(h['titulo'])}</a>"
@@ -8942,6 +9386,14 @@ def vista_buscar(q: str, email: str, deep: bool = False) -> str:
         f"<div class='meta'>{html.escape(h['fuente'])}"
         f"{' · ' + h['fecha'] if h['fecha'] else ''} · web externa ↗</div>"
         f"</div>" for h in externos)
+    # resultados de redacción — van primero: son contenido propio
+    pub_html = "".join(
+        f"<div class='card'><a href='/redaccion/nota?id={p.get('id')}'>"
+        f"{html.escape((p.get('titulo') or p.get('texto') or '')[:90])}"
+        f"</a><div class='meta'>"
+        f"{html.escape(p.get('nombre') or _red_nombre(p.get('usuario','')))}"
+        f" · {fmt_fecha(p.get('ts',''))} · nota de redacción →</div>"
+        f"</div>" for p in pubs)
     colores = {r["nombre"]: r.get("color", "") for r in perfil_usuario(email, cfg).get("reglas", [])}
     chips = trending_chips(noticias)
     regresar = (f"<a class='chip-trend' href='/noticias' "
@@ -8962,9 +9414,12 @@ def vista_buscar(q: str, email: str, deep: bool = False) -> str:
                 f"← solo base local</button></a></p>")
     return (f"<h1>Buscar: {html.escape(q)}</h1>"
             f"{trending}"
-            f"<p class='meta'>{len(hits_n)} notas · {len(hits_a)} alertas"
+            f"<p class='meta'>{len(pubs)} redacción · {len(hits_n)} "
+            f"notas · {len(hits_a)} alertas"
             f" · frase exacta: \"entre comillas\"</p>"
             f"{btn_deep}"
+            + (f"<h2>Redacción ({len(pubs)})</h2>" + pub_html
+               if pubs else "")
             + "".join(card for _, card in sorted(
                 [(a["fecha"], tarjeta_alerta(a, colores)) for a in hits_a]
                 + [(n["fecha"], tarjeta_noticia(n)) for n in hits_n],
@@ -9753,10 +10208,47 @@ LANDING = """<!DOCTYPE html>
 </body></html>"""
 
 
+MANTENIMIENTO = """<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1a237e">
+<link rel="icon" type="image/png" href="/icon3.png">
+<title>@noticias — Mantenimiento</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; margin: 0; min-height: 100vh;
+         background: #f6f7f9; display: flex; align-items: center;
+         justify-content: center; padding: 1rem; }
+  .box { width: 100%; max-width: 380px; text-align: center;
+         background: #fff; border: 1px solid #e4e6ef;
+         border-radius: 16px; padding: 2.6rem 1.6rem;
+         box-shadow: 0 10px 30px rgba(26,35,126,.07); }
+  .logo { font-size: 2.6rem; font-weight: 800; color: #1a237e;
+          letter-spacing: -.02em; margin: 0 0 .4rem; }
+  h1 { font-size: 1.05rem; color: #333; margin: .6rem 0 .4rem; }
+  p { color: #777; font-size: .9rem; line-height: 1.55; margin: 0 0 1.6rem; }
+  a.btn { display: inline-block; padding: .85rem 2.2rem; background: #1a237e;
+          color: #fff; border-radius: 10px; text-decoration: none;
+          font-weight: 600; font-size: 1rem; }
+  a.btn:hover { background: #283593; }
+  .pie { color: #c3c9d4; font-size: .75rem; margin-top: 2rem; }
+</style></head><body>
+<div class="box">
+  <p class="logo">@noticias</p>
+  <h1>Sitio en mantenimiento</h1>
+  <p>Estamos trabajando para mejorar el servicio.<br>
+     Vuelve en unos minutos.</p>
+  <a class="btn" href="/login">Entrar</a>
+  <p class="pie">Powered by PIRIA</p>
+</div>
+</body></html>"""
+
+
 def vista_landing(base: str) -> bytes:
-    """Landing pública — el pitch para prospectos. Reemplaza al login
-    como cara del sitio para quien llega sin sesión."""
-    return LANDING.replace("{base}", base).encode()
+    """Raíz pública — por ahora página de mantenimiento con acceso
+    directo al login (el producto es interno, la landing de ventas
+    queda fuera mientras dure la demo)."""
+    return MANTENIMIENTO.encode()
 
 
 def vista_instructivo(base: str) -> bytes:
@@ -10304,7 +10796,7 @@ def vista_acerca() -> str:
 <p class="meta">Síntesis de prensa digital con alertas en tiempo real.<br>
 Hecho con: 1 archivo Python + feedparser + requests + JSONL en disco.
 Mucho con muy poco.<br>
-Powered by <a href="https://olmecacode.pages.dev/" target="_blank" rel="noopener"><strong>Olmeca Code</strong></a>.</p>
+Powered by <a href="https://unknownshopper.github.io/PIRIA" target="_blank" rel="noopener"><strong>PIRIA</strong></a>.</p>
 
 <div class="card top">
   <span class="titulo">Arquitectura</span>
@@ -10545,8 +11037,2461 @@ def vista_analitica() -> str:
             f"de links compartidos.</p>{panel}{cuerpo}")
 
 
+# ===================== REDACCIÓN — feed interno por áreas =====================
+# Modelo @Noticias colaborativo: cada área de comunicación social
+# (prensa, tv, radio, redes, digital…) tiene colaboradores que
+# publican notas con foto/video/enlace/location/urgente. Paolo
+# (supervisión) ve todo en columnas; cada área ve su feed + el
+# general, con avisos de asignaciones e interés. No hay scraping:
+# el contenido lo suben los humanos.
+REDACCION = BASE / "redaccion.jsonl"      # publicaciones internas
+RED_MEDIA = BASE / "redaccion_media"      # archivos subidos
+MEDIA_MAX = 40 * 1024 * 1024              # 40 MB por archivo
+TIPO_POR_EXT = {**{e: "img" for e in
+                   (".jpg", ".jpeg", ".png", ".gif", ".webp")},
+                **{e: "video" for e in (".mp4", ".webm", ".mov",
+                                        ".m4v")},
+                **{e: "audio" for e in (".mp3", ".ogg", ".wav",
+                                        ".m4a", ".aac")},
+                ".pdf": "doc"}
+MIME_POR_EXT = {"image/jpeg": ".jpg", "image/png": ".png",
+                "image/gif": ".gif", "image/webp": ".webp",
+                "video/mp4": ".mp4", "video/webm": ".webm",
+                "video/quicktime": ".mov", "application/pdf": ".pdf",
+                "audio/mpeg": ".mp3", "audio/ogg": ".ogg",
+                "audio/wav": ".wav", "audio/x-wav": ".wav",
+                "audio/mp4": ".m4a", "audio/aac": ".aac"}
+CTYPE_POR_EXT = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                 ".png": "image/png", ".gif": "image/gif",
+                 ".webp": "image/webp", ".mp4": "video/mp4",
+                 ".webm": "video/webm", ".mov": "video/quicktime",
+                 ".m4v": "video/mp4", ".pdf": "application/pdf",
+                 ".mp3": "audio/mpeg", ".ogg": "audio/ogg",
+                 ".wav": "audio/wav", ".m4a": "audio/mp4",
+                 ".aac": "audio/aac"}
+
+
+def _red_cfg(cfg: dict) -> dict:
+    return cfg.get("redaccion") or {}
+
+
+def areas_redaccion(cfg: dict) -> list:
+    """Áreas en config.json → redaccion.areas
+    [{id, nombre, miembros:[emails]}]."""
+    return _red_cfg(cfg).get("areas") or []
+
+
+def areas_de_usuario(email: str, cfg: dict) -> list:
+    """TODAS las áreas del usuario (multi-rol): perfil 'area'/'areas'
+    (str o lista) + cada área que lo liste en 'miembros'."""
+    perfil = cargar_usuarios().get(email) or {}
+    areas = areas_redaccion(cfg)
+    aids = set(perfil.get("areas") or [])
+    aid = perfil.get("area")
+    if isinstance(aid, list):
+        aids.update(aid)
+    elif aid:
+        aids.add(aid)
+    return [a for a in areas
+            if a.get("id") in aids or email in (a.get("miembros") or [])]
+
+
+def area_de_usuario(email: str, cfg: dict):
+    """Primera área del usuario (compat) — ver areas_de_usuario."""
+    areas = areas_de_usuario(email, cfg)
+    return areas[0] if areas else None
+
+
+def _red_nombre(email: str) -> str:
+    u = cargar_usuarios().get(email) or {}
+    return u.get("nombre") or email.split("@")[0]
+
+
+def _post_id() -> str:
+    return ("r" + datetime.now().strftime("%Y%m%d%H%M%S")
+            + secrets.token_hex(3))
+
+
+def cargar_publicaciones() -> list:
+    """Más reciente primero."""
+    return sorted(leer_jsonl(REDACCION),
+                  key=lambda p: p.get("ts", ""), reverse=True)
+
+
+def _guardar_publicacion(p: dict):
+    RED_MEDIA.mkdir(exist_ok=True)
+    with REDACCION.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(p, ensure_ascii=False) + "\n")
+
+
+def _reescribir_publicaciones(posts: list):
+    tmp = REDACCION.with_suffix(".tmp")
+    tmp.write_text("".join(
+        json.dumps(p, ensure_ascii=False) + "\n" for p in posts),
+        encoding="utf-8")
+    tmp.replace(REDACCION)
+
+
+SEGUIMIENTOS = BASE / "seguimientos.jsonl"   # eventos de bitácora
+
+
+def cargar_seguimientos() -> list:
+    """Más reciente primero."""
+    return sorted(leer_jsonl(SEGUIMIENTOS),
+                  key=lambda s: s.get("ts", ""), reverse=True)
+
+
+def _guardar_seguimiento(s: dict):
+    with SEGUIMIENTOS.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(s, ensure_ascii=False) + "\n")
+
+
+def _reescribir_seguimientos(ss: list):
+    tmp = SEGUIMIENTOS.with_suffix(".tmp")
+    tmp.write_text("".join(
+        json.dumps(s, ensure_ascii=False) + "\n" for s in ss),
+        encoding="utf-8")
+    tmp.replace(SEGUIMIENTOS)
+
+
+def _usuarios_reales() -> list:
+    """[(email, nombre)] de usuarios reales (sin demo), ordenados."""
+    return sorted(
+        ((e, (u.get("nombre") or e.split("@")[0]))
+         for e, u in cargar_usuarios().items()
+         if e and "@demo.local" not in e),
+        key=lambda t: t[1].lower())
+
+
+def parse_multipart(cuerpo: bytes, boundary: str) -> dict:
+    """multipart/form-data mínimo → {campo: [(filename, content_type,
+    bytes)]}. filename='' en campos de texto."""
+    sep = ("--" + boundary).encode()
+    campos = {}
+    for trozo in cuerpo.split(sep):
+        if not trozo or trozo in (b"--", b"--\r\n"):
+            continue
+        trozo = trozo.strip(b"\r\n")
+        if not trozo or trozo == b"--":
+            continue
+        head, _, data = trozo.partition(b"\r\n\r\n")
+        if not data:
+            continue
+        if data.endswith(b"\r\n"):
+            data = data[:-2]
+        disp = ctype = ""
+        for ln in head.decode("utf-8", "replace").split("\r\n"):
+            low = ln.lower()
+            if low.startswith("content-disposition"):
+                disp = ln
+            elif low.startswith("content-type"):
+                ctype = ln.split(":", 1)[1].strip()
+        m = re.search(r'name="([^"]+)"', disp)
+        if not m:
+            continue
+        fm = re.search(r'filename="([^"]*)"', disp)
+        campos.setdefault(m.group(1), []).append(
+            (fm.group(1) if fm else "", ctype, data))
+    return campos
+
+
+def _guardar_media(post_id: str, idx: int, filename: str,
+                   ctype: str, data: bytes):
+    """Adjunto → redaccion_media/; devuelve {src,tipo,nombre} o None."""
+    if not data or len(data) > MEDIA_MAX:
+        return None
+    ctype = ctype.split(";")[0].strip().lower()
+    ext = MIME_POR_EXT.get(ctype, "")
+    if not ext:
+        _, _, e = filename.rpartition(".")
+        e = ("." + e.lower()) if e else ""
+        ext = e if e in TIPO_POR_EXT else ""
+    if not ext:
+        return None
+    nombre = f"{post_id}_{idx}{ext}"
+    (RED_MEDIA / nombre).write_bytes(data)
+    return {"src": f"/media/{nombre}", "tipo": TIPO_POR_EXT[ext],
+            "nombre": filename or nombre}
+
+
+def _thumb_src(src: str) -> str:
+    """Miniatura cacheada (~360px) para adjuntos /media/ de imagen.
+    Las tarjetas del deck cargan el thumb en vez del original —
+    las portadas pesan ~800KB y sin thumb el scroll se arrastra."""
+    if not src.startswith("/media/"):
+        return src
+    nombre = Path(src[len("/media/"):]).name
+    ext = Path(nombre).suffix.lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"):
+        return src
+    thumb_dir = RED_MEDIA / "_thumbs"
+    thumb = thumb_dir / f"{Path(nombre).stem}_s{ext}"
+    if not thumb.is_file():
+        try:
+            thumb_dir.mkdir(exist_ok=True)
+            from PIL import Image
+            im = Image.open(RED_MEDIA / nombre)
+            im.thumbnail((360, 360))
+            if im.mode in ("RGBA", "P", "LA") \
+                    and ext in (".jpg", ".jpeg"):
+                im = im.convert("RGB")
+            im.save(thumb, quality=72)
+        except Exception:
+            return src
+    return f"/media/_thumbs/{thumb.name}"
+
+
+def _media_html(media: list, compact: bool = False,
+                nota_url: str = "") -> str:
+    out = []
+    strip = []   # buffer de miniaturas — en modo compacto van todas a
+                 # una tira con scroll horizontal: la tarjeta no crece
+                 # sin importar cuántas imágenes tenga la nota
+
+    def flush():
+        if strip:
+            out.append("<div class='media-strip'>"
+                       + "".join(strip) + "</div>")
+            strip.clear()
+
+    for m in media or []:
+        src = html.escape(m.get("src", ""), quote=True)
+        if not src:
+            continue
+        if m.get("tipo") == "video":
+            poster = m.get("poster") or ""
+            if compact and poster:
+                # tarjeta: poster como miniatura en la tira; el video
+                # completo vive en la nota
+                psrc = html.escape(_thumb_src(poster), quote=True)
+                strip.append(
+                    f"<a href='{nota_url or src}' target='_blank' "
+                    f"rel='noopener'><img src='{psrc}' loading='lazy' "
+                    f"style='width:120px;height:120px;object-fit:cover;"
+                    f"border-radius:8px;display:block'></a>")
+            elif compact:
+                flush()
+                out.append(f"<video src='{src}' controls preload='none' "
+                           f"style='max-width:200px;max-height:140px;"
+                           f"border-radius:8px;margin:.3rem 0 0 0;"
+                           f"background:#000'></video>")
+            else:
+                flush()
+                out.append(f"<video src='{src}' controls preload='metadata' "
+                           f"poster='{html.escape(poster, quote=True)}' "
+                           f"style='max-width:100%;border-radius:8px;"
+                           f"margin:.3rem 0;background:#000'></video>")
+        elif m.get("tipo") == "audio":
+            flush()
+            # radio/podcast: el reproductor + el texto de la tarjeta
+            # da el contexto de a qué pertenece el audio
+            out.append(
+                f"<div style='background:rgba(124,77,255,.12);border:"
+                f"1px solid #3a4a80;border-radius:10px;"
+                f"padding:.45rem .6rem;margin:.35rem 0'>"
+                f"<div class='meta' style='font-size:.62rem;margin-bottom:"
+                f".2rem'>♪ audio — {html.escape(m.get('nombre') or 'clip')}</div>"
+                f"<audio src='{src}' controls preload='none' "
+                f"style='width:100%;height:32px'></audio></div>")
+        # transcripción del adjunto (si el LLM ya la generó)
+        if m.get("texto"):
+            flush()
+            out.append(
+                f"<details style='margin-top:.3rem'><summary style='"
+                f"font-size:.68rem;cursor:pointer;color:#666'>"
+                f"transcripción</summary><div style='white-space:"
+                f"pre-wrap;font-size:.75rem;background:rgba(0,0,0,.3);"
+                f"border-left:3px solid #7c4dff;padding:.4rem .6rem;"
+                f"margin-top:.25rem;border-radius:0 8px 8px 0'>"
+                f"{html.escape(m['texto'])}</div></details>")
+        elif m.get("tipo") == "doc":
+            flush()
+            out.append(f"<a href='{src}' target='_blank' "
+                       f"rel='noopener' style='font-size:.8rem'>"
+                       f"ver archivo adjunto →</a>")
+        elif m.get("tipo") in (None, "", "img"):
+            if compact:
+                isrc = html.escape(_thumb_src(src), quote=True)
+                strip.append(f"<a href='{src}' target='_blank' "
+                             f"rel='noopener'><img src='{isrc}' "
+                             f"loading='lazy' "
+                             f"style='width:120px;height:120px;object-fit:"
+                             f"cover;border-radius:8px;display:block'></a>")
+            else:
+                flush()
+                out.append(f"<a href='{src}' target='_blank' "
+                           f"rel='noopener'><img src='{src}' "
+                           f"loading='lazy' "
+                           f"style='max-width:220px;max-height:220px;"
+                           f"border-radius:8px;margin:.3rem .3rem 0 0;"
+                           f"object-fit:cover'></a>")
+    flush()
+    return "".join(out)
+
+
+def _area_icono(aid: str, size: int = 11) -> str:
+    """Icono SVG por medio — sustituye el texto del área en tarjetas
+    y encabezados para no repetir 'INSTAGRAM'/'FACEBOOK' en cada post."""
+    s = f"width='{size}' height='{size}'"
+    sw = "stroke='currentColor' fill='none' stroke-width='1.4'"
+    paths = {
+        "tv": (f"<svg viewBox='0 0 16 16' {s}><rect x='1.5' y='2.5' "
+               f"width='13' height='9' rx='1.5' {sw}/>"
+               f"<path d='M6 5.5l4.5 2.5L6 10.5z' fill='currentColor'/></svg>"),
+        "radio": (f"<svg viewBox='0 0 16 16' {s}><circle cx='8' cy='11' "
+                  f"r='1.3' fill='currentColor'/><path d='M4.6 9.6a5 5 0 "
+                  f"017 0M2.6 7.2a8 8 0 0111 0' stroke='currentColor' "
+                  f"fill='none' stroke-width='1.3' stroke-linecap='round'/>"
+                  f"</svg>"),
+        "facebook": (f"<svg viewBox='0 0 16 16' {s}><text x='8' y='12.5' "
+                     f"font-size='12' font-weight='700' text-anchor='middle' "
+                     f"fill='currentColor'>f</text></svg>"),
+        "x": (f"<svg viewBox='0 0 16 16' {s}><text x='8' y='12.5' "
+              f"font-size='11' font-weight='700' text-anchor='middle' "
+              f"fill='currentColor'>𝕏</text></svg>"),
+        "instagram": (f"<svg viewBox='0 0 16 16' {s}><rect x='1.8' y='1.8' "
+                      f"width='12.4' height='12.4' rx='3.5' {sw}/>"
+                      f"<circle cx='8' cy='8' r='3' {sw}/>"
+                      f"<circle cx='11.6' cy='4.4' r='.9' fill='currentColor'/>"
+                      f"</svg>"),
+        "tiktok": (f"<svg viewBox='0 0 16 16' {s}><text x='8' y='12.5' "
+                   f"font-size='11' font-weight='700' text-anchor='middle' "
+                   f"fill='currentColor'>♪</text></svg>"),
+        "prensa": (f"<svg viewBox='0 0 16 16' {s}><rect x='1.5' y='3' "
+                   f"width='13' height='10' rx='1' {sw}/>"
+                   f"<path d='M4 6.5h8M4 9h8M4 11.5h5' stroke='currentColor' "
+                   f"stroke-width='1.2' stroke-linecap='round'/></svg>"),
+        "prensa_digital": (f"<svg viewBox='0 0 16 16' {s}><rect x='1.5' "
+                           f"y='2.5' width='13' height='8.5' rx='1' {sw}/>"
+                           f"<path d='M5.5 14h5M8 11v3' stroke='currentColor' "
+                           f"stroke-width='1.3' stroke-linecap='round'/>"
+                           f"<circle cx='8' cy='6.8' r='2' {sw}/>"
+                           f"</svg>"),
+    }
+    return paths.get(aid, paths["prensa"])
+
+
+def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
+              ) -> str:
+    """Tarjeta de publicación — la usan la vista supervisor (columnas)
+    y la vista de área. Acciones: interés (todos los usuarios reales),
+    asignar (solo supervisión), marcar asignación hecha/pendiente
+    (supervisión o el asignado)."""
+    area = next((a for a in areas_redaccion(cfg)
+                 if a.get("id") == p.get("area")), {})
+    anombre = html.escape(area.get("nombre") or p.get("area") or "?")
+    urgente = ("<span style='background:#b03a2e;color:#fff;font-size:"
+               ".62rem;font-weight:700;border-radius:8px;padding:1px 7px;"
+               "margin-left:.4rem'>URGENTE</span>" if p.get("urgente")
+               else "")
+    sup = es_supervisor(email, cfg)
+    ia_btn = (f"<a class='rb-ia' href='/asistente/nota?id={p.get('id')}' "
+              f"title='Contexto IA de esta nota'>✦</a>" if sup else "")
+    meta = (f"<span class='chip-fuente' title='{anombre}' "
+            f"style='font-size:.6rem;padding:1px 6px;display:inline-flex;"
+            f"align-items:center'>"
+            f"{_area_icono(p.get('area',''))}</span> "
+            f"{html.escape(p.get('nombre') or _red_nombre(p.get('usuario','')))} · "
+            f"{fmt_fecha(p.get('ts',''))}{urgente}{ia_btn}"
+            f"{(' · 💬' + str(len(p.get('comentarios') or []))) if p.get('comentarios') else ''}")
+    # la tarjeta es solo titular + resumen (2 líneas) — la cuartilla
+    # completa vive en /redaccion/nota
+    titulo_c = (p.get("titulo") or "").strip()
+    resumen_c = (p.get("resumen") or "").strip()
+    if not resumen_c:
+        resumen_c = re.sub(r"\s+", " ", p.get("texto", "")).strip()
+    cuerpo = (f"<div class='red-tit'>{html.escape(titulo_c)}</div>"
+              f"<div class='red-snip'>{html.escape(resumen_c)}</div>"
+              if titulo_c else
+              f"<div class='red-snip'>{html.escape(resumen_c)}</div>")
+    # el enlace externo ya no se muestra en la tarjeta — vive en la
+    # vista de nota; aquí solo queda el botón compartir
+    loc = p.get("location") or ""
+    loc_h = (f"<div class='meta' style='font-size:.72rem;margin-top:.3rem'>"
+             f"ubicación: {html.escape(loc)}</div>" if loc else "")
+    nota_url = (f"/redaccion/nota?id={p.get('id')}" if p.get("id") else "")
+    media_h = _media_html(p.get("media"), compact=True,
+                          nota_url=nota_url)
+
+    # ── acciones ──
+    sup = es_supervisor(email, cfg)
+    interes = p.get("interes") or []
+    mio = email in interes
+    ico_bookmark = ("<svg viewBox='0 0 16 16' width='11' height='11'>"
+                    "<path d='M3 1.5h10a.5.5 0 01.5.5v12.2a.2.2 0 01-.32.16"
+                    "L8 11.1l-5.18 3.26a.2.2 0 01-.32-.16V2a.5.5 0 01.5-.5z'/>"
+                    "</svg>")
+    pendientes = [a for a in (p.get("asignaciones") or [])
+                  if a.get("estado", "pendiente") == "pendiente"]
+    nombres_pend = ", ".join(
+        html.escape(_red_nombre(a.get("para", ""))) for a in pendientes)
+    badge_asig = (f"<b class='rb-n'>{len(pendientes)}</b>"
+                  if pendientes else "")
+    ico_doc = ("<svg viewBox='0 0 16 16' width='11' height='11'>"
+               "<path d='M4 1.5h5.5L13 5v9.5H4z'/><path d='M9.5 1.5V5H13'"
+               "/></svg>")
+    es_demo = "@demo.local" in (email or "")
+    pid = p.get("id")
+    ico_share = ("<svg viewBox='0 0 16 16' width='11' height='11'>"
+                 "<path d='M8 1.8v7.4M4.8 4.2L8 1l3.2 3.2M3.2 9.2v4.6"
+                 "h9.6V9.2' fill='none' stroke='currentColor' "
+                 "stroke-width='1.4' stroke-linecap='round' "
+                 "stroke-linejoin='round'/></svg>")
+    # "ver más" va junto al texto (debajo del resumen), no en la
+    # barra de acciones — despliega la cuartilla en la misma tarjeta
+    bloques_txt = [b.strip() for b in
+                   re.split(r"\n\s*\n", p.get("texto") or "")
+                   if b.strip()]
+    ver_mas = ""
+    if len(bloques_txt) > 1 or len(p.get("texto") or "") > 240:
+        ver_mas = ("<details class='red-mas'><summary class='red-mas-s' "
+                   "title='Leer la nota completa aquí'>ver más</summary>"
+                   "<div class='red-leido'>"
+                   + "".join("<p>" + html.escape(b).replace("\n", "<br>")
+                             + "</p>" for b in bloques_txt)
+                   + "</div></details>")
+
+    secundario = []
+    opciones = "".join(
+        f"<option value='{html.escape(e, quote=True)}'>"
+        f"{html.escape(_red_nombre(e))} ({html.escape(e)})</option>"
+        for e, _ in _usuarios_reales())
+    segs = cargar_seguimientos()
+    ops_ev = "".join(
+        f"<option value='{html.escape(s.get('id'), quote=True)}'"
+        f"{' selected' if p.get('evento') == s.get('id') else ''}>"
+        f"{html.escape(s.get('nombre', ''))}</option>"
+        for s in segs)
+    sel_ev = (f"<select name='evento' title='Evento / seguimiento' "
+              f"style='max-width:150px'><option value=''>sin evento"
+              f"</option>{ops_ev}</select>" if segs else "")
+    ico_asig = ("<svg viewBox='0 0 16 16' width='11' height='11'>"
+                "<circle cx='6' cy='4.8' r='2.6'/><path d='M1.8 13.2"
+                "c.5-2.3 2.2-3.7 4.2-3.7s3.7 1.4 4.2 3.7'/><path d='M11 "
+                "4.2v3M9.5 5.7h3'/></svg>")
+
+    # compartir = menú desplegable: copiar enlace + (solo supervisión)
+    # la opción de asignar seguimiento
+    menu_share = [
+        f"<button class='rb' style='height:22px;font-size:.68rem' "
+        f"onclick=\"navigator.clipboard.writeText(location.origin"
+        f"+'/redaccion/nota?id={pid}');this.textContent='✓ copiado'\">"
+        f"copiar enlace</button>"]
+    if sup:
+        menu_share.append(
+            f"<form method='post' action='/redaccion/asignar' "
+            f"class='rb-form'><input type='hidden' name='id' "
+            f"value='{p.get('id')}'>" f"<input type='hidden' name='volver' value='{ret}'>"
+            f"<select name='para'>{opciones}</select>"
+            f"<input name='nota' placeholder='nota para el asignado'>"
+            f"{sel_ev}"
+            f"<button class='rb' title='Asignar seguimiento"
+            f"{(' — pendientes: ' + nombres_pend) if pendientes else ''}'>"
+            f"{ico_asig} asignar{badge_asig}</button></form>")
+    compartir = ("<details class='rb-det compartirc'>"
+                 f"<summary class='rb' "
+                 f"title='Compartir / asignar'>{ico_share} compartir</summary>"
+                 "<div class='menu-share'>" + "".join(menu_share)
+                 + "</div></details>")
+
+    acciones = [
+        f"<a class='rb' href='/redaccion/nota?id={pid}' "
+        f"title='Ver la nota completa'>{ico_doc} ver noticia</a>",
+        compartir]
+    if not es_demo:
+        acciones.append(
+            f"<form method='post' action='/redaccion/interes' "
+            f"style='display:inline'>"
+            f"<input type='hidden' name='id' value='{p.get('id')}'>" f"<input type='hidden' name='volver' value='{ret}'>"
+            f"<button class='rb{' on' if mio else ''}' "
+            f"title='{'Quitar de' if mio else 'Agregar a'} mi lista de interés'>"
+            f"{ico_bookmark} interés "
+            f"{'<b>' + str(len(interes)) + '</b>' if interes else ''}"
+            f"</button></form>")
+
+    # ── asignaciones ──
+    asignaciones = p.get("asignaciones") or []
+    if asignaciones:
+        filas = []
+        for i, a in enumerate(asignaciones):
+            pend = a.get("estado", "pendiente") == "pendiente"
+            puede = sup or a.get("para") == email
+            toggle = (f"<form method='post' action='/redaccion/asignacion'"
+                      f" style='display:inline'><input type='hidden' "
+                      f"name='id' value='{p.get('id')}'>" f"<input type='hidden' name='volver' value='{ret}'>"
+                      f"<input type='hidden' name='idx' value='{i}'>"
+                      f"<input type='hidden' name='estado' value='"
+                      f"{'hecho' if pend else 'pendiente'}'>"
+                      f"<button class='rb' "
+                      f"style='font-size:.62rem;padding:2px 8px'>"
+                      f"{'✓ hecho' if pend else 'reabrir'}</button>"
+                      f"</form>" if puede else "")
+            filas.append(
+                f"<div style='font-size:.7rem;margin-top:.25rem'>"
+                f"→ <b>{html.escape(_red_nombre(a.get('para','')))}"
+                f"</b> · {fmt_fecha(a.get('ts',''))} · "
+                f"<span style='color:{'#b8860b' if pend else '#2e7d32'}'>"
+                f"{'pendiente' if pend else 'hecho'}</span> "
+                f"{html.escape(a.get('nota',''))} {toggle}</div>")
+        secundario.append("<div style='margin-top:.3rem'>"
+                          + "".join(filas) + "</div>")
+
+    # ── unirse al seguimiento: el colaborador SOLICITA; aprueba el
+    # autor de la nota, el creador del evento o supervisión ──
+    s_ev = next((s for s in segs if s.get("id") == p.get("evento")),
+                None)
+    involucr = (email == p.get("usuario")
+                or any(a.get("para") == email
+                       for a in (p.get("asignaciones") or []))
+                or email in ((s_ev or {}).get("miembros") or []))
+    sols_vivas = ([x for x in (p.get("solicitudes") or [])
+                   if x.get("estado") == "pendiente"]
+                  + [x for x in ((s_ev or {}).get("solicitudes") or [])
+                     if x.get("estado") == "pendiente"])
+    if not sup and not es_demo and not involucr and not any(
+            x.get("de") == email for x in sols_vivas):
+        acciones.append(
+            f"<form method='post' action='/redaccion/solicitar' "
+            f"style='display:inline'><input type='hidden' name='id' "
+            f"value='{p.get('id')}'>" f"<input type='hidden' name='volver' value='{ret}'>"
+            f"<button class='rb' style='border-style:dashed' "
+            f"title='Pedir unirte al seguimiento de esta nota'>"
+            "+ unirse</button></form>")
+    # solicitudes pendientes a nivel NOTA: las resuelve el autor o sup
+    for x in sols_vivas:
+        if x.get("de") == email:
+            continue
+        # solo las guardadas en la nota (no las del evento, esas van
+        # en la columna de bitácora)
+        if not any(y is x for y in (p.get("solicitudes") or [])):
+            continue
+        if not (sup or email == p.get("usuario")):
+            continue
+        secundario.append(
+            f"<div style='font-size:.72rem;margin-top:.3rem'>"
+            f"✋ {html.escape(_red_nombre(x.get('de','')))} pide unirse "
+            f"al seguimiento "
+            f"<form method='post' action='/redaccion/resolver' "
+            f"style='display:inline'><input type='hidden' name='id' "
+            f"value='{p.get('id')}'>" f"<input type='hidden' name='volver' value='{ret}'>"
+            f"<input type='hidden' name='de' "
+            f"value='{html.escape(x.get('de',''), quote=True)}'>"
+            f"<input type='hidden' name='op' value='aceptar'>"
+            f"<button class='rb' style='font-size:.62rem;padding:2px 8px'>"
+            f"✓ aceptar</button></form>"
+            f"<form method='post' action='/redaccion/resolver' "
+            f"style='display:inline'><input type='hidden' name='id' "
+            f"value='{p.get('id')}'>" f"<input type='hidden' name='volver' value='{ret}'>"
+            f"<input type='hidden' name='de' "
+            f"value='{html.escape(x.get('de',''), quote=True)}'>"
+            f"<input type='hidden' name='op' value='rechazar'>"
+            f"<button class='rb' style='font-size:.62rem;padding:2px 8px'>"
+            f"✗</button></form></div>")
+
+    sec = "".join(secundario)
+    return (f"<div class='red-post' id='p-{p.get('id')}' style='"
+            f"background:rgba(255,255,255,.05);border:1px solid #2c3a72;"
+            f"border-radius:10px;padding:.55rem .65rem;"
+            f"margin-bottom:.55rem'>"
+            f"<div class='meta' style='font-size:.68rem'>{meta}</div>"
+            f"<div style='font-size:.85rem;margin-top:.25rem'>{cuerpo}"
+            f"</div>{ver_mas}{media_h}{loc_h}"
+            f"<div class='red-act'>{''.join(acciones)}</div>"
+            + (f"<div class='red-sub'>{sec}</div>" if sec else "")
+            + "</div>")
+
+
+_RED_CSS = """
+<style>
+/* desktop: deck horizontal — las áreas son columnas de alto fijo;
+   la página NO scrollea vertical, cada columna scrollea sus posts
+   por dentro (estilo TweetDeck). Las columnas se reordenan arrastrando */
+.red-board{display:flex;gap:14px;overflow-x:auto;align-items:stretch;
+  height:calc(100vh - 185px);padding-bottom:6px;scrollbar-width:thin;
+  scrollbar-color:#2c3a72 transparent}
+.red-board::-webkit-scrollbar{height:6px}
+.red-board::-webkit-scrollbar-thumb{background:#2c3a72;
+  border-radius:3px}
+/* barra de desplazamiento horizontal propia, encima de los
+   encabezados — sincronizada con el scroll del board */
+.red-xbar{position:relative;height:10px;margin:2px 2px 8px;
+  border-radius:6px;background:rgba(255,255,255,.05);
+  border:1px solid #2c3a72;cursor:pointer;flex:none}
+.red-xbar .red-xthumb{position:absolute;top:1px;bottom:1px;left:0;
+  min-width:26px;border-radius:4px;
+  background:linear-gradient(90deg,#3949ab,#7c4dff);
+  box-shadow:0 0 8px #7c4dff66;touch-action:none}
+.red-xbar .red-xthumb:active{background:linear-gradient(90deg,
+  #5c6bc0,#9d7bff)}
+.red-col{background:rgba(15,20,52,.72);border:1px solid #2c3a72;
+  border-radius:12px;padding:10px;min-width:0;flex:0 0 340px;
+  display:flex;flex-direction:column;height:100%;
+  backdrop-filter:blur(10px);box-shadow:0 6px 24px #0006}
+.red-col.drag{opacity:.4}
+.red-col h2{font-size:.9rem;margin:.15rem 0 .6rem;flex:none;color:#eef1ff;
+  display:flex;align-items:center;gap:.4rem;cursor:pointer;
+  user-select:none}
+.red-col h2::before{content:'⠿';color:#4a5a9e;font-size:.9rem}
+.red-col h2::after{content:'◂';color:#8a93b8;font-size:.75rem;
+  transition:transform .15s}
+.red-col h2 .head-right{margin-left:auto;display:inline-flex;
+  align-items:center;gap:.4rem}
+.red-col h2 .area-ico{display:inline-flex;align-items:center;
+  color:#9aa3c7}
+.red-col.closed .posts{display:none}
+.red-col .posts{flex:1;overflow-y:auto;min-height:0}
+.red-col .posts::-webkit-scrollbar{width:8px}
+.red-col .posts::-webkit-scrollbar-thumb{background:#2c3a72;
+  border-radius:4px}
+.red-tabs{display:flex;gap:.4rem;margin:.4rem 0 .8rem;flex-wrap:wrap}
+.red-tabs a{font-size:.75rem;padding:3px 10px;border-radius:12px;
+  border:1px solid #33415f;text-decoration:none;color:#aeb8e8;
+  background:rgba(255,255,255,.04)}
+.red-tabs a.on{background:#3949ab;color:#fff;border-color:#5c6bc0}
+.red-form{background:rgba(15,20,52,.72);border:1px solid #2c3a72;
+  border-radius:12px;padding:.8rem;margin-bottom:1rem;max-width:640px}
+.red-form input[type=text],.red-form textarea,.red-form select{
+  width:100%;box-sizing:border-box;font-size:.85rem;padding:.4rem;
+  border:1px solid #33415f;border-radius:8px;margin:.25rem 0;
+  background:#0d1330;color:#eef1ff}
+.red-form textarea{min-height:90px;resize:vertical}
+/* feeds de una sola columna (/area): línea de lectura cómoda */
+.red-post{max-width:720px;position:relative}
+/* tarjeta con el menú compartir abierto: se eleva sobre las demás
+   para que el dropdown no quede tapado por la siguiente tarjeta */
+.red-post:has(.compartirc[open]){z-index:30}
+/* botones de acción de redacción */
+.rb{display:inline-flex;align-items:center;justify-content:center;
+  gap:4px;font-size:.72rem;padding:0 10px;height:26px;
+  border-radius:13px;border:1px solid #3a4a80;
+  background:rgba(255,255,255,.06);color:#cfd6ff;
+  cursor:pointer;line-height:1;font-family:inherit;white-space:nowrap;
+  text-decoration:none;vertical-align:middle;box-sizing:border-box;
+  backdrop-filter:blur(6px)}
+.rb:hover{border-color:#7c4dff;color:#fff;background:rgba(124,77,255,.18);
+  text-decoration:none;box-shadow:0 0 12px #7c4dff44}
+.rb.on{background:#3949ab;border-color:#7c4dff;color:#fff}
+.rb svg{display:block;flex:none}
+.rb-n{background:#b03a2e;color:#fff;border-radius:8px;padding:0 5px;
+  font-size:.62rem;font-weight:700;margin-left:2px;line-height:1.5}
+.rb-det{display:inline-block}
+.rb-det>summary{list-style:none}
+.rb-det>summary::-webkit-details-marker{display:none}
+.rb-form{display:flex;gap:.35rem;margin-top:.45rem;flex-wrap:wrap;
+  align-items:center}
+.rb-form select,.rb-form input{font-size:.75rem;padding:4px 6px;
+  border:1px solid #33415f;border-radius:8px;font-family:inherit;
+  background:#0d1330;color:#eef1ff}
+.rb-form input[name=nota]{width:130px}
+/* barra de acciones de la tarjeta: primaria en fila, detalles abajo */
+.red-act{display:flex;gap:.35rem;flex-wrap:wrap;align-items:center;
+  margin-top:.45rem}
+.red-act form{display:inline-flex;margin:0}
+.red-act .rb-det{margin:0}
+/* "ver más" junto al texto — expande la cuartilla en la tarjeta */
+.red-mas{margin:.2rem 0 .35rem}
+.red-mas>summary{list-style:none;cursor:pointer;font-size:.75rem;
+  color:#8ab4ff;display:inline-flex;align-items:center;gap:.3rem;
+  user-select:none}
+.red-mas>summary::-webkit-details-marker{display:none}
+.red-mas>summary::after{content:'▾';font-size:.6rem;
+  transition:transform .15s}
+.red-mas[open]>summary::after{transform:rotate(180deg)}
+.red-mas .red-leido{margin-top:.45rem;font-size:.8rem;line-height:1.6;
+  color:#c6cdea;background:rgba(255,255,255,.04);
+  border:1px solid #2c3a72;border-radius:10px;padding:.6rem .8rem}
+.red-mas .red-leido p{margin:0 0 .7em}
+/* menú compartir: copiar enlace + asignar (supervisión) */
+.rb-det.compartirc{position:relative}
+.menu-share{position:absolute;top:calc(100% + 6px);left:0;z-index:30;
+  min-width:250px;background:rgba(13,18,48,.97);
+  border:1px solid #3a4a80;border-radius:10px;padding:.55rem;
+  display:flex;flex-direction:column;gap:.45rem;align-items:stretch;
+  box-shadow:0 10px 30px #000a;backdrop-filter:blur(8px)}
+.menu-share.up{top:auto;bottom:calc(100% + 6px)}
+.menu-share.end{left:auto;right:0}
+.menu-share .rb-form{flex-direction:column;align-items:stretch;
+  margin-top:0}
+.red-sub{margin-top:.35rem}
+.red-sub .rb{font-size:.62rem;height:22px;padding:0 8px}
+/* píldora flotante "N nuevas" — aparece sola cuando el polling
+   detecta publicaciones recientes; entra con un slide-up suave */
+.red-pill{position:fixed;bottom:1.2rem;left:50%;z-index:60;
+  transform:translateX(-50%);display:inline-flex;align-items:center;
+  gap:.45rem;padding:.65rem 1.4rem;border-radius:24px;
+  background:linear-gradient(135deg,#1a237e 0%,#3949ab 55%,#7c4dff 100%);
+  color:#fff;text-decoration:none;font-size:.85rem;font-weight:600;
+  box-shadow:0 8px 24px rgba(26,35,126,.4),0 0 0 1px #ffffff22 inset;
+  animation:redpill .45s cubic-bezier(.2,.9,.3,1.2)}
+.red-pill::before{content:'✦';color:#ffd54f;font-size:.95rem}
+@keyframes redpill{from{opacity:0;transform:translate(-50%,14px) scale(.9)}
+  to{opacity:1;transform:translate(-50%,0) scale(1)}}
+@media (min-width:761px){
+  /* columna colapsada = tile angosta vertical; las abiertas absorben
+     el ancho (flex-basis 340px vs 54px) y quedan agrupadas a la izq. */
+  .red-col{position:relative;transition:flex-basis .2s,padding .2s}
+  .red-col h2::before{order:-2}
+  .red-col h2::after{order:-1}
+  .red-col.closed{flex:0 0 56px;padding:12px 5px;align-items:center}
+  /* tile plegada: columna explícita — icono, contador, badge y el
+     nombre en vertical ocupando el resto de la altura (lomo) */
+  .red-col.closed h2{display:flex;flex-direction:column;
+    align-items:center;justify-content:flex-start;height:100%;
+    margin:0;font-size:.78rem;gap:.3rem}
+  .red-col.closed h2::before,.red-col.closed h2::after{content:''}
+  /* display:contents desarma el wrapper → cada pieza es ítem de la
+     columna: contador+badge arriba, luego icono, luego nombre */
+  .red-col.closed h2 .head-right{display:contents;margin:0}
+  .red-col.closed .red-n{order:-4;display:inline;font-weight:700;
+    color:#7cc4ff;font-size:.9rem}
+  .red-col.closed .red-nuevas{order:-3;position:static;font-size:0}
+  .red-col.closed .red-nuevas::before{content:'';display:block;
+    width:9px;height:9px;border-radius:50%;background:#b03a2e}
+  .red-col.closed .area-ico{order:-2;margin-left:0;color:#9aa3c7}
+  .red-col.closed .red-nom{order:0;writing-mode:vertical-rl;
+    transform:rotate(180deg);display:flex;align-items:center;
+    color:#dfe4ff;overflow-wrap:anywhere}
+  .red-col.closed:hover{background:rgba(58,73,171,.35)}
+}
+@media (max-width:760px){
+  /* móvil: acordeón vertical — cada medio es una tarjeta cerrada;
+     al tocar el encabezado se despliega su info (dropdown) */
+  .red-xbar{display:none}
+  /* overflow:visible — el overflow-x:auto de escritorio convierte al
+     board en scroll container y rompe el sticky del h2 de columna */
+  .red-board{display:block;height:auto;overflow:visible}
+  .red-col{display:block;height:auto;flex:none;margin-bottom:10px;
+    background:rgba(15,20,52,.72);border-color:#2c3a72}
+  .red-col .posts{display:none;overflow:visible;flex:none}
+  .red-col.open .posts{display:block}
+  .red-col h2{color:#eef1ff;cursor:pointer;user-select:none;
+    /* encabezado sticky: al bajar por las notas de la columna, el
+       título del medio queda fijo bajo el nav para poder plegarla */
+    position:sticky;top:var(--navh,0px);z-index:6;
+    margin:-10px -10px .6rem;padding:12px 10px;
+    background:rgba(15,20,52,.94);backdrop-filter:blur(10px);
+    border-bottom:1px solid #2c3a72;border-radius:12px 12px 0 0}
+  .red-col h2::before{content:''}
+  .red-col h2::after{content:'▸';float:right;color:#8a93b8;
+    transition:transform .15s}
+  .red-col.open h2::after{content:'▾'}
+  html.tema-claro .red-col h2{background:#f4f4f6}
+  main.wide{padding:.6rem .5rem}
+}
+/* tema claro — mismas piezas en look clásico */
+html.tema-claro .red-col{background:#f4f4f6;border-color:#e2e2e8;
+  box-shadow:none;backdrop-filter:none}
+html.tema-claro .red-col h2{color:#333}
+html.tema-claro .red-col h2::before{color:#bbb}
+html.tema-claro .red-col h2::after{color:#999}
+html.tema-claro .red-col h2 .area-ico{color:#5a5a6e}
+html.tema-claro .red-tabs a{background:#fff;border-color:#ccc;
+  color:#444}
+html.tema-claro .red-tabs a.on{background:#1a237e;color:#fff;
+  border-color:#1a237e}
+html.tema-claro .red-form{background:#f4f4f6;border-color:#e2e2e8}
+html.tema-claro .red-form input[type=text],
+html.tema-claro .red-form textarea,html.tema-claro .red-form select{
+  background:#fff;color:#222;border-color:#ccc}
+html.tema-claro .rb{background:#fff;border-color:#d0d0dc;color:#444;
+  backdrop-filter:none}
+html.tema-claro .rb:hover{border-color:#1a237e;color:#1a237e;
+  background:#fff;box-shadow:none}
+html.tema-claro .rb.on{background:#1a237e;border-color:#1a237e;
+  color:#fff}
+html.tema-claro .rb-form select,html.tema-claro .rb-form input{
+  background:#fff;color:#222;border-color:#ccc}
+html.tema-claro .menu-share{background:#fff;border-color:#d0d0dc;
+  box-shadow:0 10px 30px rgba(0,0,0,.15)}
+html.tema-claro .red-mas>summary{color:#5c6bc0}
+html.tema-claro .red-mas .red-leido{background:#fafafa;
+  border-color:#e2e2e8;color:#444}
+html.tema-claro .red-post{background:#fff !important;
+  border-color:#eee !important}
+html.tema-claro .red-col.closed .red-n{color:#1a237e}
+html.tema-claro .red-col.closed .red-nom{color:#333}
+html.tema-claro .red-col.closed:hover{background:#e9e9f0}
+html.tema-claro .red-col.closed .area-ico{color:#777}
+html.tema-claro .red-pill{box-shadow:0 8px 24px rgba(26,35,126,.3)}
+html.tema-claro .red-xbar{background:#ececf2;border-color:#d0d0dc}
+html.tema-claro .red-xbar .red-xthumb{
+  background:linear-gradient(90deg,#3949ab,#7c4dff)}
+/* vista de nota — artículo completo */
+.nota-kicker{display:flex;align-items:center;gap:.4rem;
+  font-size:.68rem;font-weight:700;letter-spacing:.12em;
+  text-transform:uppercase;color:#8a93b8}
+.nota-kicker .area-ico, .nota-kicker svg{color:#7c4dff}
+.nota-titulo{font-size:1.45rem;line-height:1.25;margin:.5rem 0 .4rem;
+  color:#eef1ff;font-weight:800}
+.nota-resumen{font-size:.95rem;line-height:1.6;color:#b9c2ea;
+  border-left:3px solid #7c4dff;padding:.15rem 0 .15rem .8rem;
+  margin:.4rem 0 .8rem;font-style:italic}
+.nota-meta{display:flex;flex-wrap:wrap;gap:.3rem .9rem;align-items:center;
+  font-size:.75rem;color:#9aa3c7;border-top:1px solid #2c3a72;
+  border-bottom:1px solid #2c3a72;padding:.5rem 0;margin-bottom:.9rem}
+.nota-meta a{color:#8ab4ff}
+.nota-cuerpo{font-size:.92rem;line-height:1.7;color:#dfe4ff}
+.nota-cuerpo p{margin:0 0 .95em}
+/* tarjeta del deck: titular + resumen de 2 líneas */
+.red-tit{font-weight:700;font-size:.85rem;line-height:1.3;
+  color:#eef1ff;margin-top:.2rem}
+.red-snip{font-size:.78rem;line-height:1.45;color:#9aa3c7;margin-top:.15rem;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
+  overflow:hidden}
+/* tira de miniaturas: una sola fila con scroll — la tarjeta no
+   crece aunque la nota tenga 10 fotos */
+.media-strip{display:flex;gap:.35rem;overflow-x:auto;
+  padding:.35rem 0 .15rem;margin:.3rem 0 0;scrollbar-width:none;
+  cursor:grab;user-select:none}
+.media-strip::-webkit-scrollbar{display:none}
+.media-strip a{flex:none;display:block}
+.media-strip.dragging{cursor:grabbing}
+.media-strip.dragging a{pointer-events:none}
+.nota-rel-t{font-size:.8rem;margin:1.2rem 0 .4rem;color:#8a93b8;
+  letter-spacing:.05em;text-transform:uppercase}
+.rel-nota{display:flex;flex-direction:column;gap:.15rem;
+  padding:.55rem .7rem;margin:.3rem 0;border-radius:10px;
+  border:1px solid #2c3a72;background:rgba(255,255,255,.04);
+  text-decoration:none;transition:border-color .15s}
+.rel-nota:hover{border-color:#7c4dff}
+.rel-t{font-size:.82rem;color:#dfe4ff;font-weight:600;line-height:1.35}
+.rel-m{font-size:.68rem;color:#8a93b8;display:flex;align-items:center;
+  gap:.3rem}
+/* comentarios del equipo en la nota */
+.com-item{border:1px solid #2c3a72;border-radius:10px;
+  padding:.5rem .7rem;margin:.4rem 0;background:rgba(255,255,255,.03)}
+.com-head{display:flex;gap:.5rem;align-items:baseline}
+.com-head b{font-size:.78rem;color:#cfd6ff}
+.com-head .meta{font-size:.65rem}
+.com-txt{font-size:.82rem;color:#dfe4ff;margin-top:.2rem;
+  white-space:pre-wrap;line-height:1.5}
+html.tema-claro .com-item{border-color:#e2e2e8;background:#fafafa}
+html.tema-claro .com-head b{color:#333}
+html.tema-claro .com-txt{color:#444}
+html.tema-claro .nota-kicker{color:#777}
+html.tema-claro .nota-kicker svg{color:#5c6bc0}
+html.tema-claro .nota-titulo{color:#1a237e}
+html.tema-claro .nota-resumen{color:#444;border-left-color:#5c6bc0}
+html.tema-claro .nota-meta{color:#666;border-color:#e2e2e8}
+html.tema-claro .nota-meta a{color:#1a237e}
+html.tema-claro .nota-cuerpo{color:#333}
+html.tema-claro .red-tit{color:#1a237e}
+html.tema-claro .red-snip{color:#666}
+html.tema-claro .nota-rel-t{color:#999}
+html.tema-claro .rel-nota{border-color:#e2e2e8;background:#fafafa}
+html.tema-claro .rel-nota:hover{border-color:#5c6bc0}
+html.tema-claro .rel-t{color:#1a237e}
+html.tema-claro .rel-m{color:#888}
+/* asistente IA */
+.asis-log{display:flex;flex-direction:column;gap:.55rem;
+  max-width:780px;margin-bottom:.8rem}
+.asis-msg{max-width:85%;padding:.6rem .8rem;border-radius:12px;
+  font-size:.85rem;line-height:1.55}
+.asis-q{align-self:flex-end;background:#3949ab;color:#fff;
+  border-bottom-right-radius:4px}
+.asis-a{align-self:flex-start;background:rgba(255,255,255,.06);
+  border:1px solid #2c3a72;color:#dfe4ff;
+  border-bottom-left-radius:4px;backdrop-filter:blur(6px)}
+.asis-quien{font-size:.62rem;font-weight:700;letter-spacing:.08em;
+  text-transform:uppercase;color:#8a93b8;margin-bottom:.2rem}
+.asis-sugs{display:flex;gap:.4rem;flex-wrap:wrap}
+/* estrellita IA en la meta de la tarjeta */
+.rb-ia{display:inline-flex;align-items:center;justify-content:center;
+  width:16px;height:16px;border-radius:50%;margin-left:.35rem;
+  color:#ffd54f;font-size:.72rem;text-decoration:none;
+  border:1px solid #ffd54f55;vertical-align:middle}
+.rb-ia:hover{background:#ffd54f22;box-shadow:0 0 8px #ffd54f66;
+  text-decoration:none}
+html.tema-claro .asis-q{background:#5c6bc0}
+html.tema-claro .asis-a{background:#fff;border-color:#e2e2e8;
+  color:#333}
+</style>"""
+
+
+_RED_XBAR_JS = """<script>
+/* scrollbar horizontal superior sincronizada con .red-board:
+   el thumb se puede arrastrar y el board scrollea (y viceversa) */
+(function(){
+var bar=document.querySelector('.red-xbar');
+var board=document.querySelector('.red-board');
+if(!bar||!board)return;
+var th=bar.querySelector('.red-xthumb');
+function layout(){
+  var sw=board.scrollWidth,cw=board.clientWidth;
+  if(sw<=cw){bar.style.display='none';return}
+  bar.style.display='block';
+  var tw=Math.max(26,cw/sw*cw),mx=cw-tw;
+  th.style.width=tw+'px';
+  th.style.left=(board.scrollLeft/Math.max(1,sw-cw)*mx)+'px';}
+board.addEventListener('scroll',layout);
+window.addEventListener('resize',layout);
+layout();
+var drag=false,sx=0,sl=0;
+th.addEventListener('pointerdown',function(e){
+  drag=true;sx=e.clientX;sl=board.scrollLeft;
+  th.setPointerCapture(e.pointerId);e.preventDefault();});
+th.addEventListener('pointermove',function(e){
+  if(!drag)return;
+  var sw=board.scrollWidth,cw=board.clientWidth,mx=cw-th.offsetWidth;
+  if(mx<=0)return;
+  board.scrollLeft=sl+(e.clientX-sx)/mx*(sw-cw);});
+th.addEventListener('pointerup',function(){drag=false});
+th.addEventListener('pointercancel',function(){drag=false});
+})();
+</script>"""
+
+
+def _board_wrap(cols_html: str) -> str:
+    """Envoltura del deck: barra de scroll superior + board + JS
+    de sincronización. La usan Redacción y Bitácora."""
+    return ("<div class='red-xbar'><div class='red-xthumb'></div></div>"
+            f"<div class='red-board'>{cols_html}</div>"
+            + _RED_XBAR_JS)
+
+
+def vista_redaccion(email: str) -> str:
+    """Vista supervisor: una columna por área, cronológico descendente,
+    scroll horizontal en desktop. Cada tarjeta muestra cuántas
+    publicaciones son nuevas desde la última visita del usuario."""
+    cfg = json.loads(CONFIG.read_text())
+    areas = areas_redaccion(cfg)
+    if not areas:
+        return ("<h1>Redacción</h1><p class='meta'>Sin áreas "
+                "configuradas — agrega <code>redaccion.areas</code> en "
+                "config.json (id, nombre, miembros).</p>")
+    visto = ((cargar_usuarios().get(email) or {})
+             .get("visto_redaccion", ""))
+    # orden de columnas personalizado por usuario (drag & drop)
+    orden = ((cargar_usuarios().get(email) or {})
+             .get("red_orden") or [])
+    colapsadas = set(((cargar_usuarios().get(email) or {})
+                      .get("red_colapsadas") or []))
+    areas = sorted(
+        areas, key=lambda a: orden.index(a.get("id"))
+        if a.get("id") in orden else 999)
+    posts = cargar_publicaciones()
+    nuevas_total = 0
+    cols = []
+    for a in areas:
+        ps = [p for p in posts if p.get("area") == a.get("id")][:80]
+        nuevas = sum(1 for p in ps if p.get("ts", "") > visto)
+        nuevas_total += nuevas
+        badge = (f" <span class='meta red-nuevas' style='color:#b03a2e;"
+                 f"font-weight:700'>● {nuevas} nueva"
+                 f"{'s' if nuevas != 1 else ''}</span>" if nuevas else "")
+        cards = "".join(_pub_card(p, email, cfg, ret='/redaccion') for p in ps) \
+            or "<p class='meta'>sin publicaciones</p>"
+        cls = "red-col closed" if a.get("id") in colapsadas \
+            else "red-col"
+        cols.append(
+            f"<div class='{cls}' data-area='{html.escape(a.get('id',''), quote=True)}'>"
+            f"<h2><span class='red-nom'>"
+            f"{html.escape(a.get('nombre',''))}</span>"
+            f" <span class='meta red-n' style='font-weight:400'>"
+            f"{len(ps)}</span>"
+            f"<span class='head-right'>{badge}"
+            f"<span class='area-ico'>"
+            f"{_area_icono(a.get('id'), 14)}</span></span></h2>"
+            f"<div class='posts'>{cards}</div></div>")
+    ultimo = posts[0].get("ts", "") if posts else ""
+    return (_RED_CSS +
+            f"<div class='meta' style='margin:.2rem 0 .7rem;font-size:.82rem'>"
+            f"{len(areas)} medios · {len(posts)} publicaciones · "
+            f"{nuevas_total} nuevas desde tu última visita · última "
+            f"{fmt_fecha(ultimo) if ultimo else '—'} · arrastra ⠿ para "
+            f"reordenar</div>"
+            "<button class='rb' id='red-tgl' "
+            "style='margin:.1rem 0 .7rem'>plegar todo</button>"
+            "<button class='rb' id='red-inicio' "
+            "style='margin:.1rem 0 .7rem' "
+            "title='Volver al inicio — columnas a la izquierda y "
+            "publicaciones arriba'>↺ inicio</button>"
+            + _board_wrap("".join(cols))
+            + "<script>"
+            "var _drag=null;"
+            "if(matchMedia('(pointer:fine)').matches){"
+            "document.querySelectorAll('.red-col').forEach("
+            "function(c){c.setAttribute('draggable','true');"
+            "c.addEventListener('dragstart',function(e){"
+            "_drag=c;c.classList.add('drag');"
+            "e.dataTransfer.effectAllowed='move'});"
+            "c.addEventListener('dragend',function(){"
+            "c.classList.remove('drag');_guardarOrden()});"
+            "c.addEventListener('dragover',function(e){"
+            "e.preventDefault();"
+            "var r=this.getBoundingClientRect();"
+            "board.insertBefore(_drag,(e.clientX-r.left)>r.width/2?"
+            "this.nextSibling:this)});});}"
+            "var board=document.querySelector('.red-board');"
+            "function _guardarOrden(){"
+            "if(!board)return;"
+            "var ids=[...board.querySelectorAll('.red-col')]"
+            ".map(function(c){return c.dataset.area});"
+            "fetch('/redaccion/orden',{method:'POST',"
+            "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+            "body:'orden='+ids.join(',')});}"
+            "function _guardarColapsadas(){"
+            "var ids=[...document.querySelectorAll('.red-col.closed')]"
+            ".map(function(c){return c.dataset.area});"
+            "fetch('/redaccion/colapsar',{method:'POST',"
+            "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+            "body:'cols='+ids.join(',')});}"
+            "var _tgl=document.getElementById('red-tgl');"
+            "function _syncTgl(){if(!_tgl)return;"
+            "var abiertas=document.querySelectorAll("
+            "'.red-col:not(.closed)').length;"
+            "_tgl.textContent=abiertas?'plegar todo':'expandir todo'}"
+            "if(_tgl)_tgl.addEventListener('click',function(){"
+            "var cerrar=document.querySelectorAll("
+            "'.red-col:not(.closed)').length>0;"
+            "document.querySelectorAll('.red-col').forEach("
+            "function(c){if(matchMedia('(max-width:760px)').matches){"
+            "c.classList.toggle('open',!cerrar)}"
+            "else{c.classList.toggle('closed',cerrar)}});"
+            "_guardarColapsadas();_syncTgl();});"
+            "_syncTgl();"
+            "var _ini=document.getElementById('red-inicio');"
+            "if(_ini)_ini.addEventListener('click',function(){"
+            "if(board)board.scrollLeft=0;"
+            "document.querySelectorAll('.red-col .posts')"
+            ".forEach(function(s){s.scrollTop=0});"
+            "window.scrollTo(0,0)});"
+            "document.querySelectorAll('.red-col').forEach("
+            "function(c){var h=c.querySelector('h2');if(!h)return;"
+            "h.addEventListener('click',function(){"
+            "if(matchMedia('(max-width:760px)').matches){"
+            "c.classList.toggle('open')}"
+            "else{c.classList.toggle('closed');_guardarColapsadas()}});});"
+            "</script>" + _RED_POLL_JS.replace("CTX", "tablero"))
+
+
+def _form_publicar(email: str, cfg: dict) -> str:
+    """Formulario multipart para publicar. Multi-rol: si el usuario
+    pertenece a varias áreas elige en cuál publicar; supervisión sin
+    área elige de todo el catálogo."""
+    areas_u = areas_de_usuario(email, cfg)
+    sup = es_supervisor(email, cfg)
+    sel_area = ""
+    if len(areas_u) > 1:
+        ops = "".join(
+            f"<option value='{html.escape(a.get('id',''), quote=True)}'>"
+            f"{html.escape(a.get('nombre',''))}</option>" for a in areas_u)
+        sel_area = ("<label class='meta'>Publicar en</label>"
+                    f"<select name='area'>{ops}</select>")
+    elif not areas_u and sup:
+        ops = "".join(
+            f"<option value='{html.escape(a.get('id',''), quote=True)}'>"
+            f"{html.escape(a.get('nombre',''))}</option>"
+            for a in areas_redaccion(cfg))
+        sel_area = ("<label class='meta'>Área</label>"
+                    f"<select name='area'>{ops}</select>")
+    elif not areas_u:
+        return ("<div class='red-form'><p class='meta'>No tienes un "
+                "área asignada — pide al admin que te agregue a "
+                "<code>redaccion.areas[].miembros</code> o pon "
+                "<code>area</code>/<code>areas</code> en tu perfil.</p>"
+                "</div>")
+    etiqueta = ("Publicar en " + html.escape(
+        areas_u[0].get("nombre", "")) if len(areas_u) == 1
+        else "Publicar")
+    return ("<div class='red-form'><h2 style='font-size:.95rem;margin:"
+            f".1rem 0 .5rem'>{etiqueta}</h2>"
+            "<form method='post' action='/publicar' "
+            "enctype='multipart/form-data'>"
+            + sel_area +
+            "<input type='text' name='titulo' placeholder='titular "
+            "(opcional — si lo dejas vacío se toma del texto)'>"
+            "<textarea name='texto' required placeholder='nota de la "
+            "publicación…'></textarea>"
+            "<input type='text' name='enlace' placeholder='enlace "
+            "(opcional)'>"
+            "<input type='text' name='location' placeholder='ubicación "
+            "(opcional)'>"
+            "<input type='file' name='archivos' multiple "
+            "accept='image/*,video/*,audio/*,.pdf' "
+            "style='font-size:.8rem'>"
+            "<div style='margin-top:.5rem;display:flex;gap:1rem;"
+            "align-items:center'>"
+            "<label style='font-size:.8rem'><input type='checkbox' "
+            "name='urgente' value='1'> URGENTE</label>"
+            "<button style='padding:.45rem 1.2rem;border-radius:10px;"
+            "border:none;background:#1a237e;color:#fff;cursor:pointer'>"
+            "Publicar</button></div></form></div>")
+
+
+def vista_area(email: str, v: str = "area", msg: str = "",
+               a_sel: str = "") -> str:
+    """Vista del colaborador: publicar, su feed de área, avisos
+    (asignaciones pendientes + interés) y feed general. Multi-rol:
+    si pertenece a varias áreas, chips para cambiar de una a otra."""
+    cfg = json.loads(CONFIG.read_text())
+    areas_u = areas_de_usuario(email, cfg)
+    area = next((x for x in areas_u if x.get("id") == a_sel), None) \
+        or (areas_u[0] if areas_u else None)
+    posts = cargar_publicaciones()
+    mis_eventos = [s for s in cargar_seguimientos()
+                   if email in (s.get("miembros") or [])]
+    tabs = [("area", "Mi área"), ("avisos", "Avisos"),
+            ("general", "Feed general"), ("mias", "Mis publicaciones")]
+    if mis_eventos:
+        tabs.append(("eventos", "Eventos"))
+    nav = "".join(
+        f"<a href='/area?v={k}' class='{'on' if v == k else ''}'>"
+        f"{html.escape(t)}</a>" for k, t in tabs)
+    chips = ""
+    if len(areas_u) > 1:
+        chips = ("<div class='red-tabs'>" + "".join(
+            f"<a href='/area?v=area&a={html.escape(x.get('id',''), quote=True)}'"
+            f" class='{'on' if area and x.get('id') == area.get('id') else ''}'>"
+            f"{html.escape(x.get('nombre',''))}</a>" for x in areas_u)
+            + "</div>")
+    out = [_RED_CSS,
+           "<h1>Mi área</h1>",
+           (f"<p class='meta' style='color:#b03a2e'>{html.escape(msg)}"
+            "</p>" if msg else ""),
+           f"<div class='red-tabs'>{nav}</div>",
+           chips,
+           _RED_POLL_JS.replace("CTX", "area")]
+
+    if v == "avisos":
+        mios = [p for p in posts
+                if any(a.get("para") == email and
+                       a.get("estado", "pendiente") == "pendiente"
+                       for a in (p.get("asignaciones") or []))
+                or email in (p.get("interes") or [])]
+        cuerpo = ("".join(_pub_card(p, email, cfg, ret='/area') for p in mios)
+                  or "<p class='meta'>Sin avisos — aquí llegan las "
+                     "asignaciones pendientes y las marcas de interés.</p>")
+        out.append(f"<h2 style='font-size:1rem'>Avisos "
+                   f"({len(mios)})</h2>{cuerpo}")
+        return "".join(out)
+
+    out.append(_form_publicar(email, cfg))
+
+    if v == "mias":
+        ps = [p for p in posts if p.get("usuario") == email][:100]
+        out.append(f"<h2 style='font-size:1rem'>Mis publicaciones "
+                   f"({len(ps)})</h2>"
+                   + ("".join(_pub_card(p, email, cfg, ret='/area') for p in ps)
+                      or "<p class='meta'>Aún no publicas nada.</p>"))
+        return "".join(out)
+
+    if v == "eventos":
+        bloques = []
+        for s in mis_eventos:
+            pts = [p for p in posts if p.get("evento") == s.get("id")]
+            prio = s.get("prioridad", "media")
+            pcolor = _PRIO_COLOR.get(prio, "#666")
+            bloque = (
+                f"<div class='red-form' style='margin-bottom:.8rem'>"
+                f"<b>{html.escape(s.get('nombre',''))}</b> "
+                f"<span style='color:{pcolor};font-size:.68rem'>"
+                f"● {html.escape(prio)}</span> "
+                f"<span class='meta'>({len(pts)} notas)</span>"
+                + (f"<div class='meta' style='margin-top:.2rem'>"
+                   f"objetivo: {html.escape(s.get('objetivo',''))}</div>"
+                   if s.get("objetivo") else "")
+                + "</div>"
+                + ("".join(_pub_card(p, email, cfg, ret='/area') for p in pts)
+                   or "<p class='meta'>Este evento aún no tiene notas "
+                      "ligadas.</p>"))
+            bloques.append(bloque)
+        out.append("<h2 style='font-size:1rem'>Mis eventos "
+                   f"({len(mis_eventos)})</h2>" + "".join(bloques))
+        return "".join(out)
+
+    if v == "general":
+        ps = posts[:150]
+        out.append(f"<h2 style='font-size:1rem'>Feed general "
+                   f"({len(ps)})</h2>"
+                   + ("".join(_pub_card(p, email, cfg, ret='/area') for p in ps)
+                      or "<p class='meta'>Sin publicaciones todavía.</p>"))
+        return "".join(out)
+
+    # vista por defecto: el área del usuario
+    if not area:
+        out.append("<p class='meta'>No perteneces a ninguna área "
+                   "configurada — usa las pestañas para ver el feed "
+                   "general.</p>")
+        ps = posts[:80]
+        out.append("<h2 style='font-size:1rem'>Feed general</h2>"
+                   + ("".join(_pub_card(p, email, cfg, ret='/area') for p in ps)
+                      or "<p class='meta'>Sin publicaciones todavía.</p>"))
+        return "".join(out)
+    ps = [p for p in posts if p.get("area") == area.get("id")][:100]
+    out.append(f"<h2 style='font-size:1rem'>{html.escape(area.get('nombre',''))}"
+               f" — publicaciones ({len(ps)})</h2>"
+               + ("".join(_pub_card(p, email, cfg, ret='/area') for p in ps)
+                  or "<p class='meta'>Tu área aún no tiene "
+                     "publicaciones.</p>"))
+    return "".join(out)
+
+
+def publicar_redaccion(partes: dict, email: str) -> str:
+    """POST /publicar (multipart): crea la publicación del área del
+    usuario. Devuelve la URL de regreso."""
+    cfg = json.loads(CONFIG.read_text())
+    RED_MEDIA.mkdir(exist_ok=True)
+
+    def campo(n: str) -> str:
+        vals = partes.get(n) or []
+        if not vals:
+            return ""
+        data = vals[0][2]
+        return data.decode("utf-8", "replace").strip() if data else ""
+
+    texto = campo("texto")
+    # si viene de bitácora, la nota queda ligada al evento
+    evento = (campo("evento") or "").strip()
+    back = "/bitacora" if evento else "/area"
+    if not texto:
+        return back + "?msg=" + quote("La publicación necesita texto")
+    sel = campo("area")
+    areas_u = areas_de_usuario(email, cfg)
+    # multi-rol: el área elegida debe ser una de las suyas
+    area = next((a for a in areas_u if a.get("id") == sel), None)
+    if not area and areas_u and not sel:
+        area = areas_u[0]
+    if not area:
+        area = next((a for a in areas_redaccion(cfg)
+                     if a.get("id") == sel), None)
+        if not area or not es_supervisor(email, cfg):
+            return back + "?msg=" + quote("No tienes área asignada")
+    pid = _post_id()
+    media = []
+    for i, (fn, ct, data) in enumerate(partes.get("archivos") or []):
+        if not fn:
+            continue
+        m = _guardar_media(pid, i, fn, ct, data)
+        if m:
+            media.append(m)
+    enlace = campo("enlace")
+    p = {"id": pid,
+         "ts": datetime.now().isoformat(timespec="seconds"),
+         "usuario": email,
+         "nombre": _red_nombre(email),
+         "area": area.get("id"),
+         "titulo": campo("titulo"),
+         "texto": texto,
+         "urgente": campo("urgente") == "1",
+         "enlace": enlace if enlace.startswith("http") else "",
+         "location": campo("location"),
+         "media": media,
+         "interes": [],
+         "asignaciones": []}
+    if evento:
+        p["evento"] = evento
+    _guardar_publicacion(p)
+    # transcripción en segundo plano para audio/video subidos
+    if any(m.get("tipo") in ("audio", "video") for m in media):
+        threading.Thread(target=_transcribir_adjuntos,
+                         args=(cfg, pid), daemon=True,
+                         name=f"transcribe-{pid}").start()
+    return ("/bitacora?msg=" + quote("Nota agregada al evento")
+            if evento else "/area?msg=" + quote("Publicación enviada"))
+
+
+def aplicar_accion_redaccion(ruta: str, form: dict, email: str) -> str:
+    """POSTs urlencoded de redacción: interés, asignar, estado de
+    asignación. Devuelve la URL de regreso."""
+    cfg = json.loads(CONFIG.read_text())
+    if "@demo.local" in (email or ""):
+        return "/redaccion"   # invitados: solo lectura, sin acciones
+    # 'volver' = página desde la que se envió el form (deck, mi área,
+    # bitácora) — el POST regresa ahí en vez de mandar siempre a /area
+    volver = form.get("volver", [""])[0]
+    if not (volver.startswith("/") and not volver.startswith("//")):
+        volver = ""
+    if ruta.endswith("/orden"):
+        # drag & drop del tablero: orden de columnas por usuario
+        ids = [x.strip() for x in
+               (form.get("orden") or [""])[0].split(",")
+               if x.strip()]
+        usuarios = cargar_usuarios()
+        if email in usuarios:
+            usuarios[email]["red_orden"] = ids
+            guardar_usuarios(usuarios)
+        return "/redaccion"
+    if ruta.endswith("/colapsar"):
+        # columnas plegadas del tablero — preferencia por usuario
+        ids = [x.strip() for x in
+               (form.get("cols") or [""])[0].split(",")
+               if x.strip()]
+        usuarios = cargar_usuarios()
+        if email in usuarios:
+            usuarios[email]["red_colapsadas"] = ids
+            guardar_usuarios(usuarios)
+        return "/redaccion"
+    if ruta.endswith("/bitacora/nuevo"):
+        # crear evento/seguimiento — solo supervisión
+        if not es_supervisor(email, cfg):
+            return "/bitacora"
+        nombre = form.get("nombre", [""])[0].strip()[:120]
+        if nombre:
+            _guardar_seguimiento({
+                "id": "s" + secrets.token_hex(4),
+                "nombre": nombre,
+                "objetivo": form.get("objetivo", [""])[0].strip()[:300],
+                "prioridad": form.get("prioridad", ["media"])[0],
+                "por": email,
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "miembros": []})
+        return "/bitacora"
+    if ruta.endswith("/bitacora/miembro"):
+        # agregar/quitar usuario del equipo de un evento — supervisión
+        if not es_supervisor(email, cfg):
+            return "/bitacora"
+        sid = form.get("sid", [""])[0].strip()
+        para = form.get("para", [""])[0].strip().lower()
+        op = form.get("op", [""])[0]
+        ss = cargar_seguimientos()
+        s = next((x for x in ss if x.get("id") == sid), None)
+        usuarios = cargar_usuarios()
+        if s and para in usuarios and "@demo.local" not in para:
+            miembros = s.setdefault("miembros", [])
+            if op == "add" and para not in miembros:
+                miembros.append(para)
+            elif op == "del" and para in miembros:
+                miembros.remove(para)
+            _reescribir_seguimientos(ss)
+        return "/bitacora"
+    if ruta.endswith("/bitacora/resolver"):
+        # aceptar/rechazar solicitud de unión a un evento — la
+        # resuelve el creador del evento o supervisión
+        sid = form.get("sid", [""])[0].strip()
+        de = form.get("de", [""])[0].strip().lower()
+        op = form.get("op", [""])[0]
+        ss = cargar_seguimientos()
+        s = next((x for x in ss if x.get("id") == sid), None)
+        if s and (es_supervisor(email, cfg)
+                  or s.get("por") == email):
+            for x in (s.get("solicitudes") or []):
+                if x.get("de") == de and x.get("estado") == "pendiente":
+                    x["estado"] = "aceptada" if op == "aceptar" \
+                        else "rechazada"
+                    if op == "aceptar":
+                        miembros = s.setdefault("miembros", [])
+                        if de not in miembros:
+                            miembros.append(de)
+                    break
+            _reescribir_seguimientos(ss)
+        return "/bitacora"
+    pid = form.get("id", [""])[0]
+    posts = cargar_publicaciones()
+    p = next((x for x in posts if x.get("id") == pid), None)
+    if not p:
+        return "/area?msg=" + quote("Publicación no encontrada")
+
+    if ruta.endswith("/bitacora/vincular"):
+        # ligar/quitar la nota de un evento — solo supervisión
+        if not es_supervisor(email, cfg):
+            return "/bitacora"
+        ev = form.get("evento", [""])[0].strip()
+        validos = {s.get("id") for s in cargar_seguimientos()}
+        if ev and ev not in validos:
+            return "/bitacora"
+        if ev:
+            p["evento"] = ev
+        else:
+            p.pop("evento", None)
+        _reescribir_publicaciones(posts)
+        return "/bitacora"
+
+    if ruta.endswith("/solicitar"):
+        # pedir unirse al seguimiento de una nota — si la nota tiene
+        # evento la solicitud va al equipo del evento; si no, queda
+        # en la nota y la resuelve su autor o supervisión
+        if email == p.get("usuario") or any(
+                a.get("para") == email
+                for a in (p.get("asignaciones") or [])):
+            return "/area"
+        ev = p.get("evento")
+        ss = cargar_seguimientos()
+        s = next((x for x in ss if x.get("id") == ev), None) if ev \
+            else None
+        if s is not None:
+            sols = s.setdefault("solicitudes", [])
+            if not any(x.get("de") == email
+                       and x.get("estado") == "pendiente"
+                       for x in sols):
+                sols.append({"de": email,
+                             "ts": datetime.now().isoformat(
+                                 timespec="seconds"),
+                             "estado": "pendiente"})
+            _reescribir_seguimientos(ss)
+        else:
+            sols = p.setdefault("solicitudes", [])
+            if not any(x.get("de") == email
+                       and x.get("estado") == "pendiente"
+                       for x in sols):
+                sols.append({"de": email,
+                             "ts": datetime.now().isoformat(
+                                 timespec="seconds"),
+                             "estado": "pendiente"})
+            _reescribir_publicaciones(posts)
+        return volver or ("/redaccion" if es_supervisor(email, cfg)
+                          else "/area")
+
+    if ruta.endswith("/resolver"):
+        # aceptar/rechazar solicitud a nivel NOTA — autor o supervisión
+        de = form.get("de", [""])[0].strip().lower()
+        op = form.get("op", [""])[0]
+        if not (es_supervisor(email, cfg)
+                or email == p.get("usuario")):
+            return "/area"
+        sols = p.get("solicitudes") or []
+        for x in sols:
+            if x.get("de") == de and x.get("estado") == "pendiente":
+                x["estado"] = "aceptada" if op == "aceptar" \
+                    else "rechazada"
+                if op == "aceptar":
+                    p.setdefault("asignaciones", []).append({
+                        "para": de, "por": email,
+                        "ts": datetime.now().isoformat(
+                            timespec="seconds"),
+                        "estado": "pendiente",
+                        "nota": "se unió al seguimiento"})
+                break
+        _reescribir_publicaciones(posts)
+        return volver or ("/redaccion" if es_supervisor(email, cfg)
+                          else "/area")
+
+    if ruta.endswith("/comentar"):
+        # nota del equipo sobre una publicación — la ven todos los
+        # que abran la nota; guests (demo) no pueden comentar
+        texto = form.get("texto", [""])[0].strip()[:500]
+        if texto:
+            p.setdefault("comentarios", []).append({
+                "de": email,
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "texto": texto})
+            _reescribir_publicaciones(posts)
+        return volver or f"/redaccion/nota?id={pid}"
+
+    if ruta.endswith("/interes"):
+        interes = p.setdefault("interes", [])
+        if email in interes:
+            interes.remove(email)
+        else:
+            interes.append(email)
+        _reescribir_publicaciones(posts)
+        return volver or "/redaccion"
+
+    if ruta.endswith("/asignar"):
+        # asignar es privilegio de supervisión (Paolo/admin)
+        if not es_supervisor(email, cfg):
+            return "/area?msg=" + quote("Solo supervisión asigna")
+        para = form.get("para", [""])[0].strip().lower()
+        usuarios = cargar_usuarios()
+        if para not in usuarios or "@demo.local" in para:
+            return "/area?msg=" + quote("Destinatario inválido")
+        ev = form.get("evento", [""])[0].strip()
+        if ev:
+            ss = cargar_seguimientos()
+            s = next((x for x in ss if x.get("id") == ev), None)
+            if s:
+                p["evento"] = ev
+                miembros = s.setdefault("miembros", [])
+                if para not in miembros:
+                    miembros.append(para)
+                _reescribir_seguimientos(ss)
+        p.setdefault("asignaciones", []).append({
+            "para": para, "por": email,
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "estado": "pendiente",
+            "nota": form.get("nota", [""])[0].strip()[:200]})
+        _reescribir_publicaciones(posts)
+        return volver or ("/redaccion" if es_supervisor(email, cfg)
+                          else "/area")
+
+    # /asignacion: marcar hecha/pendiente — supervisión o el asignado
+    try:
+        idx = int(form.get("idx", ["0"])[0])
+    except ValueError:
+        return "/area"
+    asignaciones = p.get("asignaciones") or []
+    if not (0 <= idx < len(asignaciones)):
+        return "/area"
+    a = asignaciones[idx]
+    if not (es_supervisor(email, cfg) or a.get("para") == email):
+        return "/area?msg=" + quote("No puedes cerrar esa asignación")
+    a["estado"] = form.get("estado", ["hecho"])[0] \
+        if form.get("estado", [""])[0] in ("hecho", "pendiente") \
+        else "hecho"
+    _reescribir_publicaciones(posts)
+    return volver or ("/redaccion" if es_supervisor(email, cfg)
+                      else "/area?v=avisos")
+
+
+_RED_REP_CACHE = {}   # horas -> (ts_epoch, texto) — el LLM tarda;
+                      # 10 min de caché por rango evita regenerar
+
+
+def reporte_redaccion(cfg: dict, horas: int) -> str:
+    """Reporte IA de las publicaciones de las últimas `horas` horas.
+    Usa _llm (Gemini free tier; si no hay key o falla, Ollama local)."""
+    ahora = time.time()
+    hit = _RED_REP_CACHE.get(horas)
+    if hit and ahora - hit[0] < 600:
+        return hit[1]
+    corte = (datetime.now() - timedelta(hours=horas))\
+        .isoformat(timespec="seconds")
+    posts = [p for p in cargar_publicaciones()
+             if p.get("ts", "") >= corte][:150]
+    if not posts:
+        return "(sin publicaciones en ese rango)"
+    areas = {a.get("id"): a.get("nombre", a.get("id"))
+             for a in areas_redaccion(cfg)}
+    lineas = []
+    for p in posts:
+        urg = " · URGENTE" if p.get("urgente") else ""
+        # transcripciones de audio/video: el LLM las usa como fuente
+        trans = " ".join(
+            (m.get("texto") or "")[:400]
+            for m in (p.get("media") or []) if m.get("texto"))
+        lineas.append(
+            f"- [{areas.get(p.get('area'), p.get('area'))}] "
+            f"{p.get('nombre') or _red_nombre(p.get('usuario',''))} · "
+            f"{fmt_fecha(p.get('ts',''))}{urg} · "
+            f"{p.get('texto','')[:300]}"
+            + (f" [transcripción: {trans}]" if trans else ""))
+    prompt = (
+        "Eres el editor de la redacción de un equipo de comunicación "
+        "social. Con base en estas publicaciones internas de las "
+        f"últimas {horas} horas, escribe un reporte ejecutivo en "
+        "español: primero lo URGENTE si lo hay, luego un párrafo de "
+        "contexto de qué dominó, y viñetas por tema o área. Tono "
+        "sobrio de nota informativa, máximo 250 palabras, sin "
+        "inventar datos.\n\n" + "\n".join(lineas))
+    txt = _llm(cfg, prompt, timeout=180)
+    if not txt:
+        txt = "(el modelo no respondió — intenta de nuevo)"
+    _RED_REP_CACHE[horas] = (ahora, txt)
+    return txt
+
+
+def vista_reporte_redaccion(email: str, horas: int = 6) -> str:
+    """Tab Reporte: rango 1/3/6/12/24 h → resumen IA de lo publicado.
+    No navega a otro lado: genera (o sirve cache) en la misma vista."""
+    cfg = json.loads(CONFIG.read_text())
+    horas = horas if horas in (1, 3, 6, 12, 24) else 6
+    chips = "".join(
+        f"<a href='/redaccion/reporte?h={h}' "
+        f"class='{'on' if h == horas else ''}'>{h} h</a>"
+        for h in (1, 3, 6, 12, 24))
+    txt = reporte_redaccion(cfg, horas)
+    return (_RED_CSS
+            + f"<div class='red-tabs'>{chips}"
+              f"<a href='/redaccion'>← tablero</a></div>"
+            + f"<h2 style='font-size:1rem;margin:.2rem 0 .6rem'>"
+              f"Reporte de las últimas {horas} horas</h2>"
+            + "<div class='red-form' style='max-width:none'>"
+            + f"<div style='white-space:pre-wrap;font-size:.9rem;"
+              f"line-height:1.55'>{html.escape(txt)}</div></div>")
+
+
+_PRIO_COLOR = {"alta": "#b03a2e", "media": "#b8860b", "baja": "#2e7d32"}
+
+
+def _bit_item(p: dict, email: str, cfg: dict,
+              seguimientos: list) -> str:
+    """Tarjeta de nota dentro de una columna de bitácora + control para
+    moverla a otro seguimiento (o quitarla)."""
+    opciones = ("<option value=''>— sin evento —</option>" + "".join(
+        f"<option value='{html.escape(s.get('id'), quote=True)}'"
+        f"{' selected' if p.get('evento') == s.get('id') else ''}>"
+        f"{html.escape(s.get('nombre', ''))}</option>"
+        for s in seguimientos))
+    vincular = (
+        "<details class='rb-det' style='margin-bottom:.4rem'>"
+        "<summary class='rb' style='font-size:.68rem'>"
+        "⇄ mover a evento</summary>"
+        f"<form method='post' action='/bitacora/vincular' "
+        f"class='rb-form'><input type='hidden' name='id' "
+        f"value='{p.get('id')}'>"
+        f"<select name='evento' style='min-width:170px'>{opciones}</select>"
+        "<button class='rb'>mover</button></form></details>")
+    return vincular + _pub_card(p, email, cfg, ret='/bitacora')
+
+
+def _form_nota_evento(s: dict, email: str, cfg: dict) -> str:
+    """En cada columna de bitácora: publicar una nota directo al
+    evento — texto + titular + enlace + archivo (foto/video/audio/
+    doc) + urgente. La nota aparece en la columna y en su área."""
+    if "@demo.local" in (email or ""):
+        return ""
+    areas_u = areas_de_usuario(email, cfg)
+    if not areas_u and not es_supervisor(email, cfg):
+        return ""
+    cat = areas_u if areas_u else areas_redaccion(cfg)
+    if not cat:
+        return ""
+    sel = "".join(
+        f"<option value='{html.escape(a.get('id',''), quote=True)}'>"
+        f"{html.escape(a.get('nombre',''))}</option>" for a in cat)
+    return ("<details class='rb-det' style='margin:.35rem 0 .2rem'>"
+            "<summary class='rb' style='font-size:.68rem'>"
+            "+ nota al evento</summary>"
+            "<form method='post' action='/bitacora/nota' "
+            "enctype='multipart/form-data' class='rb-form' "
+            "style='flex-direction:column;align-items:stretch'>"
+            f"<input type='hidden' name='evento' "
+            f"value='{html.escape(s.get('id'), quote=True)}'>"
+            f"<select name='area' style='width:100%'>{sel}</select>"
+            "<input type='text' name='titulo' "
+            "placeholder='titular (opcional)'>"
+            "<textarea name='texto' required "
+            "placeholder='nota del evento…' "
+            "style='min-height:56px'></textarea>"
+            "<input type='text' name='enlace' "
+            "placeholder='enlace / url (opcional)'>"
+            "<input type='file' name='archivos' multiple "
+            "accept='image/*,video/*,audio/*,.pdf' "
+            "style='font-size:.72rem'>"
+            "<div style='display:flex;gap:.6rem;align-items:center'>"
+            "<label style='font-size:.72rem'><input type='checkbox' "
+            "name='urgente' value='1'> URGENTE</label>"
+            "<button class='rb'>publicar en el evento</button></div>"
+            "</form></details>")
+
+
+def vista_bitacora(email: str) -> str:
+    """Tab Bitácora (supervisión) en formato deck: una columna por
+    evento/seguimiento — encabezado con nombre, objetivo, prioridad e
+    involucrados; debajo las notas ligadas a ese evento, y una columna
+    final 'Por revisar' con lo que tiene interés/asignación sin evento."""
+    cfg = json.loads(CONFIG.read_text())
+    posts = cargar_publicaciones()
+    seguimientos = cargar_seguimientos()
+    por_evento = {s.get("id"): [] for s in seguimientos}
+    por_revisar = []
+    for p in posts:
+        ev = p.get("evento")
+        if ev in por_evento:
+            por_evento[ev].append(p)
+        elif p.get("interes") or p.get("asignaciones"):
+            por_revisar.append(p)
+
+    n_pend = sum(1 for p in posts for a in (p.get("asignaciones") or [])
+                 if a.get("estado", "pendiente") == "pendiente")
+    stats = (f"<div class='meta' style='margin:.2rem 0 .7rem;"
+             f"font-size:.82rem'>{len(seguimientos)} eventos · "
+             f"{sum(len(v) for v in por_evento.values())} notas ligadas · "
+             f"{len(por_revisar)} por revisar · {n_pend} asignaciones "
+             f"pendientes</div>")
+
+    # ── formulario de nuevo evento ──
+    nuevo = (
+        "<form method='post' action='/bitacora/nuevo' "
+        "class='red-form' style='display:flex;gap:.5rem;flex-wrap:wrap;"
+        "align-items:center;max-width:none'>"
+        "<b style='font-size:.82rem'>+ nuevo evento</b>"
+        "<input type='text' name='nombre' placeholder='nombre del evento' "
+        "required style='width:220px;margin:0'>"
+        "<input type='text' name='objetivo' "
+        "placeholder='objetivo / nota del seguimiento' "
+        "style='width:280px;margin:0'>"
+        "<select name='prioridad' style='width:auto;margin:0'>"
+        "<option value='media'>prioridad media</option>"
+        "<option value='alta'>prioridad alta</option>"
+        "<option value='baja'>prioridad baja</option></select>"
+        "<button class='rb'>crear</button></form>")
+
+    cols = []
+
+    def _col(titulo_html: str, subt: str, pts: list,
+             debajo: str = "", cls_extra: str = "") -> str:
+        cards = "".join(_bit_item(p, email, cfg, seguimientos)
+                        for p in pts) \
+            or "<p class='meta' style='padding:.4rem'>sin notas</p>"
+        return (f"<div class='red-col {cls_extra}'>"
+                f"<h2>{titulo_html}</h2>"
+                f"<div class='meta' style='font-size:.7rem;margin:-.3rem 0 "
+                f".6rem'>{subt}</div>{debajo}"
+                f"<div class='posts'>{cards}</div></div>")
+
+    def _equipo_html(s: dict) -> str:
+        """Chips de miembros del evento + formulario para agregar/quitar."""
+        sid = html.escape(s.get("id"), quote=True)
+        partes = []
+        for m in (s.get("miembros") or []):
+            partes.append(
+                f"<form method='post' action='/bitacora/miembro' "
+                f"style='display:inline'>"
+                f"<input type='hidden' name='sid' value='{sid}'>"
+                f"<input type='hidden' name='para' "
+                f"value='{html.escape(m, quote=True)}'>"
+                f"<input type='hidden' name='op' value='del'>"
+                f"<button class='rb' title='Quitar del evento' "
+                f"style='font-size:.6rem;padding:1px 7px'>"
+                f"{html.escape(_red_nombre(m))} ×</button></form>")
+        restantes = [(e, n) for e, n in _usuarios_reales()
+                     if e not in (s.get("miembros") or [])]
+        if restantes:
+            ops = "".join(
+                f"<option value='{html.escape(e, quote=True)}'>"
+                f"{html.escape(n)}</option>" for e, n in restantes)
+            partes.append(
+                f"<form method='post' action='/bitacora/miembro' "
+                f"style='display:inline-flex;gap:.2rem'>"
+                f"<input type='hidden' name='sid' value='{sid}'>"
+                f"<input type='hidden' name='op' value='add'>"
+                f"<select name='para' style='font-size:.62rem;"
+                f"padding:1px 3px;max-width:110px'>{ops}</select>"
+                f"<button class='rb' title='Agregar al evento' "
+                f"style='font-size:.6rem;padding:1px 7px'>+</button>"
+                f"</form>")
+        # solicitudes de unión pendientes — las acepta/declina el
+        # creador del evento o supervisión
+        sols = "".join(
+            f"<form method='post' action='/bitacora/resolver' "
+            f"style='display:inline'>"
+            f"<input type='hidden' name='sid' value='{sid}'>"
+            f"<input type='hidden' name='de' "
+            f"value='{html.escape(x.get('de',''), quote=True)}'>"
+            f"<input type='hidden' name='op' value='{op}'>"
+            f"<button class='rb' title='{tit}' "
+            f"style='font-size:.6rem;padding:1px 7px'>{lbl}</button>"
+            f"</form>"
+            for x in (s.get("solicitudes") or [])
+            if x.get("estado") == "pendiente"
+            for op, lbl, tit in (
+                ("aceptar", f"✓ {html.escape(_red_nombre(x.get('de','')))}",
+                 "Aceptar — entra al equipo"),
+                ("rechazar", "✗", "Rechazar solicitud")))
+        if sols:
+            partes.append(
+                "<span style='color:#b8860b'>✋ solicitudes:</span> "
+                + sols)
+        return ("<div class='meta' style='font-size:.68rem;display:flex;"
+                "flex-wrap:wrap;gap:.25rem;align-items:center;margin:"
+                ".15rem 0 .55rem'>equipo: " + "".join(partes) + "</div>")
+
+    for s in seguimientos:
+        pts = por_evento.get(s.get("id"), [])
+        prio = s.get("prioridad", "media")
+        pcolor = _PRIO_COLOR.get(prio, "#666")
+        titulo = (html.escape(s.get("nombre", "Evento"))
+                  + f" <span style='color:{pcolor};font-size:.68rem'>"
+                  f"● {html.escape(prio)}</span>")
+        subt = html.escape(s.get("objetivo", ""))[:140]
+        cols.append(_col(titulo, subt, pts,
+                         debajo=(_equipo_html(s)
+                                 + _form_nota_evento(s, email, cfg))))
+
+    # columna "Por revisar": interés/asignaciones sin evento ligado
+    cols.append(_col(
+        "Por revisar", "notas con interés o seguimiento sin evento",
+        por_revisar))
+
+    return (_RED_CSS
+            + "<div class='red-tabs'><a href='/redaccion'>← tablero</a>"
+              "<a href='/redaccion/reporte'>Reporte</a></div>"
+            + "<h2 style='font-size:1rem;margin:.2rem 0 .4rem'>Bitácora</h2>"
+            + stats + nuevo
+            + _board_wrap("".join(cols)))
+
+
+def contador_redaccion(email: str, ctx: str) -> int:
+    """Publicaciones nuevas desde la última visita del usuario en ese
+    contexto ('tablero' = /redaccion, 'area' = /area). Solo cuenta —
+    no marca visto (eso lo hace la vista al renderizar)."""
+    cfg = json.loads(CONFIG.read_text())
+    perfil = cargar_usuarios().get(email) or {}
+    visto = perfil.get("visto_redaccion" if ctx == "tablero"
+                       else "visto_area", "")
+    areas_u = areas_de_usuario(email, cfg)
+    posts = cargar_publicaciones()
+    if ctx == "area":
+        ids = {a.get("id") for a in areas_u}
+        posts = [p for p in posts if p.get("area") in ids]
+    return sum(1 for p in posts if p.get("ts", "") > visto)
+
+
+_RED_POLL_JS = """
+<script>
+/* polling inteligente: cada 45s pregunta si hay publicaciones nuevas;
+   si las hay muestra un botón flotante — NO recarga a ciegas */
+setInterval(function(){
+  fetch('/redaccion/contador?ctx=CTX').then(function(r){return r.json()})
+  .then(function(d){
+    if(d.n>0&&!document.getElementById('red-nuevas')){
+      var b=document.createElement('a');b.id='red-nuevas';b.href='#';
+      b.className='red-pill';
+      b.textContent=d.n+' nueva'+(d.n>1?'s':'')+' — actualizar';
+      b.onclick=function(e){e.preventDefault();location.reload()};
+      document.body.appendChild(b);}}).catch(function(){});
+},45000);
+</script>"""
+
+
+def vista_publicacion(email: str, pid: str) -> str:
+    """Nota completa en formato reporte: texto íntegro, media grande,
+    transcripción, enlace/ubicación, asignaciones e interés."""
+    cfg = json.loads(CONFIG.read_text())
+    posts = cargar_publicaciones()
+    p = next((x for x in posts if x.get("id") == pid), None)
+    if not p:
+        return ("<h1>Nota no encontrada</h1><p class='meta'>La "
+                "publicación no existe o fue eliminada.</p>")
+    area = next((a for a in areas_redaccion(cfg)
+                 if a.get("id") == p.get("area")), {})
+    anombre = html.escape(area.get("nombre") or p.get("area") or "?")
+    urgente = ("<span style='background:#b03a2e;color:#fff;font-size:"
+               ".68rem;font-weight:700;border-radius:8px;padding:2px 9px;"
+               "margin-left:.5rem'>URGENTE</span>" if p.get("urgente")
+               else "")
+    # titular/resumen: campos propios si existen; si no, se derivan
+    # del texto (posts viejos no traen metadatos de nota)
+    texto = p.get("texto", "")
+    titulo = (p.get("titulo") or "").strip()
+    resumen = (p.get("resumen") or "").strip()
+    if not titulo:
+        primera = texto.strip().split("\n", 1)[0]
+        titulo = primera[:90] if primera else "(sin titular)"
+    titulo_h = html.escape(titulo)
+    lead_h = (f"<p class='nota-resumen'>{html.escape(resumen)}</p>"
+              if resumen else "")
+    # cuerpo en párrafos — la nota completa es una cuartilla, no una
+    # sola línea corrida
+    bloques = [b.strip() for b in re.split(r"\n\s*\n", texto)
+               if b.strip()] or [texto]
+    cuerpo = "".join("<p>" + html.escape(b).replace("\n", "<br>")
+                     + "</p>" for b in bloques)
+
+    # media a tamaño reporte — varias imágenes van en grid 2 col.
+    # para no estirar la nota completa en vertical
+    n_img = sum(1 for m in (p.get("media") or [])
+                if m.get("tipo") in (None, "", "img"))
+    media_h = []
+    for m in p.get("media") or []:
+        src = html.escape(m.get("src", ""), quote=True)
+        if not src:
+            continue
+        if m.get("tipo") == "video":
+            media_h.append(
+                f"<video src='{src}' controls preload='metadata' "
+                f"style='width:100%;max-width:760px;border-radius:10px;"
+                f"margin:.4rem 0'></video>")
+        elif m.get("tipo") == "audio":
+            media_h.append(
+                f"<div style='background:#f0f1f5;border-radius:10px;"
+                f"padding:.6rem .8rem;margin:.4rem 0;max-width:480px'>"
+                f"<div class='meta' style='font-size:.65rem;margin-bottom:"
+                f".25rem'>♪ audio — {html.escape(m.get('nombre') or 'clip')}"
+                f"</div><audio src='{src}' controls preload='none' "
+                f"style='width:100%;height:36px'></audio></div>")
+        elif m.get("tipo") == "doc":
+            media_h.append(
+                f"<a href='{src}' target='_blank' rel='noopener' "
+                f"style='font-size:.85rem'>ver archivo adjunto →</a>")
+        else:
+            w = "width:48%;margin:.4rem 1% .4rem 0" \
+                if n_img > 1 else "max-width:100%;margin:.4rem 0"
+            media_h.append(
+                f"<a href='{src}' target='_blank' rel='noopener' "
+                f"style='display:inline-block;vertical-align:top;{w}'>"
+                f"<img src='{src}' loading='lazy' "
+                f"style='width:100%;max-height:480px;object-fit:cover;"
+                f"border-radius:10px;display:block'></a>")
+        if m.get("texto"):
+            media_h.append(
+                f"<details open style='margin:.4rem 0;max-width:720px'>"
+                f"<summary style='font-size:.72rem;cursor:pointer;"
+                f"color:#1a237e;font-weight:600'>transcripción "
+                f"(generada por IA)</summary><div style='white-space:"
+                f"pre-wrap;font-size:.82rem;background:#fafafa;border-left:"
+                f"3px solid #1a237e;padding:.6rem .8rem;margin-top:.3rem;"
+                f"border-radius:0 8px 8px 0;line-height:1.5'>"
+                f"{html.escape(m['texto'])}</div></details>")
+
+    enlace = p.get("enlace") or ""
+    loc = p.get("location") or ""
+
+    # asignaciones + interés en formato reporte
+    sup = es_supervisor(email, cfg)
+    asignaciones = p.get("asignaciones") or []
+    asign_h = ""
+    if asignaciones:
+        filas = []
+        for i, a in enumerate(asignaciones):
+            pend = a.get("estado", "pendiente") == "pendiente"
+            filas.append(
+                f"<div style='font-size:.78rem;margin-top:.3rem'>"
+                f"→ <b>{html.escape(_red_nombre(a.get('para','')))}</b>"
+                f" · {fmt_fecha(a.get('ts',''))} · "
+                f"<span style='color:{'#b8860b' if pend else '#2e7d32'}'>"
+                f"{'pendiente' if pend else 'hecho'}</span> "
+                f"{html.escape(a.get('nota',''))}</div>")
+        asign_h = ("<h3 style='font-size:.85rem;margin-top:1rem'>"
+                   "Seguimiento</h3>" + "".join(filas))
+    interes = p.get("interes") or []
+    interes_h = (f"<div class='meta' style='font-size:.72rem;margin-top:.6rem'>"
+                 f"{len(interes)} marcado(s) de interés: "
+                 + ", ".join(html.escape(_red_nombre(e)) for e in interes)
+                 + "</div>" if interes else "")
+
+    autor = html.escape(p.get("nombre")
+                        or _red_nombre(p.get("usuario", "")))
+    # fila meta estilo nota periodística: autor · fecha · ubicación ·
+    # enlace · compartir — todo lo que hace "completa" la pieza
+    meta_bits = [f"✍ {autor}", f"🕐 {fmt_fecha(p.get('ts',''))}"]
+    if p.get("fuente"):
+        meta_bits.append(f"📰 {html.escape(p['fuente'])}")
+    if loc:
+        meta_bits.append(f"📍 {html.escape(loc)}")
+    if enlace:
+        meta_bits.append(
+            f"<a href='{html.escape(enlace, quote=True)}' "
+            f"target='_blank' rel='noopener'>enlace original →</a>")
+    meta_bits.append(
+        "<button class='rb' style='height:24px;font-size:.68rem' "
+        "onclick=\"navigator.clipboard.writeText(location.href);"
+        "this.textContent='✓ enlace copiado'\">compartir</button>")
+    meta_row = ("<div class='nota-meta'>"
+                + "<span>·</span>".join(meta_bits) + "</div>")
+
+    # notas relacionadas: (a) las otras publicaciones de la misma
+    # historia (familia — la nota salió en varios medios) y (b) notas
+    # de otras historias que comparten palabras clave del titular
+    nombres_area = {a.get("id"): a.get("nombre", "")
+                    for a in areas_redaccion(cfg)}
+    claves = {w for w in normalizar(titulo).split() if len(w) > 4}
+    rel_map = {}
+    for q in posts:
+        if q.get("id") == p.get("id"):
+            continue
+        if p.get("familia") and q.get("familia") == p.get("familia"):
+            rel_map[q["id"]] = (0, q)
+            continue
+        tq = set(normalizar(q.get("titulo") or "").split())
+        if len(claves & {w for w in tq if len(w) > 4}) >= 2:
+            rel_map[q["id"]] = (1, q)
+    def _ts_desc(t):
+        return t[1].get("ts", "")
+    fam = sorted((t for t in rel_map.values() if t[0] == 0),
+                 key=_ts_desc, reverse=True)
+    otras = sorted((t for t in rel_map.values() if t[0] == 1),
+                   key=_ts_desc, reverse=True)
+    rel = (fam + otras)[:6]
+    rel_h = ""
+    if rel:
+        filas_rel = []
+        for _, q in rel:
+            qt = html.escape((q.get("titulo") or "")[:80])
+            qa = html.escape(nombres_area.get(q.get("area"),
+                                              q.get("area") or "?"))
+            filas_rel.append(
+                f"<a class='rel-nota' href='/redaccion/nota?id="
+                f"{q.get('id')}'>"
+                f"<span class='rel-t'>{qt}</span>"
+                f"<span class='rel-m'>{_area_icono(q.get('area'),10)} "
+                f"{qa} · {html.escape(q.get('nombre') or '')} · "
+                f"{fmt_fecha(q.get('ts',''))}</span></a>")
+        rel_h = ("<h3 class='nota-rel-t'>Notas relacionadas</h3>"
+                 + "".join(filas_rel))
+
+    # ── notas del equipo sobre la publicación ──
+    comentarios = p.get("comentarios") or []
+    com_items = "".join(
+        f"<div class='com-item'><div class='com-head'>"
+        f"<b>{html.escape(_red_nombre(c.get('de', '')))}</b>"
+        f"<span class='meta'>{fmt_fecha(c.get('ts', ''))}</span></div>"
+        f"<div class='com-txt'>{html.escape(c.get('texto', ''))}</div>"
+        f"</div>" for c in comentarios[-30:])
+    com_form = ("" if "@demo.local" in (email or "") else
+                f"<form method='post' action='/redaccion/comentar' "
+                f"class='rb-form' style='margin-top:.55rem'>"
+                f"<input type='hidden' name='id' value='{p.get('id')}'>"
+                f"<input type='hidden' name='volver' "
+                f"value='/redaccion/nota?id={p.get('id')}'>"
+                f"<input name='texto' required maxlength='500' "
+                f"placeholder='Deja una nota para el equipo…' "
+                f"style='flex:1;min-width:180px'>"
+                f"<button class='rb'>comentar</button></form>")
+    com_h = ("<h3 class='nota-rel-t'>Notas del equipo"
+             + (f" ({len(comentarios)})" if comentarios else "")
+             + "</h3>"
+             + (com_items or "<p class='meta'>Aún no hay notas.</p>")
+             + com_form)
+
+    return (_RED_CSS +
+            "<p class='meta' style='margin:.2rem 0'><a href='javascript:"
+            "history.back()' style='color:#1a237e;text-decoration:none'>"
+            "← volver</a></p>"
+            "<article class='red-form nota' style='max-width:780px'>"
+            f"<div class='nota-kicker'>{_area_icono(p.get('area'),12)} "
+            f"{anombre}{urgente}</div>"
+            f"<h1 class='nota-titulo'>{titulo_h}</h1>"
+            + lead_h + meta_row +
+            f"<div class='nota-cuerpo'>{cuerpo}</div>"
+            + "".join(media_h) + asign_h + interes_h + rel_h + com_h +
+            "</article>")
+
+
+# ── asistente IA de la redacción ─────────────────────────────────
+# chat para supervisión: recupera las notas más relevantes por
+# palabra clave y las manda como contexto a _llm (Gemini → Ollama)
+
+def _chat_path(email: str):
+    safe = re.sub(r"[^a-z0-9@._-]", "_", (email or "").lower())
+    return BASE / f"asistente_{safe}.json"
+
+
+def _chat_cargar(email: str) -> list:
+    try:
+        return json.loads(_chat_path(email).read_text())
+    except Exception:
+        return []
+
+
+def _chat_guardar(email: str, msgs: list):
+    try:
+        _chat_path(email).write_text(
+            json.dumps(msgs[-15:], ensure_ascii=False))
+    except Exception:
+        pass
+
+
+_STOP_ASIS = {
+    "que","los","las","una","uno","unos","unas","con","por","para",
+    "del","como","mas","más","sus","este","esta","esto","hay","fue",
+    "son","ser","sea","sobre","entre","desde","hasta","donde","cuando",
+    "quien","cual","cuales","cómo","muy","ya","han","era","the","and",
+    "of","in","on","at","to","a","y","o","e","u","de","en","el","la",
+    "lo","un","al","es","se","su","me","te","le","nos","les","mi",
+    "tu","mis","tus","no","si","sí","ni","pero","porque","pues",
+    "aunque","mientras","durante","tras","ante","bajo","sin","segun",
+    "según","hacia","nota","notas","noticia","noticias","publicacion",
+    "publicación","redacción","redaccion","hay","tienen","tener"}
+
+
+def _asistente_responder(pregunta: str, cfg: dict):
+    """Devuelve (respuesta_texto, notas_contexto). Recuperación por
+    palabra clave sobre titulo/resumen/texto/fuente — sin embeddings,
+    suficiente para la demo."""
+    posts = cargar_publicaciones()
+    agujas = [t for t in _agujas_buscar(pregunta)
+              if t not in _STOP_ASIS and len(t) > 2]
+    if not agujas:
+        return ("Escribe una pregunta con términos concretos — por "
+                "ejemplo un lugar, persona o tema de la cobertura.", [])
+    scored = []
+    for p in posts:
+        txt = normalizar(" ".join(
+            str(p.get(k) or "") for k in
+            ("titulo", "resumen", "texto", "fuente")))
+        sc = sum(1 for t in agujas if termino_en(t, txt))
+        if sc:
+            scored.append((sc, p))
+    scored.sort(key=lambda x: -x[0])
+    # prioridad: notas que cubren TODAS las agujas; si ninguna, las
+    # de mayor coincidencia parcial
+    completos = [p for sc, p in scored if sc == len(agujas)]
+    top = (completos or [p for _, p in scored])[:6]
+    if not top:
+        return ("No encontré notas relacionadas con esa pregunta en "
+                "la redacción — prueba con otros términos.", [])
+    ctx = []
+    for p in top:
+        ctx.append(
+            f"[{p.get('id')}] {p.get('titulo') or ''} | "
+            f"{p.get('area','')} | {p.get('fuente','')} | "
+            f"{fmt_fecha(p.get('ts',''))} | por {p.get('nombre','')}\n"
+            f"{(p.get('resumen') or '')}\n"
+            f"{(p.get('texto') or '')[:700]}")
+    prompt = (
+        "Eres el asistente de la redacción del TSJT (Tabasco). "
+        "Respondes preguntas de supervisión sobre las notas internas "
+        "de la redacción. Reglas: español, directo, máximo 150 "
+        "palabras; cita las notas por su id entre corchetes [id] "
+        "cuando las uses; si te preguntan si una nota está relacionada "
+        "con otra, explica por qué (mismo tema, misma familia, mismo "
+        "evento); si no hay base en las notas, dilo claro. "
+        "NUNCA inventes datos ni ids de notas que no estén en la "
+        "lista — si no sabes, dilo.\n\n"
+        f"PREGUNTA: {pregunta}\n\nNOTAS DE LA REDACCIÓN:\n\n"
+        + "\n\n---\n\n".join(ctx))
+    resp = _llm(cfg, prompt, timeout=90)
+    if not resp or resp.startswith("(no se pudo"):
+        resp = ("El modelo no respondió a tiempo — intenta de nuevo "
+                "en un momento.")
+    # anti-alucinación: cualquier [id] citado que NO esté entre las
+    # notas del contexto se invalida — el LLM no puede fabricar
+    # referencias
+    validos = {str(p.get("id")) for p in top}
+    resp = re.sub(
+        r"\[(r?[a-z0-9]{6,})\]",
+        lambda m: m.group(0) if m.group(1) in validos
+        else "[id no válido]", resp)
+    return resp, top
+
+
+def vista_asistente(email: str) -> str:
+    """Chat IA para supervisión: historial + caja de pregunta. Las
+    respuestas citan las notas usadas como contexto con links."""
+    msgs = _chat_cargar(email)
+    burbujas = []
+    nombres_area = {a.get("id"): a.get("nombre", "")
+                    for a in areas_redaccion(
+                        json.loads(CONFIG.read_text()))}
+    for m in msgs:
+        quien = "tú" if m.get("rol") == "q" else "asistente"
+        cls = "asis-q" if m.get("rol") == "q" else "asis-a"
+        cuerpo = m.get("texto", "")
+        # el LLM a veces escribe markdown — normalizar: [[id]](url) y
+        # [id](url) → [id]; **negrita** → <b>
+        cuerpo = re.sub(r"\[\[\s*([^\]]+?)\s*\]\]\([^)]*\)",
+                        r"[\1]", cuerpo)
+        cuerpo = re.sub(r"\[\s*([^\]]+?)\s*\]\([^)]*\)",
+                        r"[\1]", cuerpo)
+        cuerpo = html.escape(cuerpo)
+        cuerpo = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", cuerpo)
+        # citas [id] → botón "ver nota"
+        def _link(mm):
+            return (f"<a class='rb' style='height:20px;font-size:.62rem;"
+                    f"padding:0 8px;margin:0 2px;display:inline-block' "
+                    f"href='/redaccion/nota?id={mm.group(1)}'>"
+                    f"ver nota</a>")
+        cuerpo = re.sub(r"\[(r?[a-z0-9]{6,})\]", _link, cuerpo)
+        burbujas.append(
+            f"<div class='asis-msg {cls}'><div class='asis-quien'>"
+            f"{quien}</div><div>{cuerpo}</div></div>")
+    chips = "".join(
+        f"<button class='rb' style='height:22px;font-size:.68rem' "
+        f"onclick=\"document.getElementById('asis-q').value='{html.escape(q, quote=True)}';"
+        f"document.getElementById('asis-f').submit()\">{html.escape(q)}</button>"
+        for q in ["¿Qué notas hay sobre Sheinbaum?",
+                  "¿Qué está pasando con la Resistencia Cívica?",
+                  "¿Qué notas comparten tema entre sí?"])
+    return (_RED_CSS +
+            "<h2 style='font-size:1rem;margin:.2rem 0 .6rem'>"
+            "Asistente de la redacción</h2>"
+            "<div class='meta' style='margin-bottom:.7rem;font-size:.78rem'>"
+            "Pregunta sobre la cobertura — el asistente busca en las "
+            "notas publicadas y responde con contexto.</div>"
+            "<div class='asis-log'>" + "".join(burbujas) +
+            ("<p class='meta'>sin conversación todavía — haz la "
+             "primera pregunta ↓</p>" if not burbujas else "")
+            + "</div>"
+            f"<div class='asis-sugs'>{chips}</div>"
+            "<form method='post' action='/asistente' id='asis-f' "
+            "style='display:flex;gap:.5rem;margin-top:.6rem'>"
+            "<input type='text' name='pregunta' id='asis-q' required "
+            "placeholder='pregunta sobre la cobertura…' "
+            "style='flex:1'>"
+            "<button class='rb' style='height:34px'>preguntar</button>"
+            "</form>"
+            "<div class='meta' style='font-size:.68rem;margin-top:.6rem'>"
+            "respuesta generada con IA a partir de las notas "
+            "publicadas — los ids citados siempre llevan a su fuente; "
+            "verifica antes de circular.</div>")
+
+
+_IA_CACHE = {}
+
+
+def vista_nota_ia(email: str, pid: str) -> str:
+    """Contexto IA de UNA nota (botón ✦ de la tarjeta): resumen del
+    caso + por qué se relaciona con otras notas. Cacheado por id —
+    no se gasta LLM dos veces en la misma pieza."""
+    cfg = json.loads(CONFIG.read_text())
+    posts = cargar_publicaciones()
+    p = next((x for x in posts if x.get("id") == pid), None)
+    if not p:
+        return ("<h1>Nota no encontrada</h1><p class='meta'>La "
+                "publicación no existe.</p>")
+    if pid not in _IA_CACHE:
+        # candidatas relacionadas: misma familia + titular con
+        # palabras clave compartidas
+        claves = {w for w in normalizar(p.get("titulo") or "").split()
+                  if len(w) > 4}
+        rel = []
+        for q in posts:
+            if q.get("id") == pid:
+                continue
+            if p.get("familia") and q.get("familia") == p.get("familia"):
+                rel.append(q)
+                continue
+            tq = set(normalizar(q.get("titulo") or "").split())
+            if len(claves & {w for w in tq if len(w) > 4}) >= 2:
+                rel.append(q)
+        rel = rel[:5]
+        area = next((a for a in areas_redaccion(cfg)
+                     if a.get("id") == p.get("area")), {})
+        rel_txt = "\n".join(
+            f"[{q.get('id')}] {q.get('titulo','')} | "
+            f"{q.get('area','')} | {q.get('fuente','')} | "
+            f"{fmt_fecha(q.get('ts',''))}" for q in rel) or "(ninguna)"
+        prompt = (
+            "Eres el asistente de la redacción del TSJT. En 3-5 líneas "
+            "resume el contexto de esta nota y explica con qué otras "
+            "notas se relaciona (mismo tema, familia o evento). "
+            "Cita notas relacionadas por su id entre corchetes [id]. "
+            "Español, directo.\n\n"
+            f"NOTA [{pid}] {p.get('titulo','')} | "
+            f"{area.get('nombre', p.get('area',''))} | "
+            f"{p.get('fuente','')} | {fmt_fecha(p.get('ts',''))} | "
+            f"por {p.get('nombre','')}\n"
+            f"{(p.get('resumen') or '')}\n"
+            f"{(p.get('texto') or '')[:900]}\n\n"
+            f"NOTAS RELACIONADAS CANDIDATAS:\n{rel_txt}")
+        resp = _llm(cfg, prompt, timeout=90) \
+            or "El modelo no respondió — intenta de nuevo."
+        # anti-alucinación: solo los ids que el modelo realmente vio
+        # (la nota + las relacionadas candidatas) pueden citarse
+        validos = {str(pid)} | {str(q.get("id")) for q in rel}
+        resp = re.sub(
+            r"\[(r?[a-z0-9]{6,})\]",
+            lambda m: m.group(0) if m.group(1) in validos
+            else "[id no válido]", resp)
+        _IA_CACHE[pid] = resp
+    resp = _IA_CACHE[pid]
+    # normalizar markdown del LLM y convertir citas en botones
+    resp = re.sub(r"\[\[\s*([^\]]+?)\s*\]\]\([^)]*\)", r"[\1]", resp)
+    resp = re.sub(r"\[\s*([^\]]+?)\s*\]\([^)]*\)", r"[\1]", resp)
+    cuerpo = html.escape(resp)
+    cuerpo = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", cuerpo)
+    def _link(mm):
+        return (f"<a class='rb' style='height:20px;font-size:.62rem;"
+                f"padding:0 8px;margin:0 2px;display:inline-block' "
+                f"href='/redaccion/nota?id={mm.group(1)}'>"
+                f"ver nota</a>")
+    cuerpo = re.sub(r"\[(r?[a-z0-9]{6,})\]", _link, cuerpo)
+    cuerpo = cuerpo.replace("\n", "<br>")
+    return (_RED_CSS +
+            "<p class='meta' style='margin:.2rem 0'><a href='javascript:"
+            "history.back()' style='color:#1a237e;text-decoration:none'>"
+            "← volver</a></p>"
+            "<article class='red-form nota' style='max-width:780px'>"
+            f"<h1 class='nota-titulo' style='font-size:1.1rem'>"
+            f"{html.escape(p.get('titulo') or '')}</h1>"
+            "<div class='asis-a' style='margin:.8rem 0'>"
+            "<div class='asis-quien'>✦ contexto IA</div>"
+            f"<div>{cuerpo}</div></div>"
+            "<div class='meta'><a class='rb' "
+            f"href='/redaccion/nota?id={pid}'>ver noticia completa →</a>"
+            "</div></article>")
+
+
+# ── chat interno de la redacción ──────────────────────────────────
+# canales en chats.json, mensajes en chat_msg.jsonl ({canal,de,ts,
+# texto}). 'general' existe siempre y es visible para todos; los demás
+# canales los crea supervisión. Lectura para todos, escritura solo
+# usuarios reales (demo guest = solo lectura).
+CHAT_JSON = BASE / "chats.json"
+CHAT_MSG = BASE / "chat_msg.jsonl"
+
+
+def cargar_canales() -> list:
+    try:
+        cs = json.loads(CHAT_JSON.read_text()).get("canales", [])
+    except Exception:
+        cs = []
+    if not any(c.get("id") == "general" for c in cs):
+        cs.insert(0, {"id": "general", "nombre": "General",
+                      "ts": datetime.now().isoformat(timespec="seconds")})
+        _guardar_canales(cs)
+    return cs
+
+
+def _guardar_canales(cs: list):
+    _escribir_json(CHAT_JSON, {"canales": cs})
+
+
+def cargar_msgs(canal: str, limite: int = 300) -> list:
+    out = []
+    try:
+        for ln in CHAT_MSG.read_text().splitlines():
+            try:
+                m = json.loads(ln)
+            except Exception:
+                continue
+            if m.get("canal") == canal:
+                out.append(m)
+    except FileNotFoundError:
+        pass
+    return out[-limite:]
+
+
+def agregar_msg(canal: str, de: str, texto: str):
+    with CHAT_MSG.open("a") as f:
+        f.write(json.dumps(
+            {"canal": canal, "de": de,
+             "ts": datetime.now().isoformat(timespec="seconds"),
+             "texto": texto}, ensure_ascii=False) + "\n")
+
+
+def _chat_burbuja(m: dict, email: str) -> str:
+    mio = m.get("de") == email
+    quien = html.escape(_red_nombre(m.get("de", "")))
+    hora = fmt_fecha(m.get("ts", ""))
+    return (f"<div class='chat-msg{' mio' if mio else ''}'>"
+            f"<div class='chat-quien'>{quien} · {hora}</div>"
+            f"<div class='chat-txt'>{html.escape(m.get('texto', ''))}"
+            f"</div></div>")
+
+
+def _chat_css() -> str:
+    return """
+<style>
+.chat-wrap{display:flex;gap:.8rem;align-items:stretch;height:70vh;
+  max-width:1000px}
+.chat-side{flex:0 0 190px;display:flex;flex-direction:column;gap:.35rem;
+  overflow-y:auto}
+.chat-side a{display:block;padding:.5rem .7rem;border-radius:10px;
+  border:1px solid #2c3a72;background:rgba(255,255,255,.04);
+  color:#cfd6ff;text-decoration:none;font-size:.82rem}
+.chat-side a.on{border-color:#7c4dff;background:rgba(124,77,255,.15);
+  color:#fff;font-weight:600}
+.chat-main{flex:1;display:flex;flex-direction:column;min-width:0;
+  border:1px solid #2c3a72;border-radius:12px;background:rgba(15,20,52,.6);
+  overflow:hidden}
+.chat-hilo{flex:1;overflow-y:auto;padding:.7rem;display:flex;
+  flex-direction:column;gap:.45rem}
+.chat-msg{max-width:78%;padding:.45rem .7rem;border-radius:12px;
+  background:rgba(255,255,255,.06);border:1px solid #2c3a72;
+  align-self:flex-start}
+.chat-msg.mio{align-self:flex-end;background:rgba(57,73,171,.35);
+  border-color:#5c6bc0}
+.chat-quien{font-size:.62rem;color:#8a93b8;margin-bottom:.15rem}
+.chat-txt{font-size:.85rem;color:#eef1ff;white-space:pre-wrap;
+  line-height:1.45;word-break:break-word}
+.chat-form{display:flex;gap:.4rem;padding:.55rem;border-top:1px solid
+  #2c3a72}
+.chat-form input{flex:1;font-size:.85rem;padding:.5rem .7rem;border-radius:
+  10px;border:1px solid #33415f;background:#0d1330;color:#eef1ff}
+.chat-nuevo{display:flex;gap:.35rem;margin-top:.5rem}
+.chat-nuevo input{flex:1;font-size:.78rem;padding:.4rem .6rem;border-radius:
+  8px;border:1px solid #33415f;background:#0d1330;color:#eef1ff}
+.chat-vacio{color:#8a93b8;font-size:.8rem;text-align:center;
+  margin:auto}
+html.tema-claro .chat-side a{background:#fff;color:#444;
+  border-color:#e2e2e8}
+html.tema-claro .chat-side a.on{background:#1a237e;color:#fff;
+  border-color:#1a237e}
+html.tema-claro .chat-main{background:#fff;border-color:#e2e2e8}
+html.tema-claro .chat-msg{background:#f4f4f6;border-color:#e2e2e8}
+html.tema-claro .chat-msg.mio{background:#e8eaf6;border-color:#9fa8da}
+html.tema-claro .chat-txt{color:#333}
+html.tema-claro .chat-quien{color:#999}
+html.tema-claro .chat-form{border-color:#e2e2e8}
+html.tema-claro .chat-form input,html.tema-claro .chat-nuevo input{
+  background:#fff;color:#222;border-color:#ccc}
+@media (max-width:760px){.chat-wrap{flex-direction:column;height:auto}
+  .chat-side{flex-direction:row;overflow-x:auto;flex:none}
+  .chat-side a{white-space:nowrap}.chat-main{min-height:50vh}}
+</style>"""
+
+
+def vista_chat(email: str, canal: str = "general") -> str:
+    cfg = json.loads(CONFIG.read_text())
+    canales = cargar_canales()
+    if canal not in {c.get("id") for c in canales}:
+        canal = "general"
+    msgs = cargar_msgs(canal)
+    es_demo = "@demo.local" in (email or "")
+    sup = es_supervisor(email, cfg)
+
+    items = "".join(
+        f"<a href='/chat?c={c.get('id')}' "
+        f"class='{'on' if c.get('id') == canal else ''}'>"
+ f"{html.escape(c.get('nombre') or c.get('id'))}</a>"
+        for c in canales)
+    # supervisión crea canales nuevos
+    nuevo = ("" if es_demo or not sup else
+             "<form method='post' action='/chat/canal' class='chat-nuevo'>"
+             "<input name='nombre' placeholder='nuevo canal…' "
+             "maxlength='40' required>"
+             "<button class='rb'>+</button></form>")
+
+    hilo = "".join(_chat_burbuja(m, email) for m in msgs) or \
+        "<div class='chat-vacio'>Sin mensajes todavía — rompe el hielo.</div>"
+    form = ("" if es_demo else
+            "<form method='post' action='/chat/enviar' class='chat-form'>"
+            f"<input type='hidden' name='canal' value='{canal}'>"
+            "<input name='texto' placeholder='Escribe al equipo…' "
+            "autocomplete='off' required maxlength='1000'>"
+            "<button class='rb'>enviar</button></form>")
+
+    js = f"""
+<script>
+var _chatUlt = {len(msgs)};
+var _chatCanal = {canal!r};
+function _chatPoll(){{
+  fetch('/chat/hilo?c='+encodeURIComponent(_chatCanal)
+        +'&desde='+_chatUlt)
+  .then(function(r){{return r.json()}}).then(function(d){{
+    if(!d.n)return;
+    var h=document.getElementById('chat-hilo');if(!h)return;
+    var tmp=document.createElement('div');tmp.innerHTML=d.html;
+    while(tmp.firstChild)h.appendChild(tmp.firstChild);
+    _chatUlt=d.idx;
+    h.scrollTop=h.scrollHeight;
+    var vac=h.querySelector('.chat-vacio');if(vac)vac.remove();
+  }}).catch(function(){{}});
+}}
+setInterval(_chatPoll,8000);
+var _ch=document.getElementById('chat-hilo');
+if(_ch)_ch.scrollTop=_ch.scrollHeight;
+var _ci=document.querySelector('.chat-form input[name=texto]');
+if(_ci)_ci.focus();
+</script>"""
+
+    return (_chat_css() + _RED_CSS +
+            "<h2 style='font-size:1rem;margin:.2rem 0 .6rem'>Chat de la "
+            "redacción</h2>"
+            "<div class='chat-wrap'>"
+            f"<div class='chat-side'>{items}{nuevo}</div>"
+            "<div class='chat-main'>"
+            f"<div class='chat-hilo' id='chat-hilo'>{hilo}</div>"
+            f"{form}</div></div>" + js)
+
+
+def _chat_hilo_html(canal: str, desde: int, email: str) -> dict:
+    """Mensajes del canal a partir del índice 'desde' → HTML + nuevo
+    índice. Índice (no timestamp) porque dos mensajes pueden caer en
+    el mismo segundo y se perdería el segundo."""
+    msgs = cargar_msgs(canal, limite=500)
+    nuevos = msgs[int(desde):] if desde.isdigit() else msgs
+    html_ = "".join(_chat_burbuja(m, email) for m in nuevos)
+    return {"n": len(nuevos), "html": html_, "idx": len(msgs)}
+
+
+def aplicar_accion_chat(ruta: str, form: dict, email: str) -> str:
+    """POSTs del chat → redirect de regreso."""
+    cfg = json.loads(CONFIG.read_text())
+    canales = cargar_canales()
+    ids = {c.get("id") for c in canales}
+    if ruta.endswith("/chat/canal"):
+        if not es_supervisor(email, cfg):
+            return "/chat"
+        nombre = form.get("nombre", [""])[0].strip()[:40]
+        if nombre:
+            cid = re.sub(r"[^a-z0-9]+", "-",
+                         normalizar(nombre)).strip("-") or \
+                "c" + secrets.token_hex(3)
+            if cid not in ids:
+                canales.append({"id": cid, "nombre": nombre,
+                                "ts": datetime.now().isoformat(
+                                    timespec="seconds")})
+                _guardar_canales(canales)
+                return f"/chat?c={cid}"
+        return "/chat"
+    # /chat/enviar
+    if "@demo.local" in (email or ""):
+        return "/chat"
+    canal = form.get("canal", ["general"])[0]
+    if canal not in ids:
+        canal = "general"
+    texto = form.get("texto", [""])[0].strip()[:1000]
+    if texto:
+        agregar_msg(canal, email, texto)
+    return f"/chat?c={canal}"
+
+
 def render_pagina(contenido: str, q: str = "", base: str = "",
-                  og_img: str = "",
+                  og_img: str = "", wide: bool = False,
                   usuario: str = "", og_title: str = "",
                   og_desc: str = "") -> bytes:
     cfg = json.loads(CONFIG.read_text())
@@ -10561,12 +13506,41 @@ def render_pagina(contenido: str, q: str = "", base: str = "",
     # guests (demo 24h): solo noticias/alertas/portadas — el producto
     # judicial (interés, columnas, síntesis, fuentes) es de pago
     # tab X oculto mientras la sesión está pausada
-    tabs_reg = ('<a href="/telegram">TG</a>'
-                '<a href="/columnas">Columnas</a>'
-                '<a href="/interes">Interés</a>'
-                '<a href="/resumenes">Resúmenes</a>'
-                '<a href="/fuentes">Fuentes</a>'
-                if "@demo.local" not in usuario else "")
+    # redacción es el producto: supervisión y colaboradores ven SOLO
+    # sus secciones — el monitor de prensa queda empaquetado (las
+    # rutas viejas siguen vivas por URL, solo salen del menú)
+    en_redaccion = bool(usuario) and (
+        "@demo.local" in usuario
+        or es_supervisor(usuario, cfg) or area_de_usuario(usuario, cfg))
+    tabs_base = ("" if en_redaccion else
+                 '<a href="/noticias">Noticias</a>'
+                 '<a href="/alertas">Alertas</a>'
+                 '<a href="/portadas">Portadas</a>')
+    if usuario and "@demo.local" in usuario:
+        # invitado: deck + chat (solo lectura) en modo demo
+        tabs_reg = ('<a href="/redaccion">Redacción</a>'
+                    '<a href="/chat">Chat</a>')
+        admin_tabs = ""
+    elif en_redaccion:
+        tabs_reg = ""
+        admin_tabs = ""
+        if es_supervisor(usuario, cfg) \
+                or area_de_usuario(usuario, cfg):
+            tabs_reg += '<a href="/redaccion">Redacción</a>'
+        if area_de_usuario(usuario, cfg):
+            tabs_reg += '<a href="/area">Mi área</a>'
+        tabs_reg += '<a href="/redaccion/reporte">Reporte</a>'
+        tabs_reg += '<a href="/chat">Chat</a>'
+        if es_supervisor(usuario, cfg):
+            tabs_reg += '<a href="/bitacora">Bitácora</a>'
+            tabs_reg += '<a href="/asistente">Asistente</a>'
+    else:
+        tabs_reg = ('<a href="/telegram">TG</a>'
+                    '<a href="/columnas">Columnas</a>'
+                    '<a href="/interes">Interés</a>'
+                    '<a href="/resumenes">Resúmenes</a>'
+                    '<a href="/fuentes">Fuentes</a>'
+                    if "@demo.local" not in usuario else "")
     # nombre en el header: perfil 'nombre' si lo trae, si no el
     # local-part del email (paolo@… → paolo); guest → invitado
     if usuario:
@@ -10579,6 +13553,13 @@ def render_pagina(contenido: str, q: str = "", base: str = "",
         nombre_u = ""
     return PAGINA.format(contenido=contenido, q=html.escape(q),
                          base=base, admin_tabs=admin_tabs,
+                         main_cls=' class="wide"' if wide else "",
+                         # refresh ciego cada 60s: solo para el producto
+                         # viejo — redacción usa polling inteligente
+                         refresh_tag=("" if en_redaccion else
+                                      '<meta http-equiv="refresh" '
+                                      'content="60">'),
+                         tabs_base=tabs_base,
                          tabs_reg=tabs_reg, usuario=html.escape(usuario),
                          usuario_html=html.escape(nombre_u),
                          og_title=html.escape(og_title or
@@ -10587,7 +13568,7 @@ def render_pagina(contenido: str, q: str = "", base: str = "",
                              "Monitor de noticias del Poder Judicial de "
                              "Tabasco: prensa del Magistrado Presidente y "
                              "el TSJT, alertas por tema y síntesis "
-                             "ejecutivas. Powered by Olmeca Code."),
+                             "ejecutivas. Powered by PIRIA."),
                          og_img=html.escape(og_img or
                              f"{base}/og.png")).encode()
 
@@ -11166,6 +14147,161 @@ def servir_web(puerto: int):
                                          og_title="Columnas — @noticias",
                                          og_desc="Opinión y columnas de la prensa "
                                                  "monitoreada."))
+            elif ruta.path == "/redaccion":
+                cfg_r = json.loads(CONFIG.read_text())
+                if not email or not ("@demo.local" in email
+                                     or es_supervisor(email, cfg_r)
+                                     or area_de_usuario(email, cfg_r)):
+                    self.send_response(303)
+                    self.send_header("Location", "/noticias")
+                    self.end_headers()
+                    return
+                self._html(render_pagina(
+                    vista_redaccion(email), base=base, usuario=email,
+                    wide=True,
+                    og_title="Redacción — @noticias",
+                    og_desc="Feed interno por área de comunicación "
+                            "social."))
+                _marcar_visto(email, "visto_redaccion")
+            elif ruta.path == "/redaccion/nota":
+                if not email:
+                    self.send_response(303)
+                    self.send_header("Location", "/noticias")
+                    self.end_headers()
+                    return
+                self._html(render_pagina(
+                    vista_publicacion(email, params.get("id", [""])[0]),
+                    base=base, usuario=email, wide=True,
+                    og_title="Nota — @noticias"))
+            elif ruta.path == "/redaccion/contador":
+                # polling del deck: {"n": nuevas desde la última vista}
+                email_c = email
+                if not email_c:
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                n = contador_redaccion(
+                    email_c, params.get("ctx", ["tablero"])[0])
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(json.dumps({"n": n}).encode())
+            elif ruta.path == "/asistente/nota":
+                email = self._usuario()
+                cfg_a = json.loads(CONFIG.read_text())
+                if not email or "@demo.local" in email \
+                        or not es_supervisor(email, cfg_a):
+                    self.send_response(303)
+                    self.send_header("Location", "/redaccion")
+                    self.end_headers()
+                    return
+                self._html(render_pagina(
+                    vista_nota_ia(email, params.get("id", [""])[0]),
+                    base=base, usuario=email))
+            elif ruta.path == "/asistente":
+                email = self._usuario()
+                cfg_a = json.loads(CONFIG.read_text())
+                if not email or "@demo.local" in email \
+                        or not es_supervisor(email, cfg_a):
+                    self.send_response(303)
+                    self.send_header("Location", "/redaccion")
+                    self.end_headers()
+                    return
+                self._html(render_pagina(vista_asistente(email),
+                                         base=base, usuario=email))
+            elif ruta.path == "/redaccion/reporte":
+                cfg_r = json.loads(CONFIG.read_text())
+                if not email or "@demo.local" in email or not (
+                        es_supervisor(email, cfg_r)
+                        or area_de_usuario(email, cfg_r)):
+                    self.send_response(303)
+                    self.send_header("Location", "/noticias")
+                    self.end_headers()
+                    return
+                try:
+                    h = int(params.get("h", ["6"])[0])
+                except (ValueError, IndexError):
+                    h = 6
+                self._html(render_pagina(
+                    vista_reporte_redaccion(email, h), base=base,
+                    usuario=email, wide=True,
+                    og_title="Reporte — @noticias"))
+            elif ruta.path == "/bitacora":
+                cfg_b = json.loads(CONFIG.read_text())
+                if not email or "@demo.local" in email or not (
+                        es_supervisor(email, cfg_b)
+                        or area_de_usuario(email, cfg_b)):
+                    self.send_response(303)
+                    self.send_header("Location", "/noticias")
+                    self.end_headers()
+                    return
+                self._html(render_pagina(
+                    vista_bitacora(email), base=base, usuario=email,
+                    wide=True, og_title="Bitácora — @noticias"))
+            elif ruta.path == "/chat":
+                if not email:
+                    self.send_response(303)
+                    self.send_header("Location", "/noticias")
+                    self.end_headers()
+                    return
+                self._html(render_pagina(
+                    vista_chat(email, params.get("c", ["general"])[0]),
+                    base=base, usuario=email, wide=True,
+                    og_title="Chat — @noticias"))
+            elif ruta.path == "/chat/hilo":
+                # polling del chat: JSON con burbujas nuevas
+                if not email:
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                d = _chat_hilo_html(
+                    params.get("c", ["general"])[0],
+                    params.get("desde", ["0"])[0], email)
+                body = json.dumps(d, ensure_ascii=False).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif ruta.path == "/area":
+                if not email or "@demo.local" in email:
+                    self.send_response(303)
+                    self.send_header("Location", "/noticias")
+                    self.end_headers()
+                    return
+                self._html(render_pagina(
+                    vista_area(email, params.get("v", ["area"])[0],
+                               params.get("msg", [""])[0],
+                               params.get("a", [""])[0]),
+                    base=base, usuario=email, wide=True,
+                    og_title="Mi área — @noticias"))
+                _marcar_visto(email, "visto_area")
+            elif ruta.path.startswith("/media/"):
+                # adjuntos de redacción — cualquier usuario logueado
+                # (invitados incluidos: es solo lectura del deck)
+                if not email:
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                nombre = ruta.path[len("/media/"):]
+                fp = (RED_MEDIA / nombre).resolve()
+                base_media = RED_MEDIA.resolve()
+                if not str(fp).startswith(str(base_media) + "/") \
+                        or not fp.is_file():
+                    self.send_error(404)
+                    return
+                ext = fp.suffix.lower()
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 CTYPE_POR_EXT.get(ext,
+                                                  "application/octet-stream"))
+                self.send_header("Content-Length", str(fp.stat().st_size))
+                self.send_header("Cache-Control",
+                                 "private, max-age=86400")
+                self.end_headers()
+                self.wfile.write(fp.read_bytes())
             elif ruta.path == "/interes":
                 self._html(render_pagina(vista_interes(
                     email, int(params.get("p", ["1"])[0])),
@@ -11497,7 +14633,24 @@ def servir_web(puerto: int):
                            429)
                 return
             largo = int(self.headers.get("Content-Length", 0))
-            form = parse_qs(self.rfile.read(largo).decode()) if largo else {}
+            raw = self.rfile.read(largo) if largo else b""
+            if ruta.path in ("/publicar", "/bitacora/nota"):
+                # multipart (subida de archivos) — no pasa por parse_qs
+                email = self._usuario()
+                ctype = self.headers.get("Content-Type", "")
+                destino = "/noticias"
+                if email and "@demo.local" not in email \
+                        and "multipart/form-data" in ctype \
+                        and "boundary=" in ctype:
+                    boundary = ctype.split("boundary=", 1)[1]\
+                        .strip().strip('"')
+                    destino = publicar_redaccion(
+                        parse_multipart(raw, boundary), email)
+                self.send_response(303)
+                self.send_header("Location", destino)
+                self.end_headers()
+                return
+            form = parse_qs(raw.decode("utf-8", "replace")) if largo else {}
             https = self._base().startswith("https")
 
             if ruta.path == "/login":
@@ -11506,6 +14659,10 @@ def servir_web(puerto: int):
                 pw = form.get("password", [""])[0]
                 if email and password_valida(email, pw, cfg):
                     perfil_usuario(email, cfg)  # autocrear en el primer login
+                    # la IP que ya entró con password correcta queda
+                    # exenta — el ISP rota la IP pública y el skip-list
+                    # de config se queda viejo (429 en login, añejo)
+                    _RL_AUTO.add(ip)
                     self.send_response(303)
                     self.send_header("Location",
                                      home_usuario(email))
@@ -11516,6 +14673,22 @@ def servir_web(puerto: int):
                     self._html(vista_login(self._base(),
                                            "Correo o contraseña "
                                            "incorrectos."))
+                return
+            if ruta.path == "/demo_entrar":
+                # acceso rápido sin password — solo con demo_login:true
+                cfg_d = json.loads(CONFIG.read_text())
+                email = form.get("email", [""])[0].strip().lower()
+                usuarios = cargar_usuarios()
+                if cfg_d.get("demo_login") and email in usuarios \
+                        and "@demo.local" not in email:
+                    self.send_response(303)
+                    self.send_header("Location", home_usuario(email))
+                    self.send_header("Set-Cookie",
+                                     cookie_sesion(email, https))
+                    self.end_headers()
+                else:
+                    self._html(vista_login(self._base(),
+                                           "Acceso demo no disponible."))
                 return
             if ruta.path == "/invitado":
                 # cool-down por IP: la demo gratis no se puede re-pedir
@@ -11539,7 +14712,7 @@ def servir_web(puerto: int):
                         "e.textContent=(m<10?'0':'')+m+':'+(x<10?'0':'')+x;"
                         "if(s>0){s--;setTimeout(t,1000);}}</script>"
                         "<script>t();</script>",
-                        base=base))
+                        base=self._base()))
                     return
                 usuarios = cargar_usuarios()
                 email = f"guest-{secrets.token_hex(4)}@demo.local"
@@ -11750,6 +14923,66 @@ def servir_web(puerto: int):
                                      + quote(msg))
                     self.end_headers()
                 return
+            if ruta.path == "/asistente":
+                email = self._usuario()
+                cfg_a = json.loads(CONFIG.read_text())
+                if not email or "@demo.local" in email \
+                        or not es_supervisor(email, cfg_a):
+                    self.send_response(303)
+                    self.send_header("Location", "/redaccion")
+                    self.end_headers()
+                    return
+                pregunta = (form.get("pregunta") or [""])[0].strip()[:500]
+                if pregunta:
+                    msgs = _chat_cargar(email)
+                    msgs.append({"rol": "q", "texto": pregunta})
+                    resp, top = _asistente_responder(pregunta, cfg_a)
+                    if top:
+                        resp += ("\n\nNotas usadas como contexto:\n"
+                                 + "\n".join(
+                                     f"- [{p.get('id')}] "
+                                     f"{(p.get('titulo') or '')[:70]}"
+                                     for p in top))
+                    msgs.append({"rol": "a", "texto": resp})
+                    _chat_guardar(email, msgs)
+                self.send_response(303)
+                self.send_header("Location", "/asistente")
+                self.end_headers()
+                return
+            if ruta.path in ("/chat/enviar", "/chat/canal"):
+                email = self._usuario()
+                if not email:
+                    self.send_response(303)
+                    self.send_header("Location", "/noticias")
+                    self.end_headers()
+                    return
+                destino = aplicar_accion_chat(ruta.path, form, email)
+                self.send_response(303)
+                self.send_header("Location", destino)
+                self.end_headers()
+                return
+            if ruta.path in ("/redaccion/interes", "/redaccion/asignar",
+                             "/redaccion/asignacion",
+                             "/redaccion/comentar",
+                             "/redaccion/orden",
+                             "/redaccion/colapsar",
+                             "/bitacora/nuevo",
+                             "/bitacora/vincular",
+                             "/bitacora/miembro",
+                             "/bitacora/resolver",
+                             "/redaccion/solicitar",
+                             "/redaccion/resolver"):
+                email = self._usuario()
+                if not email or "@demo.local" in email:
+                    self.send_response(303)
+                    self.send_header("Location", "/noticias")
+                    self.end_headers()
+                    return
+                destino = aplicar_accion_redaccion(ruta.path, form, email)
+                self.send_response(303)
+                self.send_header("Location", destino)
+                self.end_headers()
+                return
             if ruta.path in ("/config", "/fuentes", "/usuarios"):
                 email = self._usuario()
                 if not email:
@@ -11814,6 +15047,12 @@ def main():
             # recargar config cada ciclo: reglas editadas en el dashboard
             # aplican sin reiniciar
             cfg = json.loads(CONFIG.read_text())
+            # pausar_scraping: solo la webapp (redacción) — sin feeds,
+            # portadas, síntesis ni posts FB. Se reactiva quitando el
+            # flag (se relee cada vuelta, sin reiniciar el servicio)
+            if cfg.get("pausar_scraping"):
+                time.sleep(60)
+                continue
             # portadas primero: horas clavadas (00:30→06:45); revisar se
             # atasca ~4 min barriendo 95 feeds y desfasaba el PDF
             if toca_captura_portadas(cfg):
@@ -11873,4 +15112,9 @@ def main():
 
 
 if __name__ == "__main__":
+    sys.exit(main())
+    sys.exit(main())
+
+if __name__ == "__main__":
+    sys.exit(main())
     sys.exit(main())
