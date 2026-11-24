@@ -15,6 +15,7 @@ usuarios.json.bak*
 *.jsonl
 *.jsonl.bak*
 vistos.json
+rl_auto.json
 chats.json
 clusters.json
 demo_ips.json

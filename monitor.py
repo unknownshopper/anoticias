@@ -506,8 +506,48 @@ def url_https(url: str) -> str:
 _RL_HITS: dict = {}
 _RL_SKIP_IPS: set = set()
 _RL_SKIP_MT: float = 0
-_RL_AUTO: set = set()   # IPs que ya hicieron login exitoso en esta
-                        # sesión del proceso — exentas del rate limit
+RL_AUTO_FILE = BASE / "rl_auto.json"  # IPs con login exitoso
+_RL_AUTO: set = set()
+_RL_AUTO_LOADED = False
+
+
+def _rl_auto_ips() -> set:
+    """IPs exentas por login exitoso — persistidas en disco porque el
+    servicio se reinicia en cada deploy y la lista en memoria se
+    borraba, devolviendo a todo el equipo a la ventana de 10/min."""
+    global _RL_AUTO_LOADED, _RL_AUTO
+    if not _RL_AUTO_LOADED:
+        _RL_AUTO_LOADED = True
+        try:
+            _RL_AUTO = set(json.loads(RL_AUTO_FILE.read_text()))
+        except Exception:
+            _RL_AUTO = set()
+    return _RL_AUTO
+
+
+def _rl_auto_add(ip: str):
+    _rl_auto_ips().add(ip)
+    try:
+        RL_AUTO_FILE.write_text(json.dumps(sorted(_RL_AUTO)))
+    except Exception:
+        pass
+
+
+_RL_FAIL: dict = {}   # email → [ts de logins fallidos]
+
+
+def _login_bloqueado(email: str) -> bool:
+    """Fuerza bruta por CUENTA: >8 fallos en 10 min congela ese email.
+    La defensa real contra bots (que rotan IPs) sin castigar a una
+    oficina entera que comparte una sola IP pública."""
+    ahora = time.time()
+    fails = [t for t in _RL_FAIL.get(email, []) if ahora - t < 600]
+    _RL_FAIL[email] = fails
+    return len(fails) >= 8
+
+
+def _login_fallo(email: str):
+    _RL_FAIL.setdefault(email, []).append(time.time())
 
 
 def ratelimit_ok(ip: str, limite: int = 120, ventana: int = 60) -> bool:
@@ -522,7 +562,7 @@ def ratelimit_ok(ip: str, limite: int = 120, ventana: int = 60) -> bool:
                                .get("ratelimit_skip") or [])
     except Exception:
         pass
-    if ip in _RL_SKIP_IPS or ip in _RL_AUTO:
+    if ip in _RL_SKIP_IPS or ip in _rl_auto_ips():
         return True
     ahora = time.time()
     hits = [t for t in _RL_HITS.get(ip, []) if ahora - t < ventana]
@@ -14904,8 +14944,12 @@ def servir_web(puerto: int):
             ruta = urlparse(self.path)
             ip = self.headers.get("Cf-Connecting-Ip", "") or \
                 self.client_address[0]
-            # auth: 10 intentos/min — frena fuerza bruta y farm de invitados
-            limite = 10 if ruta.path in ("/login", "/invitado") else 120
+            # /login: 30/min por IP — la fuerza bruta la frena el bloqueo
+            # por cuenta (_login_bloqueado); una IP generosa no asfixia a
+            # una oficina compartiendo NAT. /invitado queda estricto
+            # porque las altas de invitado ya tienen su propio cool-down.
+            limite = 30 if ruta.path == "/login" else \
+                (10 if ruta.path == "/invitado" else 120)
             if not ratelimit_ok(ip, limite=limite):
                 self._html("<h1 style='font-family:system-ui;padding:2rem'>"
                            "Demasiadas solicitudes — espera un minuto.</h1>",
@@ -14936,12 +14980,18 @@ def servir_web(puerto: int):
                 cfg = json.loads(CONFIG.read_text())
                 email = form.get("email", [""])[0].strip().lower()
                 pw = form.get("password", [""])[0]
-                if email and password_valida(email, pw, cfg):
+                if email and _login_bloqueado(email):
+                    self._html("<h1 style='font-family:system-ui;"
+                               "padding:2rem'>Demasiados intentos en esa "
+                               "cuenta — espera unos minutos.</h1>", 429)
+                elif email and password_valida(email, pw, cfg):
                     perfil_usuario(email, cfg)  # autocrear en el primer login
+                    _RL_FAIL.pop(email, None)
                     # la IP que ya entró con password correcta queda
                     # exenta — el ISP rota la IP pública y el skip-list
-                    # de config se queda viejo (429 en login, añejo)
-                    _RL_AUTO.add(ip)
+                    # de config se queda viejo (429 en login, añejo).
+                    # Persiste en disco: cada deploy reinicia el proceso
+                    _rl_auto_add(ip)
                     self.send_response(303)
                     self.send_header("Location",
                                      home_usuario(email))
@@ -14949,6 +14999,8 @@ def servir_web(puerto: int):
                                      cookie_sesion(email, https))
                     self.end_headers()
                 else:
+                    if email:
+                        _login_fallo(email)
                     self._html(vista_login(self._base(),
                                            "Correo o contraseña "
                                            "incorrectos."))
