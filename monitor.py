@@ -11455,24 +11455,26 @@ def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
         filas = []
         for i, a in enumerate(asignaciones):
             pend = a.get("estado", "pendiente") == "pendiente"
-            puede = sup or a.get("para") == email
+            # el toggle de estado es solo de supervisión (Paolo):
+            # un icono — ⭕ pendiente / ✅ hecho — al frente de la fila
             toggle = (f"<form method='post' action='/redaccion/asignacion'"
                       f" style='display:inline'><input type='hidden' "
                       f"name='id' value='{p.get('id')}'>" f"<input type='hidden' name='volver' value='{ret}'>"
                       f"<input type='hidden' name='idx' value='{i}'>"
                       f"<input type='hidden' name='estado' value='"
                       f"{'hecho' if pend else 'pendiente'}'>"
-                      f"<button class='rb'>"
-                      f"{'✓ hecho' if pend else 'reabrir'}</button>"
-                      f"</form>" if puede else "")
+                      f"<button class='rb' title='"
+                      f"{'marcar hecho' if pend else 'reabrir'}'>"
+                      f"{'⭕' if pend else '✅'}</button>"
+                      f"</form>" if sup else "")
             filas.append(
-                f"<div class='red-asign-f'>"
-                f"→ <b>{html.escape(_red_nombre(a.get('para','')))}"
+                f"<div class='red-asign-f'>{toggle}"
+                f"<b>{html.escape(_red_nombre(a.get('para','')))}"
                 f"</b> · <span title='{html.escape(fmt_fecha(a.get('ts','')))}'>"
                 f"{fmt_relativo(a.get('ts',''))}</span> · "
                 f"<span style='color:{'#e6a23c' if pend else '#4caf7d'}'>"
                 f"{'pendiente' if pend else 'hecho'}</span> "
-                f"{html.escape(a.get('nota',''))} {toggle}</div>")
+                f"{html.escape(a.get('nota',''))}</div>")
         asig_h = ("<div class='red-asign'>"
                   + "".join(filas) + "</div>")
 
@@ -11610,6 +11612,9 @@ _RED_CSS = """
 .rb:hover{border-color:#7c4dff;color:#fff;background:rgba(124,77,255,.18);
   text-decoration:none;box-shadow:0 0 12px #7c4dff44}
 .rb.on{background:#3949ab;border-color:#7c4dff;color:#fff}
+.rb:disabled{opacity:.45;cursor:default}
+.rb:disabled:hover{border-color:#3a4a80;color:#cfd6ff;
+  background:rgba(255,255,255,.06);box-shadow:none}
 .rb svg{display:block;flex:none}
 .rb-n{background:#b03a2e;color:#fff;border-radius:8px;padding:0 5px;
   font-size:.62rem;font-weight:700;margin-left:2px;line-height:1.5}
@@ -11643,7 +11648,8 @@ _RED_CSS = """
 /* selección del tablero + menú asignar en lote (supervisión) */
 .red-sel{float:right;margin:1px 0 0 .4rem;accent-color:#7c8cf8;
   cursor:pointer}
-#red-asig{position:relative}
+#red-asig{position:relative;vertical-align:middle}
+#red-asig>summary{height:29px;box-sizing:border-box}
 .red-asig-menu{position:absolute;top:calc(100% + 6px);left:0;z-index:40;
   min-width:300px;background:rgba(13,18,48,.97);
   border:1px solid #3a4a80;border-radius:10px;padding:.6rem;
@@ -11671,7 +11677,8 @@ _RED_CSS = """
   background:rgba(124,77,255,.09)}
 .red-asign-f{font-size:.72rem;margin:.1rem 0 .3rem;
   display:flex;align-items:center;gap:.3rem;flex-wrap:wrap}
-.red-asign-f .rb{font-size:.64rem;height:21px;padding:0 8px}
+.red-asign-f .rb{font-size:.8rem;height:20px;padding:0 5px;
+  border-radius:10px}
 /* píldora flotante "N nuevas" — aparece sola cuando el polling
    detecta publicaciones recientes; entra con un slide-up suave */
 .red-pill{position:fixed;bottom:1.2rem;left:50%;z-index:60;
@@ -12712,8 +12719,8 @@ def aplicar_accion_redaccion(ruta: str, form: dict, email: str) -> str:
     if not (0 <= idx < len(asignaciones)):
         return "/area"
     a = asignaciones[idx]
-    if not (es_supervisor(email, cfg) or a.get("para") == email):
-        return "/area?msg=" + quote("No puedes cerrar esa asignación")
+    if not es_supervisor(email, cfg):
+        return "/area?msg=" + quote("Solo supervisión cierra asignaciones")
     a["estado"] = form.get("estado", ["hecho"])[0] \
         if form.get("estado", [""])[0] in ("hecho", "pendiente") \
         else "hecho"
