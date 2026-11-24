@@ -330,6 +330,28 @@ def fmt_fecha(iso: str) -> str:
         return iso[:16]
 
 
+def fmt_relativo(iso: str) -> str:
+    """'5min', '3h', '2d', '1sem', '3mes', '1a' — fecha compacta para
+    metas de tarjetas (la absoluta queda en el title)."""
+    try:
+        s = (datetime.now()
+             - datetime.fromisoformat(str(iso)[:19])).total_seconds()
+    except Exception:
+        return ""
+    s = max(0, s)
+    if s < 3600:
+        return f"{max(1, int(s // 60))}min"
+    if s < 86400:
+        return f"{int(s // 3600)}h"
+    if s < 604800:
+        return f"{int(s // 86400)}d"
+    if s < 2592000:
+        return f"{int(s // 604800)}sem"
+    if s < 31536000:
+        return f"{int(s // 2592000)}mes"
+    return f"{int(s // 31536000)}a"
+
+
 def purgar():
     """Retención: noticias y alertas solo RETENCION_DIAS días.
     Registros sin fecha parseable se conservan (no borramos a ciegas).
@@ -11359,7 +11381,8 @@ def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
             f"align-items:center'>"
             f"{_area_icono(p.get('area',''))}</span> "
             f"{html.escape(p.get('nombre') or _red_nombre(p.get('usuario','')))} · "
-            f"{fmt_fecha(p.get('ts',''))}{urgente}{ia_btn}"
+            f"<span title='{html.escape(fmt_fecha(p.get('ts','')))}'>"
+            f"{fmt_relativo(p.get('ts',''))}</span>{urgente}{ia_btn}"
             f"{(' · 💬' + str(len(p.get('comentarios') or []))) if p.get('comentarios') else ''}")
     # la tarjeta es solo titular + resumen (2 líneas) — la cuartilla
     # completa vive en /redaccion/nota
@@ -11424,7 +11447,9 @@ def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
             f"title='{'Quitar de' if es_fav else 'Agregar a'} "
             f"favoritos'>{'★' if es_fav else '☆'}</button>")
 
-    # ── asignaciones ──
+    # ── asignaciones VAN PRIMERO: quién la tiene asignada y en qué
+    # estado va es lo operativo — se pinta arriba de la tarjeta ──
+    asig_h = ""
     asignaciones = p.get("asignaciones") or []
     if asignaciones:
         filas = []
@@ -11437,19 +11462,19 @@ def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
                       f"<input type='hidden' name='idx' value='{i}'>"
                       f"<input type='hidden' name='estado' value='"
                       f"{'hecho' if pend else 'pendiente'}'>"
-                      f"<button class='rb' "
-                      f"style='font-size:.62rem;padding:2px 8px'>"
+                      f"<button class='rb'>"
                       f"{'✓ hecho' if pend else 'reabrir'}</button>"
                       f"</form>" if puede else "")
             filas.append(
-                f"<div style='font-size:.7rem;margin-top:.25rem'>"
+                f"<div class='red-asign-f'>"
                 f"→ <b>{html.escape(_red_nombre(a.get('para','')))}"
-                f"</b> · {fmt_fecha(a.get('ts',''))} · "
-                f"<span style='color:{'#b8860b' if pend else '#2e7d32'}'>"
+                f"</b> · <span title='{html.escape(fmt_fecha(a.get('ts','')))}'>"
+                f"{fmt_relativo(a.get('ts',''))}</span> · "
+                f"<span style='color:{'#e6a23c' if pend else '#4caf7d'}'>"
                 f"{'pendiente' if pend else 'hecho'}</span> "
                 f"{html.escape(a.get('nota',''))} {toggle}</div>")
-        secundario.append("<div style='margin-top:.3rem'>"
-                          + "".join(filas) + "</div>")
+        asig_h = ("<div class='red-asign'>"
+                  + "".join(filas) + "</div>")
 
     # ── unirse al seguimiento: el colaborador SOLICITA; aprueba el
     # autor de la nota, el creador del evento o supervisión ──
@@ -11510,7 +11535,7 @@ def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
             f"border-radius:10px;padding:.55rem .65rem;"
             f"margin-bottom:.55rem'>"
             f"<div class='meta' style='font-size:.68rem'>{meta}"
-            f"{sel_box}</div>"
+            f"{sel_box}</div>{asig_h}"
             f"<div style='font-size:.85rem;margin-top:.25rem'>{cuerpo}"
             f"</div>{ver_mas}{media_h}{loc_h}"
             f"<div class='red-act'>{''.join(acciones)}</div>"
@@ -11576,8 +11601,8 @@ _RED_CSS = """
 .red-post{max-width:720px;position:relative}
 /* botones de acción de redacción */
 .rb{display:inline-flex;align-items:center;justify-content:center;
-  gap:4px;font-size:.72rem;padding:0 10px;height:26px;
-  border-radius:13px;border:1px solid #3a4a80;
+  gap:5px;font-size:.76rem;padding:0 12px;height:29px;
+  border-radius:15px;border:1px solid #3a4a80;
   background:rgba(255,255,255,.06);color:#cfd6ff;
   cursor:pointer;line-height:1;font-family:inherit;white-space:nowrap;
   text-decoration:none;vertical-align:middle;box-sizing:border-box;
@@ -11639,7 +11664,14 @@ _RED_CSS = """
 .red-post[draggable=true]{cursor:grab}
 .red-star.on{color:#f6c344}
 .red-sub{margin-top:.35rem}
-.red-sub .rb{font-size:.62rem;height:22px;padding:0 8px}
+.red-sub .rb{font-size:.7rem;height:24px;padding:0 10px}
+/* bloque de asignaciones al tope de la tarjeta */
+.red-asign{margin:.45rem 0 .15rem;padding:.4rem .55rem .25rem;
+  border-left:3px solid #7c4dff;border-radius:0 8px 8px 0;
+  background:rgba(124,77,255,.09)}
+.red-asign-f{font-size:.72rem;margin:.1rem 0 .3rem;
+  display:flex;align-items:center;gap:.3rem;flex-wrap:wrap}
+.red-asign-f .rb{font-size:.64rem;height:21px;padding:0 8px}
 /* píldora flotante "N nuevas" — aparece sola cuando el polling
    detecta publicaciones recientes; entra con un slide-up suave */
 .red-pill{position:fixed;bottom:1.2rem;left:50%;z-index:60;
