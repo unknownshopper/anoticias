@@ -6783,42 +6783,6 @@ document.addEventListener('wheel',function(e){{
   if(Math.abs(e.deltaY)>Math.abs(e.deltaX)){{
     e.preventDefault();s.scrollLeft+=e.deltaY;}}}},
   {{passive:false}});
-// menú compartir (.compartirc): el dropdown vive dentro de la tarjeta
-// que está dentro de .posts con overflow → se recorta. Al abrirlo lo
-// movemos a <body> como position:fixed junto al botón: ya no hay
-// contenedor que lo corte. Se cierra con click fuera o al hacer scroll.
-document.addEventListener('toggle',function(e){{
-  var d=e.target;
-  if(!d.classList||!d.classList.contains('compartirc'))return;
-  var m=d._share||d.querySelector('.menu-share');if(!m)return;
-  if(d.open){{
-    d._share=m;
-    var s=d.querySelector('summary').getBoundingClientRect();
-    m.style.cssText='position:fixed;z-index:9999;display:flex;';
-    document.body.appendChild(m);
-    var mh=m.offsetHeight;
-    var top=s.bottom+6;
-    if(top+mh>innerHeight-8)top=Math.max(8,s.top-mh-6);
-    m.style.top=top+'px';
-    m.style.left=Math.max(8,Math.min(s.left,innerWidth-262))+'px';
-  }}else{{
-    m.style.cssText='';
-    if(m.parentNode!==d)d.appendChild(m);
-    d._share=null;
-  }}
-}},true);
-document.addEventListener('click',function(e){{
-  document.querySelectorAll('details.compartirc[open]').forEach(
-    function(d){{
-      var m=d._share||d.querySelector('.menu-share');
-      if((m&&m.contains(e.target))||d.contains(e.target))return;
-      d.open=false;
-    }});
-}},true);
-addEventListener('scroll',function(){{
-  document.querySelectorAll('details.compartirc[open]').forEach(
-    function(d){{d.open=false}});
-}},true);
 </script>
 </body></html>"""
 
@@ -11376,9 +11340,10 @@ def _area_icono(aid: str, size: int = 11) -> str:
 def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
               ) -> str:
     """Tarjeta de publicación — la usan la vista supervisor (columnas)
-    y la vista de área. Acciones: interés (todos los usuarios reales),
-    asignar (solo supervisión), marcar asignación hecha/pendiente
-    (supervisión o el asignado)."""
+    y la vista de área. En /redaccion lleva checkbox de selección
+    (compartir/asignar en lote desde la barra); acciones por tarjeta:
+    ver noticia, marcar asignación hecha/pendiente (supervisión o el
+    asignado), solicitar unirse al seguimiento."""
     area = next((a for a in areas_redaccion(cfg)
                  if a.get("id") == p.get("area")), {})
     anombre = html.escape(area.get("nombre") or p.get("area") or "?")
@@ -11417,22 +11382,11 @@ def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
 
     # ── acciones ──
     sup = es_supervisor(email, cfg)
-    pendientes = [a for a in (p.get("asignaciones") or [])
-                  if a.get("estado", "pendiente") == "pendiente"]
-    nombres_pend = ", ".join(
-        html.escape(_red_nombre(a.get("para", ""))) for a in pendientes)
-    badge_asig = (f"<b class='rb-n'>{len(pendientes)}</b>"
-                  if pendientes else "")
     ico_doc = ("<svg viewBox='0 0 16 16' width='11' height='11'>"
                "<path d='M4 1.5h5.5L13 5v9.5H4z'/><path d='M9.5 1.5V5H13'"
                "/></svg>")
     es_demo = "@demo.local" in (email or "")
     pid = p.get("id")
-    ico_share = ("<svg viewBox='0 0 16 16' width='11' height='11'>"
-                 "<path d='M8 1.8v7.4M4.8 4.2L8 1l3.2 3.2M3.2 9.2v4.6"
-                 "h9.6V9.2' fill='none' stroke='currentColor' "
-                 "stroke-width='1.4' stroke-linecap='round' "
-                 "stroke-linejoin='round'/></svg>")
     # "ver más" va junto al texto (debajo del resumen), no en la
     # barra de acciones — despliega la cuartilla en la misma tarjeta
     bloques_txt = [b.strip() for b in
@@ -11448,52 +11402,16 @@ def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
                    + "</div></details>")
 
     secundario = []
-    opciones = "".join(
-        f"<option value='{html.escape(e, quote=True)}'>"
-        f"{html.escape(_red_nombre(e))} ({html.escape(e)})</option>"
-        for e, _ in _usuarios_reales())
     segs = cargar_seguimientos()
-    ops_ev = "".join(
-        f"<option value='{html.escape(s.get('id'), quote=True)}'"
-        f"{' selected' if p.get('evento') == s.get('id') else ''}>"
-        f"{html.escape(s.get('nombre', ''))}</option>"
-        for s in segs)
-    sel_ev = (f"<select name='evento' title='Evento / seguimiento' "
-              f"style='max-width:150px'><option value=''>sin evento"
-              f"</option>{ops_ev}</select>" if segs else "")
-    ico_asig = ("<svg viewBox='0 0 16 16' width='11' height='11'>"
-                "<circle cx='6' cy='4.8' r='2.6'/><path d='M1.8 13.2"
-                "c.5-2.3 2.2-3.7 4.2-3.7s3.7 1.4 4.2 3.7'/><path d='M11 "
-                "4.2v3M9.5 5.7h3'/></svg>")
-
-    # compartir = menú desplegable: copiar enlace + (solo supervisión)
-    # la opción de asignar seguimiento
-    menu_share = [
-        f"<button class='rb' style='height:22px;font-size:.68rem' "
-        f"onclick=\"navigator.clipboard.writeText(location.origin"
-        f"+'/redaccion/nota?id={pid}');this.textContent='✓ copiado'\">"
-        f"copiar enlace</button>"]
-    if sup:
-        menu_share.append(
-            f"<form method='post' action='/redaccion/asignar' "
-            f"class='rb-form'><input type='hidden' name='id' "
-            f"value='{p.get('id')}'>" f"<input type='hidden' name='volver' value='{ret}'>"
-            f"<select name='para'>{opciones}</select>"
-            f"<input name='nota' placeholder='nota para el asignado'>"
-            f"{sel_ev}"
-            f"<button class='rb' title='Asignar seguimiento"
-            f"{(' — pendientes: ' + nombres_pend) if pendientes else ''}'>"
-            f"{ico_asig} asignar{badge_asig}</button></form>")
-    compartir = ("<details class='rb-det compartirc'>"
-                 f"<summary class='rb' "
-                 f"title='Compartir / asignar'>{ico_share} compartir</summary>"
-                 "<div class='menu-share'>" + "".join(menu_share)
-                 + "</div></details>")
+    # checkbox de selección del tablero (compartir/asignar en lote
+    # desde la barra de herramientas) — solo en /redaccion
+    sel_box = (f"<input type='checkbox' class='red-sel' value='{pid}' "
+               f"title='Seleccionar para compartir / asignar'>"
+               if ret == "/redaccion" and not es_demo else "")
 
     acciones = [
         f"<a class='rb' href='/redaccion/nota?id={pid}' "
-        f"title='Ver la nota completa'>{ico_doc} ver noticia</a>",
-        compartir]
+        f"title='Ver la nota completa'>{ico_doc} ver noticia</a>"]
 
     # ── asignaciones ──
     asignaciones = p.get("asignaciones") or []
@@ -11579,7 +11497,8 @@ def _pub_card(p: dict, email: str, cfg: dict, ret: str = "/redaccion"
             f"background:rgba(255,255,255,.05);border:1px solid #2c3a72;"
             f"border-radius:10px;padding:.55rem .65rem;"
             f"margin-bottom:.55rem'>"
-            f"<div class='meta' style='font-size:.68rem'>{meta}</div>"
+            f"<div class='meta' style='font-size:.68rem'>{meta}"
+            f"{sel_box}</div>"
             f"<div style='font-size:.85rem;margin-top:.25rem'>{cuerpo}"
             f"</div>{ver_mas}{media_h}{loc_h}"
             f"<div class='red-act'>{''.join(acciones)}</div>"
@@ -11643,9 +11562,6 @@ _RED_CSS = """
 .red-form textarea{min-height:90px;resize:vertical}
 /* feeds de una sola columna (/area): línea de lectura cómoda */
 .red-post{max-width:720px;position:relative}
-/* tarjeta con el menú compartir abierto: se eleva sobre las demás
-   para que el dropdown no quede tapado por la siguiente tarjeta */
-.red-post:has(.compartirc[open]){z-index:30}
 /* botones de acción de redacción */
 .rb{display:inline-flex;align-items:center;justify-content:center;
   gap:4px;font-size:.72rem;padding:0 10px;height:26px;
@@ -11687,17 +11603,22 @@ _RED_CSS = """
   color:#c6cdea;background:rgba(255,255,255,.04);
   border:1px solid #2c3a72;border-radius:10px;padding:.6rem .8rem}
 .red-mas .red-leido p{margin:0 0 .7em}
-/* menú compartir: copiar enlace + asignar (supervisión) */
-.rb-det.compartirc{position:relative}
-.menu-share{position:absolute;top:calc(100% + 6px);left:0;z-index:30;
-  min-width:250px;background:rgba(13,18,48,.97);
-  border:1px solid #3a4a80;border-radius:10px;padding:.55rem;
-  display:flex;flex-direction:column;gap:.45rem;align-items:stretch;
-  box-shadow:0 10px 30px #000a;backdrop-filter:blur(8px)}
-.menu-share.up{top:auto;bottom:calc(100% + 6px)}
-.menu-share.end{left:auto;right:0}
-.menu-share .rb-form{flex-direction:column;align-items:stretch;
-  margin-top:0}
+/* selección del tablero + menú asignar en lote (supervisión) */
+.red-sel{float:right;margin:1px 0 0 .4rem;accent-color:#7c8cf8;
+  cursor:pointer}
+#red-asig{position:relative}
+.red-asig-menu{position:absolute;top:calc(100% + 6px);left:0;z-index:40;
+  min-width:300px;background:rgba(13,18,48,.97);
+  border:1px solid #3a4a80;border-radius:10px;padding:.6rem;
+  display:flex;flex-direction:column;gap:.45rem;text-align:left;
+  box-shadow:0 10px 30px #000a;backdrop-filter:blur(8px);
+  cursor:default;text-transform:none}
+.red-asig-menu form{display:flex;flex-direction:column;gap:.45rem;
+  margin:0}
+.red-asig-us{max-height:180px;overflow-y:auto;display:flex;
+  flex-direction:column;gap:.2rem;padding-right:.3rem}
+.red-asig-u{display:flex;gap:.4rem;align-items:baseline;
+  font-size:.78rem;font-weight:400;cursor:pointer}
 .red-sub{margin-top:.35rem}
 .red-sub .rb{font-size:.62rem;height:22px;padding:0 8px}
 /* píldora flotante "N nuevas" — aparece sola cuando el polling
@@ -11787,7 +11708,7 @@ html.tema-claro .rb.on{background:#1a237e;border-color:#1a237e;
   color:#fff}
 html.tema-claro .rb-form select,html.tema-claro .rb-form input{
   background:#fff;color:#222;border-color:#ccc}
-html.tema-claro .menu-share{background:#fff;border-color:#d0d0dc;
+html.tema-claro .red-asig-menu{background:#fff;border-color:#d0d0dc;
   box-shadow:0 10px 30px rgba(0,0,0,.15)}
 html.tema-claro .red-mas>summary{color:#5c6bc0}
 html.tema-claro .red-mas .red-leido{background:#fafafa;
@@ -11980,6 +11901,59 @@ def vista_redaccion(email: str) -> str:
             f"{_area_icono(a.get('id'), 14)}</span></span></h2>"
             f"<div class='posts'>{cards}</div></div>")
     ultimo = posts[0].get("ts", "") if posts else ""
+    sup = es_supervisor(email, cfg)
+    es_demo = "@demo.local" in (email or "")
+    # barra de acciones del tablero: selección múltiple → compartir
+    # (copia enlaces al portapapeles) / asignar (N notas × M
+    # colaboradores × evento opcional, creable al vuelo)
+    sel_bar = ""
+    if not es_demo:
+        sel_bar += ("<span class='meta' id='red-sel' "
+                    "style='font-size:.78rem;align-self:center;"
+                    "margin:0 .3rem'></span>"
+                    "<button class='rb' id='red-copy' disabled "
+                    "style='margin:.1rem 0 .7rem' "
+                    "title='Copiar los enlaces de las notas "
+                    "seleccionadas'>⧉ compartir</button>")
+    if sup:
+        checks = "".join(
+            f"<label class='red-asig-u'><input type='checkbox' "
+            f"name='para' value='{html.escape(e, quote=True)}'> "
+            f"{html.escape(n)} <span class='meta'>"
+            f"({html.escape(e)})</span></label>"
+            for e, n in _usuarios_reales())
+        ops_ev = "".join(
+            f"<option value='{html.escape(s.get('id'), quote=True)}'>"
+            f"{html.escape(s.get('nombre', ''))}</option>"
+            for s in cargar_seguimientos())
+        sel_bar += (
+            "<details class='rb-det' id='red-asig' "
+            "style='margin:.1rem 0 .7rem'>"
+            "<summary class='rb' title='Asignar las notas "
+            "seleccionadas a colaboradores'>asignar "
+            "<span id='red-asig-n' class='rb-n'></span></summary>"
+            "<div class='red-asig-menu'>"
+            "<form method='post' action='/redaccion/asignar' "
+            "id='red-asig-form'>"
+            "<input type='hidden' name='volver' value='/redaccion'>"
+            "<div id='red-asig-ids'></div>"
+            "<div class='red-asig-us'>" + checks + "</div>"
+            "<button type='button' class='rb' id='red-asig-todos' "
+            "style='font-size:.62rem;align-self:flex-start'>"
+            "seleccionar / quitar todos</button>"
+            "<input name='nota' placeholder='nota para los asignados'>"
+            "<select name='evento' title='Evento / seguimiento'>"
+            "<option value=''>sin evento</option>" + ops_ev +
+            "<option value='__nuevo__'>+ nuevo evento…</option>"
+            "</select>"
+            "<input name='evento_nuevo' "
+            "placeholder='nombre del evento nuevo' "
+            "style='display:none'>"
+            "<button class='rb'>asignar</button></form></div>"
+            "</details>"
+            "<a class='rb' href='/bitacora' "
+            "style='margin:.1rem 0 .7rem' "
+            "title='Eventos / seguimientos'>eventos</a>")
     return (_RED_CSS +
             f"<div class='meta' style='margin:.2rem 0 .7rem;font-size:.82rem'>"
             f"{len(areas)} medios · {len(posts)} publicaciones · "
@@ -11992,6 +11966,7 @@ def vista_redaccion(email: str) -> str:
             "style='margin:.1rem 0 .7rem' "
             "title='Volver al inicio — columnas a la izquierda y "
             "publicaciones arriba'>↺ inicio</button>"
+            + sel_bar
             + _board_wrap("".join(cols))
             + "<script>"
             "var _drag=null;"
@@ -12048,6 +12023,63 @@ def vista_redaccion(email: str) -> str:
             "if(matchMedia('(max-width:760px)').matches){"
             "c.classList.toggle('open')}"
             "else{c.classList.toggle('closed');_guardarColapsadas()}});});"
+            # selección múltiple: checkbox por tarjeta → compartir
+            # (copiar enlaces) y asignar en lote
+            "function _selIds(){return [].slice.call("
+            "document.querySelectorAll('.red-sel:checked'))"
+            ".map(function(c){return c.value})}"
+            "function _syncSel(){var n=_selIds().length;"
+            "var b=document.getElementById('red-sel');"
+            "if(b)b.textContent=n?'☑ '+n+' seleccionada'"
+            "+(n>1?'s':''):'';"
+            "var cp=document.getElementById('red-copy');"
+            "if(cp)cp.disabled=!n;}"
+            "document.addEventListener('change',function(e){"
+            "var t=e.target;if(!t||!t.classList)return;"
+            "if(t.classList.contains('red-sel'))_syncSel();"
+            "if(t.name=='para'&&t.closest('#red-asig-form')){"
+            "var n=t.closest('form').querySelectorAll("
+            "'input[name=para]:checked').length;"
+            "var bn=document.getElementById('red-asig-n');"
+            "if(bn)bn.textContent=n?'· '+n:'';}});"
+            "var _cp=document.getElementById('red-copy');"
+            "if(_cp)_cp.addEventListener('click',function(){"
+            "var ids=_selIds();if(!ids.length)return;"
+            "navigator.clipboard.writeText(ids.map(function(i){"
+            "return location.origin+'/redaccion/nota?id='+i})"
+            ".join('\\n'));"
+            "var b=this;"
+            "b.textContent='✓ '+ids.length+' enlace'"
+            "+(ids.length>1?'s':'');"
+            "setTimeout(function(){b.textContent='⧉ compartir'},"
+            "1600);});"
+            "var _af=document.getElementById('red-asig-form');"
+            "if(_af){_af.addEventListener('submit',function(e){"
+            "var ids=_selIds();"
+            "if(!ids.length){e.preventDefault();return}"
+            "var box=document.getElementById('red-asig-ids');"
+            "box.innerHTML='';"
+            "ids.forEach(function(i){var h=document.createElement"
+            "('input');h.type='hidden';h.name='id';h.value=i;"
+            "box.appendChild(h)});});"
+            "var _tb=document.getElementById('red-asig-todos');"
+            "if(_tb)_tb.addEventListener('click',function(){"
+            "var cs=_af.querySelectorAll('input[name=para]');"
+            "var all=true;"
+            "cs.forEach(function(c){if(!c.checked)all=false});"
+            "cs.forEach(function(c){c.checked=!all});"
+            "var n=_af.querySelectorAll('input[name=para]:checked')"
+            ".length;"
+            "var bn=document.getElementById('red-asig-n');"
+            "if(bn)bn.textContent=n?'· '+n:'';});"
+            "var _evs=_af.querySelector('select[name=evento]');"
+            "var _en=_af.querySelector('input[name=evento_nuevo]');"
+            "if(_evs&&_en)_evs.addEventListener('change',function(){"
+            "_en.style.display=_evs.value=='__nuevo__'?'block':'none'"
+            "});}"
+            "document.addEventListener('click',function(e){"
+            "var d=document.getElementById('red-asig');"
+            "if(d&&d.open&&!d.contains(e.target))d.open=false;});"
             "</script>" + _RED_POLL_JS.replace("CTX", "tablero"))
 
 
@@ -12453,31 +12485,61 @@ def aplicar_accion_redaccion(ruta: str, form: dict, email: str) -> str:
         return volver or f"/redaccion/nota?id={pid}"
 
     if ruta.endswith("/asignar"):
-        # asignar es privilegio de supervisión (Paolo/admin)
+        # asignar es privilegio de supervisión (Paolo/admin).
+        # Multi-selección del tablero: N notas × M colaboradores;
+        # 'evento' puede ser uno existente o '__nuevo__' + nombre
+        # (el evento se crea al vuelo, igual que en /bitacora)
         if not es_supervisor(email, cfg):
             return "/area?msg=" + quote("Solo supervisión asigna")
-        para = form.get("para", [""])[0].strip().lower()
         usuarios = cargar_usuarios()
-        if para not in usuarios or "@demo.local" in para:
-            return "/area?msg=" + quote("Destinatario inválido")
+        paras = [x.strip().lower() for x in form.get("para", [])
+                 if x.strip().lower() in usuarios
+                 and "@demo.local" not in x.strip().lower()]
+        ids = [x for x in form.get("id", []) if x]
+        if not paras or not ids:
+            return "/area?msg=" + quote(
+                "Faltan destinatarios o notas seleccionadas")
+        nota = form.get("nota", [""])[0].strip()[:200]
         ev = form.get("evento", [""])[0].strip()
+        if ev == "__nuevo__":
+            nombre_ev = form.get("evento_nuevo", [""])[0].strip()[:120]
+            ev = ""
+            if nombre_ev:
+                ev = "s" + secrets.token_hex(4)
+                _guardar_seguimiento({
+                    "id": ev, "nombre": nombre_ev, "objetivo": "",
+                    "prioridad": "media", "por": email,
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "miembros": []})
         if ev:
             ss = cargar_seguimientos()
             s = next((x for x in ss if x.get("id") == ev), None)
             if s:
-                p["evento"] = ev
                 miembros = s.setdefault("miembros", [])
-                if para not in miembros:
-                    miembros.append(para)
+                for para in paras:
+                    if para not in miembros:
+                        miembros.append(para)
                 _reescribir_seguimientos(ss)
-        p.setdefault("asignaciones", []).append({
-            "para": para, "por": email,
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "estado": "pendiente",
-            "nota": form.get("nota", [""])[0].strip()[:200]})
+            else:
+                ev = ""
+        ts_a = datetime.now().isoformat(timespec="seconds")
+        por_id = {x.get("id"): x for x in posts}
+        for pid2 in ids:
+            p2 = por_id.get(pid2)
+            if not p2:
+                continue
+            if ev:
+                p2["evento"] = ev
+            for para in paras:
+                if any(a.get("para") == para
+                       and a.get("estado", "pendiente") == "pendiente"
+                       for a in (p2.get("asignaciones") or [])):
+                    continue
+                p2.setdefault("asignaciones", []).append({
+                    "para": para, "por": email, "ts": ts_a,
+                    "estado": "pendiente", "nota": nota})
         _reescribir_publicaciones(posts)
-        return volver or ("/redaccion" if es_supervisor(email, cfg)
-                          else "/area")
+        return volver or "/redaccion"
 
     # /asignacion: marcar hecha/pendiente — supervisión o el asignado
     try:
