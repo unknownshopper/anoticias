@@ -4,6 +4,15 @@ App monolítica `monitor.py` (stdlib http.server, sin framework). Datos en JSON/
 en el mismo directorio: `redaccion.jsonl`, `usuarios.json`, `seguimientos.json`,
 `chats.json`, `chat_msg.jsonl`, `asistente_*.json`, `config.json`.
 
+Contexto: empezó como monitor automatizado (cuentas dedicadas + crontabs) y
+pivotó a colector tipo TweetDeck operado por el equipo de comunicación social.
+Los artefactos de esa era están archivados en `legacy/` (scripts de login
+FB/X, sesiones, CSVs de unfollow, backups `.bak`, logs y reportes viejos).
+Ojo: `monitor.py` aún contiene el subsistema de scraping dormido
+(portadas FB/X/kiosko, pool de sesiones, playwright) — está apagado por
+`pausar_scraping`/`fb_pausa`/`fb_posts_pausa` en config.json y sus mensajes
+referencian `fb_login.py`/`x_login.py`, que ahora viven en `legacy/`.
+
 ## Correr / verificar
 
 ```bash
