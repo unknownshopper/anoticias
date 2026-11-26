@@ -1102,6 +1102,17 @@ MANTENIMIENTO = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#1a237e">
 <link rel="icon" type="image/png" href="/icon3.png">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="@noticias">
+<meta property="og:title" content="@noticias — Visor y colector de noticias">
+<meta property="og:description" content="La mesa de trabajo de comunicación social: cada área publica, supervisión asigna y mide. Contenido 100% humano.">
+<meta property="og:image" content="{base}/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="@noticias — Visor y colector de noticias">
+<meta name="twitter:description" content="La mesa de trabajo de comunicación social: cada área publica, supervisión asigna y mide.">
+<meta name="twitter:image" content="{base}/og.png">
 <title>@noticias — Visor y colector de noticias</title>
 <style>
   * { box-sizing: border-box; }
@@ -1170,10 +1181,9 @@ PALETA = ["#1a237e", "#1565c0", "#00695c", "#ef6c00", "#ad1457",
 
 
 def vista_landing(base: str) -> bytes:
-    """Raíz pública — por ahora página de mantenimiento con acceso
-    directo al login (el producto es interno, la landing de ventas
-    queda fuera mientras dure la demo)."""
-    return MANTENIMIENTO.encode()
+    """Raíz pública — propuesta del producto (visor y colector de
+    noticias) con acceso directo al login."""
+    return MANTENIMIENTO.replace("{base}", base).encode()
 
 
 def vista_instructivo(base: str) -> bytes:
