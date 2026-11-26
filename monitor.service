@@ -1,5 +1,5 @@
 [Unit]
-Description=@noticias — monitor de prensa
+Description=@noticias — redacción por áreas (tweetdeck)
 After=network-online.target cloudflared.service
 Wants=network-online.target
 
@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=t800
 WorkingDirectory=/home/t800/Desktop/SISTA/monitor_noticias
-ExecStart=/home/t800/Desktop/SISTA/monitor_noticias/.venv/bin/python -u monitor.py --web 8080 --loop 15
+ExecStart=/home/t800/Desktop/SISTA/monitor_noticias/.venv/bin/python -u monitor.py --web 8080
 Restart=always
 RestartSec=5
 # logs en journalctl -u monitor -f
