@@ -2160,7 +2160,8 @@ _RED_CSS = """
   border-radius:8px;white-space:nowrap;z-index:8;
   box-shadow:0 6px 18px rgba(0,0,0,.45);text-transform:none;
   letter-spacing:0}
-.red-personas:hover .red-tip{display:block}
+.red-personas:hover .red-tip,.red-personas:focus-within .red-tip{
+  display:block}
 html.tema-claro .red-tip{background:#fff;color:#333;
   border-color:#d5d9ec;box-shadow:0 6px 18px rgba(0,0,0,.18)}
 .red-col.closed .posts{display:none}
@@ -2183,6 +2184,16 @@ html.tema-claro .red-tip{background:#fff;color:#333;
   border:1px solid #33415f;border-radius:8px;margin:.25rem 0;
   background:#0d1330;color:#eef1ff}
 .red-form textarea{min-height:90px;resize:vertical}
+.red-form input[type=file]{width:100%;font-size:.85rem;
+  color:#9aa3c7;margin:.35rem 0}
+.red-form input[type=file]::file-selector-button{padding:.6rem 1rem;
+  border-radius:10px;border:1px dashed #4a5a9e;
+  background:rgba(124,77,255,.14);color:#dfe3ff;font-size:.85rem;
+  font-weight:600;cursor:pointer;margin-right:.7rem;font-family:inherit}
+.red-form input[type=file]::file-selector-button:active{background:#3949ab}
+html.tema-claro .red-form input[type=file]{color:#666}
+html.tema-claro .red-form input[type=file]::file-selector-button{
+  border-color:#b9c0e0;background:#eef1fb;color:#1a237e}
 /* feeds de una sola columna (/area): línea de lectura cómoda */
 .red-post{max-width:720px;position:relative}
 /* botones de acción de redacción */
@@ -2332,27 +2343,53 @@ html.tema-claro .red-tip{background:#fff;color:#333;
   .red-col.closed:hover{background:rgba(58,73,171,.35)}
 }
 @media (max-width:760px){
-  /* móvil: acordeón vertical — cada medio es una tarjeta cerrada;
-     al tocar el encabezado se despliega su info (dropdown) */
+  /* móvil: tabs por área + swipe — una columna visible a la vez,
+     el selector queda pegado bajo el nav */
   .red-xbar{display:none}
-  /* overflow:visible — el overflow-x:auto de escritorio convierte al
-     board en scroll container y rompe el sticky del h2 de columna */
+  #red-tgl,#bit-tgl{display:none}
+  /* inputs ≥16px: iOS NO hace zoom al enfocar (con .85rem sí) */
+  .red-form input[type=text],.red-form textarea,.red-form select{
+    font-size:1rem;padding:.65rem}
+  /* adjuntar en táctil: botón grande, el contador de archivos
+     queda a un lado */
+  .red-form input[type=file]::file-selector-button{
+    padding:.85rem 1.1rem;font-size:.95rem}
+  /* el checkbox URGENTE y el botón publicar crecen al pulgar */
+  .red-form label{font-size:.95rem !important}
+  .red-form button{min-height:44px;font-size:.95rem !important}
+  /* barra de tabs: scroll horizontal, pill activa resaltada */
+  .red-tabs-m{display:flex;gap:.4rem;overflow-x:auto;
+    position:sticky;top:var(--navh,0px);z-index:7;
+    padding:.5rem .2rem;margin:0 -0.5rem .6rem;
+    background:rgba(10,14,38,.92);backdrop-filter:blur(10px);
+    -webkit-overflow-scrolling:touch;scrollbar-width:none}
+  .red-tabs-m::-webkit-scrollbar{display:none}
+  .red-tabs-m button{flex:none;padding:.5rem .95rem;border-radius:18px;
+    border:1px solid #3a4a80;background:rgba(255,255,255,.05);
+    color:#9aa3c7;font-size:.8rem;font-weight:600;font-family:inherit;
+    white-space:nowrap}
+  .red-tabs-m button.on{background:#1a237e;color:#fff;
+    border-color:#7c4dff}
+  html.tema-claro .red-tabs-m{background:rgba(246,247,249,.92)}
+  html.tema-claro .red-tabs-m button{border-color:#d5d9ec;
+    color:#555;background:#fff}
+  html.tema-claro .red-tabs-m button.on{background:#1a237e;
+    color:#fff;border-color:#1a237e}
+  /* una sola columna visible (la del tab activo) */
   .red-board{display:block;height:auto;overflow:visible}
-  .red-col{display:block;height:auto;flex:none;margin-bottom:10px;
+  .red-col{display:none;height:auto;margin-bottom:10px;
     background:rgba(15,20,52,.72);border-color:#2c3a72}
-  .red-col .posts{display:none;overflow:visible;flex:none}
-  .red-col.open .posts{display:block}
-  .red-col h2{color:#eef1ff;cursor:pointer;user-select:none;
-    /* encabezado sticky: al bajar por las notas de la columna, el
-       título del medio queda fijo bajo el nav para poder plegarla */
-    position:sticky;top:var(--navh,0px);z-index:6;
+  .red-col.open{display:block}
+  .red-col .posts{display:block;overflow:visible}
+  /* encabezado de columna: barra de info pegada bajo los tabs —
+     ya no plega (los tabs mandan) */
+  .red-col h2{color:#eef1ff;user-select:none;
+    position:sticky;top:calc(var(--navh,0px) + 46px);z-index:6;
     margin:-10px -10px .6rem;padding:12px 10px;
     background:rgba(15,20,52,.94);backdrop-filter:blur(10px);
     border-bottom:1px solid #2c3a72;border-radius:12px 12px 0 0}
   .red-col h2::before{content:''}
-  .red-col h2::after{content:'▸';float:right;color:#8a93b8;
-    transition:transform .15s}
-  .red-col.open h2::after{content:'▾'}
+  .red-col h2::after{content:''}
   html.tema-claro .red-col h2{background:#f4f4f6}
   main.wide{padding:.6rem .5rem}
 }
@@ -2527,6 +2564,36 @@ th.addEventListener('pointermove',function(e){
 th.addEventListener('pointerup',function(){drag=false});
 th.addEventListener('pointercancel',function(){drag=false});
 })();
+// móvil: tabs por columna + swipe lateral (redacción y bitácora)
+if(matchMedia('(max-width:760px)').matches&&board){
+var cols=[].slice.call(board.querySelectorAll('.red-col'));
+var tabs=document.createElement('div');tabs.className='red-tabs-m';
+cols.forEach(function(c,i){
+var b=document.createElement('button');
+var nom=c.querySelector('.red-nom');
+var n=c.querySelector('.red-n');
+b.textContent=(nom?nom.textContent.trim():'')+(n?' '+n.textContent.trim():'');
+b.addEventListener('click',function(){_actTab(i)});
+tabs.appendChild(b);});
+board.parentNode.insertBefore(tabs,board);
+function _actTab(i){
+cols.forEach(function(c,j){c.classList.toggle('open',j===i)});
+[].slice.call(tabs.children).forEach(function(b,j){
+b.classList.toggle('on',j===i)});
+var act=tabs.children[i];
+if(act)act.scrollIntoView({inline:'center',block:'nearest'});
+window.scrollTo(0,0);}
+if(cols.length)_actTab(0);
+var _swx=0,_swy=0;
+board.addEventListener('touchstart',function(e){
+_swx=e.touches[0].clientX;_swy=e.touches[0].clientY;},{passive:true});
+board.addEventListener('touchend',function(e){
+var dx=e.changedTouches[0].clientX-_swx;
+var dy=e.changedTouches[0].clientY-_swy;
+if(Math.abs(dx)<60||Math.abs(dx)<Math.abs(dy)*1.5)return;
+var cur=[].indexOf.call(tabs.children,tabs.querySelector('.on'));
+_actTab(Math.min(Math.max(cur+(dx<0?1:-1),0),cols.length-1));
+},{passive:true});}
 </script>"""
 
 
@@ -2576,7 +2643,7 @@ def vista_redaccion(email: str) -> str:
                    or m.split("@")[0]
                    for m in (a.get("miembros") or [])]
         personas = (
-            f"<span class='red-personas' "
+            f"<span class='red-personas' tabindex='0' "
             f"onclick='event.stopPropagation()'>"
             f"<svg viewBox='0 0 16 16' width='12' height='12'>"
             f"<circle cx='8' cy='5' r='2.6' fill='currentColor'/>"
@@ -2735,9 +2802,8 @@ def vista_redaccion(email: str) -> str:
             "document.querySelectorAll('.red-col').forEach("
             "function(c){var h=c.querySelector('h2');if(!h)return;"
             "h.addEventListener('click',function(){"
-            "if(matchMedia('(max-width:760px)').matches){"
-            "c.classList.toggle('open')}"
-            "else{c.classList.toggle('closed');_guardarColapsadas()}});});"
+            "if(!matchMedia('(max-width:760px)').matches){"
+            "c.classList.toggle('closed');_guardarColapsadas()}});});"
             # selección múltiple: checkbox por tarjeta → compartir
             # (copiar enlaces) y asignar en lote
             "function _selIds(){return [].slice.call("
@@ -3649,9 +3715,8 @@ def vista_bitacora(email: str) -> str:
         "document.querySelectorAll('.red-col').forEach(function(c){"
         "var h=c.querySelector('h2');if(!h)return;"
         "h.addEventListener('click',function(){"
-        "if(matchMedia('(max-width:760px)').matches){"
-        "c.classList.toggle('open')}"
-        "else{c.classList.toggle('closed')}})});"
+        "if(!matchMedia('(max-width:760px)').matches){"
+        "c.classList.toggle('closed')}})});"
         "_bitSync();</script>")
     return (_RED_CSS
             + "<div class='red-tabs'><a href='/redaccion'>← tablero</a>"
