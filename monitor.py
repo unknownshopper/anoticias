@@ -596,7 +596,7 @@ PAGINA = """<!DOCTYPE html>
   .card.redes {{ border-left-color: #1565c0; }}
   .card.desarrollo {{ border-left-color: #ef6c00; }}
   .card.nota {{ border-left-color: #90a4ae; }}
-  .card.top {{ border-left-color: #7b1fa2; }}
+  .card.top {{ border-left-color: #1a237e; }}
 
   details {{ margin: .5rem 0 0; }}
   .col-card {{ background: #fff; border-left: 5px solid #455a64;
@@ -832,17 +832,17 @@ PAGINA = """<!DOCTYPE html>
   #loader .txt {{ color: #1a237e; font-weight: 600; }}
   .trending {{ display: flex; flex-wrap: wrap; gap: .5rem; margin: .8rem 0 1.2rem; }}
   .trending a {{ text-decoration: none; }}
-  .chip-trend {{ display: inline-block; background: #7b1fa2; color: #fff;
+  .chip-trend {{ display: inline-block; background: #3949ab; color: #fff;
       font-size: .72rem; font-weight: 600; text-transform: uppercase;
       letter-spacing: .03em; padding: .3rem .7rem; border-radius: 14px; }}
-  .chip-trend:hover {{ background: #6a1b9a; }}
+  .chip-trend:hover {{ background: #303f9f; }}
   /* ── tema espacial Trillian ── */
   body {{ background: #04050d; color: #dfe4ff; }}
   body::before {{ content: ''; position: fixed; inset: 0; z-index: -2;
     pointer-events: none;
     background:
       radial-gradient(ellipse 80% 55% at 70% -10%, #1a237e55, transparent 60%),
-      radial-gradient(ellipse 60% 45% at 10% 110%, #4a148c44, transparent 60%),
+      radial-gradient(ellipse 60% 45% at 10% 110%, #28359355, transparent 60%),
       linear-gradient(180deg, #05060f 0%, #0a0e24 55%, #04050d 100%); }}
   body::after {{ content: ''; position: fixed; inset: 0; z-index: -1;
     pointer-events: none; opacity: .8;
@@ -850,7 +850,7 @@ PAGINA = """<!DOCTYPE html>
       radial-gradient(1px 1px at 12% 22%, #ffffffcc 50%, transparent 51%),
       radial-gradient(1.4px 1.4px at 68% 12%, #9fd8ff88 50%, transparent 51%),
       radial-gradient(1px 1px at 84% 64%, #ffffffbb 50%, transparent 51%),
-      radial-gradient(2px 2px at 32% 78%, #b388ff66 50%, transparent 51%),
+      radial-gradient(2px 2px at 32% 78%, #9fa8da66 50%, transparent 51%),
       radial-gradient(1px 1px at 55% 45%, #ffffffaa 50%, transparent 51%),
       radial-gradient(1.6px 1.6px at 8% 88%, #69f0ae66 50%, transparent 51%),
       radial-gradient(1px 1px at 92% 30%, #ffffff99 50%, transparent 51%),
@@ -873,7 +873,7 @@ PAGINA = """<!DOCTYPE html>
   .tema-btn {{ background: rgba(255,255,255,.07); border: 1px solid #3a4a80;
     color: #cfd6ff; border-radius: 8px; width: 30px; height: 30px;
     cursor: pointer; font-size: .95rem; line-height: 1; }}
-  .tema-btn:hover {{ border-color: #7c4dff; box-shadow: 0 0 10px #7c4dff55; }}
+  .tema-btn:hover {{ border-color: #5c6bc0; box-shadow: 0 0 10px #5c6bc055; }}
   /* tema claro — revierte el espacio al look clásico claro */
   html.tema-claro body {{ background: #f6f7f9; color: #222; }}
   html.tema-claro body::before, html.tema-claro body::after {{ display: none; }}
@@ -1179,7 +1179,7 @@ def cookie_sesion(email: str, https: bool) -> str:
 
 
 PALETA = ["#1a237e", "#1565c0", "#00695c", "#ef6c00", "#ad1457",
-          "#4527a0", "#2e7d32", "#c62828", "#00838f", "#5d4037"]
+          "#283593", "#2e7d32", "#c62828", "#00838f", "#5d4037"]
 
 
 def vista_landing(base: str) -> bytes:
@@ -1400,7 +1400,7 @@ def vista_usuarios(email: str) -> str:
                 + "<button class='btn-rojo' name='accion' value='eliminar' "
                   "onclick=\"return confirm('¿Eliminar este perfil?')\">Eliminar</button>"
                   "</div></form>")
-        cards_u += f"""<div class="card regla" style="border-left-color:#4527a0">
+        cards_u += f"""<div class="card regla" style="border-left-color:#283593">
   <strong>{html.escape(u_email)}</strong>
   <span class="meta"> · {tipo} · {html.escape(etiqueta)}</span>
   {form}
@@ -1839,7 +1839,7 @@ def _media_html(media: list, compact: bool = False,
             # radio/podcast: el reproductor + el texto de la tarjeta
             # da el contexto de a qué pertenece el audio
             out.append(
-                f"<div style='background:rgba(124,77,255,.12);border:"
+                f"<div style='background:rgba(92,107,192,.12);border:"
                 f"1px solid #3a4a80;border-radius:10px;"
                 f"padding:.45rem .6rem;margin:.35rem 0'>"
                 f"<div class='meta' style='font-size:.62rem;margin-bottom:"
@@ -1854,7 +1854,7 @@ def _media_html(media: list, compact: bool = False,
                 f"font-size:.68rem;cursor:pointer;color:#666'>"
                 f"transcripción</summary><div style='white-space:"
                 f"pre-wrap;font-size:.75rem;background:rgba(0,0,0,.3);"
-                f"border-left:3px solid #7c4dff;padding:.4rem .6rem;"
+                f"border-left:3px solid #5c6bc0;padding:.4rem .6rem;"
                 f"margin-top:.25rem;border-radius:0 8px 8px 0'>"
                 f"{html.escape(m['texto'])}</div></details>")
         elif m.get("tipo") == "doc":
@@ -2128,8 +2128,8 @@ _RED_CSS = """
   border:1px solid #2c3a72;cursor:pointer;flex:none}
 .red-xbar .red-xthumb{position:absolute;top:1px;bottom:1px;left:0;
   min-width:26px;border-radius:4px;
-  background:linear-gradient(90deg,#3949ab,#7c4dff);
-  box-shadow:0 0 8px #7c4dff66;touch-action:none}
+  background:linear-gradient(90deg,#3949ab,#5c6bc0);
+  box-shadow:0 0 8px #5c6bc066;touch-action:none}
 .red-xbar .red-xthumb:active{background:linear-gradient(90deg,
   #5c6bc0,#9d7bff)}
 .red-col{background:rgba(15,20,52,.72);border:1px solid #2c3a72;
@@ -2190,7 +2190,7 @@ html.tema-claro .red-tip{background:#fff;color:#333;
   color:#9aa3c7;margin:.35rem 0}
 .red-form input[type=file]::file-selector-button{padding:.6rem 1rem;
   border-radius:10px;border:1px dashed #4a5a9e;
-  background:rgba(124,77,255,.14);color:#dfe3ff;font-size:.85rem;
+  background:rgba(92,107,192,.14);color:#dfe3ff;font-size:.85rem;
   font-weight:600;cursor:pointer;margin-right:.7rem;font-family:inherit}
 .red-form input[type=file]::file-selector-button:active{background:#3949ab}
 html.tema-claro .red-form input[type=file]{color:#666}
@@ -2206,9 +2206,9 @@ html.tema-claro .red-form input[type=file]::file-selector-button{
   cursor:pointer;line-height:1;font-family:inherit;white-space:nowrap;
   text-decoration:none;vertical-align:middle;box-sizing:border-box;
   backdrop-filter:blur(6px)}
-.rb:hover{border-color:#7c4dff;color:#fff;background:rgba(124,77,255,.18);
-  text-decoration:none;box-shadow:0 0 12px #7c4dff44}
-.rb.on{background:#3949ab;border-color:#7c4dff;color:#fff}
+.rb:hover{border-color:#5c6bc0;color:#fff;background:rgba(92,107,192,.18);
+  text-decoration:none;box-shadow:0 0 12px #5c6bc044}
+.rb.on{background:#3949ab;border-color:#5c6bc0;color:#fff}
 .rb:disabled{opacity:.45;cursor:default}
 .rb:disabled:hover{border-color:#3a4a80;color:#cfd6ff;
   background:rgba(255,255,255,.06);box-shadow:none}
@@ -2228,19 +2228,19 @@ html.tema-claro .red-form input[type=file]::file-selector-button{
   box-sizing:border-box;transition:border-color .15s,box-shadow .15s,
   background .15s;
   box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 2px 8px rgba(0,0,0,.3)}
-.rtb:hover{border-color:#8f6bff;color:#fff;
-  background:linear-gradient(180deg,rgba(124,77,255,.32),
-  rgba(124,77,255,.14));box-shadow:0 0 14px #7c4dff66;
+.rtb:hover{border-color:#7986cb;color:#fff;
+  background:linear-gradient(180deg,rgba(92,107,192,.32),
+  rgba(92,107,192,.14));box-shadow:0 0 14px #5c6bc066;
   text-decoration:none}
 .rtb:disabled{opacity:.4;cursor:default}
 .rtb:disabled:hover{border-color:#4a5aa0;color:#e6eaff;
   background:linear-gradient(180deg,rgba(120,140,255,.16),
   rgba(120,140,255,.05));
   box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 2px 8px rgba(0,0,0,.3)}
-.rtb.acc{background:linear-gradient(180deg,#5e35d8,#4527a0);
-  border-color:#8f6bff;color:#fff}
-.rtb.acc:hover{background:linear-gradient(180deg,#6d46e8,#512da8);
-  border-color:#8f6bff;color:#fff;box-shadow:0 0 16px #7c4dff88}
+.rtb.acc{background:linear-gradient(180deg,#3949ab,#283593);
+  border-color:#7986cb;color:#fff}
+.rtb.acc:hover{background:linear-gradient(180deg,#3f51b5,#303f9f);
+  border-color:#7986cb;color:#fff;box-shadow:0 0 16px #5c6bc088}
 .red-selpill{display:none;align-items:center;height:26px;padding:0 10px;
   border-radius:13px;background:#3949ab;color:#fff;font-size:.72rem;
   font-weight:700;letter-spacing:.02em}
@@ -2299,8 +2299,8 @@ html.tema-claro .red-form input[type=file]::file-selector-button{
 .red-sub .rb{font-size:.7rem;height:24px;padding:0 10px}
 /* bloque de asignaciones al tope de la tarjeta */
 .red-asign{margin:.45rem 0 .15rem;padding:.4rem .55rem .25rem;
-  border-left:3px solid #7c4dff;border-radius:0 8px 8px 0;
-  background:rgba(124,77,255,.09)}
+  border-left:3px solid #5c6bc0;border-radius:0 8px 8px 0;
+  background:rgba(92,107,192,.09)}
 .red-asign-f{font-size:.72rem;margin:.1rem 0 .3rem;
   display:flex;align-items:center;gap:.3rem;flex-wrap:wrap}
 .red-asign-f .rb{font-size:.8rem;height:20px;padding:0 5px;
@@ -2310,7 +2310,7 @@ html.tema-claro .red-form input[type=file]::file-selector-button{
 .red-pill{position:fixed;bottom:1.2rem;left:50%;z-index:60;
   transform:translateX(-50%);display:inline-flex;align-items:center;
   gap:.45rem;padding:.65rem 1.4rem;border-radius:24px;
-  background:linear-gradient(135deg,#1a237e 0%,#3949ab 55%,#7c4dff 100%);
+  background:linear-gradient(135deg,#1a237e 0%,#3949ab 55%,#5c6bc0 100%);
   color:#fff;text-decoration:none;font-size:.85rem;font-weight:600;
   box-shadow:0 8px 24px rgba(26,35,126,.4),0 0 0 1px #ffffff22 inset;
   animation:redpill .45s cubic-bezier(.2,.9,.3,1.2)}
@@ -2430,16 +2430,16 @@ html.tema-claro .red-col.closed .area-ico{color:#777}
 html.tema-claro .red-pill{box-shadow:0 8px 24px rgba(26,35,126,.3)}
 html.tema-claro .red-xbar{background:#ececf2;border-color:#d0d0dc}
 html.tema-claro .red-xbar .red-xthumb{
-  background:linear-gradient(90deg,#3949ab,#7c4dff)}
+  background:linear-gradient(90deg,#3949ab,#5c6bc0)}
 /* vista de nota — artículo completo */
 .nota-kicker{display:flex;align-items:center;gap:.4rem;
   font-size:.68rem;font-weight:700;letter-spacing:.12em;
   text-transform:uppercase;color:#8a93b8}
-.nota-kicker .area-ico, .nota-kicker svg{color:#7c4dff}
+.nota-kicker .area-ico, .nota-kicker svg{color:#5c6bc0}
 .nota-titulo{font-size:1.45rem;line-height:1.25;margin:.5rem 0 .4rem;
   color:#eef1ff;font-weight:800}
 .nota-resumen{font-size:.95rem;line-height:1.6;color:#b9c2ea;
-  border-left:3px solid #7c4dff;padding:.15rem 0 .15rem .8rem;
+  border-left:3px solid #5c6bc0;padding:.15rem 0 .15rem .8rem;
   margin:.4rem 0 .8rem;font-style:italic}
 .nota-meta{display:flex;flex-wrap:wrap;gap:.3rem .9rem;align-items:center;
   font-size:.75rem;color:#9aa3c7;border-top:1px solid #2c3a72;
@@ -2468,7 +2468,7 @@ html.tema-claro .red-xbar .red-xthumb{
   padding:.55rem .7rem;margin:.3rem 0;border-radius:10px;
   border:1px solid #2c3a72;background:rgba(255,255,255,.04);
   text-decoration:none;transition:border-color .15s}
-.rel-nota:hover{border-color:#7c4dff}
+.rel-nota:hover{border-color:#5c6bc0}
 .rel-t{font-size:.82rem;color:#dfe4ff;font-weight:600;line-height:1.35}
 .rel-m{font-size:.68rem;color:#8a93b8;display:flex;align-items:center;
   gap:.3rem}
@@ -4315,7 +4315,7 @@ def _chat_css() -> str:
 .chat-side a{display:block;padding:.5rem .7rem;border-radius:10px;
   border:1px solid #2c3a72;background:rgba(255,255,255,.04);
   color:#cfd6ff;text-decoration:none;font-size:.82rem}
-.chat-side a.on{border-color:#7c4dff;background:rgba(124,77,255,.15);
+.chat-side a.on{border-color:#5c6bc0;background:rgba(92,107,192,.15);
   color:#fff;font-weight:600}
 .chat-main{flex:1;display:flex;flex-direction:column;min-width:0;
   border:1px solid #2c3a72;border-radius:12px;background:rgba(15,20,52,.6);
