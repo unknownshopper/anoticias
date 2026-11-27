@@ -13,12 +13,9 @@ Uso:
 
 import argparse
 import base64
-import calendar
 import hashlib
 import hmac
 import html
-import io
-import ipaddress
 import json
 import re
 import secrets
@@ -28,8 +25,7 @@ import sys
 import threading
 import time
 import unicodedata
-from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote
