@@ -2151,6 +2151,18 @@ _RED_CSS = """
   align-items:center;gap:.4rem}
 .red-col h2 .area-ico{display:inline-flex;align-items:center;
   color:#9aa3c7}
+.red-col h2 .red-personas{position:relative;display:inline-flex;
+  align-items:center;gap:.18rem;color:#9aa3c7;font-size:.72rem;
+  font-weight:400}
+.red-tip{display:none;position:absolute;top:1.5rem;right:-.3rem;
+  background:#232a4d;border:1px solid #3a4a80;color:#dfe3ff;
+  font-size:.72rem;line-height:1.55;padding:.45rem .65rem;
+  border-radius:8px;white-space:nowrap;z-index:8;
+  box-shadow:0 6px 18px rgba(0,0,0,.45);text-transform:none;
+  letter-spacing:0}
+.red-personas:hover .red-tip{display:block}
+html.tema-claro .red-tip{background:#fff;color:#333;
+  border-color:#d5d9ec;box-shadow:0 6px 18px rgba(0,0,0,.18)}
 .red-col.closed .posts{display:none}
 /* al plegar, solo queda el h2 (lomo vertical en escritorio) — también
    cubre bloques extra como en bitácora (subtítulo, equipo, form) */
@@ -2536,13 +2548,12 @@ def vista_redaccion(email: str) -> str:
         return ("<h1>Redacción</h1><p class='meta'>Sin áreas "
                 "configuradas — agrega <code>redaccion.areas</code> en "
                 "config.json (id, nombre, miembros).</p>")
-    visto = ((cargar_usuarios().get(email) or {})
-             .get("visto_redaccion", ""))
+    usuarios = cargar_usuarios()
+    perfil_u = usuarios.get(email) or {}
+    visto = perfil_u.get("visto_redaccion", "")
     # orden de columnas personalizado por usuario (drag & drop)
-    orden = ((cargar_usuarios().get(email) or {})
-             .get("red_orden") or [])
-    colapsadas = set(((cargar_usuarios().get(email) or {})
-                      .get("red_colapsadas") or []))
+    orden = perfil_u.get("red_orden") or []
+    colapsadas = set(perfil_u.get("red_colapsadas") or [])
     areas = sorted(
         areas, key=lambda a: orden.index(a.get("id"))
         if a.get("id") in orden else 999)
@@ -2560,13 +2571,27 @@ def vista_redaccion(email: str) -> str:
             or "<p class='meta'>sin publicaciones</p>"
         cls = "red-col closed" if a.get("id") in colapsadas \
             else "red-col"
+        # equipo del área: ícono con conteo; al hover, los nombres
+        nombres = [(usuarios.get(m) or {}).get("nombre")
+                   or m.split("@")[0]
+                   for m in (a.get("miembros") or [])]
+        personas = (
+            f"<span class='red-personas' "
+            f"onclick='event.stopPropagation()'>"
+            f"<svg viewBox='0 0 16 16' width='12' height='12'>"
+            f"<circle cx='8' cy='5' r='2.6' fill='currentColor'/>"
+            f"<path d='M3 14c.7-3 2.7-4.4 5-4.4s4.3 1.4 5 4.4z' "
+            f"fill='currentColor'/></svg>{len(nombres)}"
+            f"<span class='red-tip'>"
+            f"{'<br>'.join(html.escape(n) for n in nombres) or 'sin miembros'}"
+            f"</span></span>")
         cols.append(
             f"<div class='{cls}' data-area='{html.escape(a.get('id',''), quote=True)}'>"
             f"<h2><span class='red-nom'>"
             f"{html.escape(a.get('nombre',''))}</span>"
             f" <span class='meta red-n' style='font-weight:400'>"
             f"{len(ps)}</span>"
-            f"<span class='head-right'>{badge}"
+            f"<span class='head-right'>{badge}{personas}"
             f"<span class='area-ico'>"
             f"{_area_icono(a.get('id'), 14)}</span></span></h2>"
             f"<div class='posts'>{cards}</div></div>")
