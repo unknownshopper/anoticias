@@ -2709,12 +2709,7 @@ def vista_redaccion(email: str) -> str:
             "<button class='rtb' id='red-inicio' "
             "title='Volver al inicio — columnas a la izquierda y "
             "publicaciones arriba'>↺ inicio</button>"
-            + sel_bar
-            + f"<span class='meta' style='margin-left:auto;"
-              f"font-size:.72rem'>{len(areas)} medios · "
-              f"{len(posts)} publicaciones · {nuevas_total} nuevas · "
-              f"última {fmt_fecha(ultimo) if ultimo else '—'} · "
-              f"arrastra ⠿</span></div>"
+            + sel_bar + "</div>"
             + _board_wrap("".join(cols))
             + "<script>"
             "var _drag=null;"
@@ -4346,6 +4341,21 @@ def _chat_css() -> str:
   #2c3a72}
 .chat-form input{flex:1;font-size:.85rem;padding:.5rem .7rem;border-radius:
   10px;border:1px solid #33415f;background:#0d1330;color:#eef1ff}
+.chat-sep{font-size:.62rem;font-weight:700;letter-spacing:.1em;
+  text-transform:uppercase;color:#8a93b8;margin:.6rem .2rem .1rem}
+.chat-grupo{margin-top:.3rem}
+.chat-grupo summary{font-size:.7rem;color:#8a93b8;cursor:pointer;
+  padding:.3rem .2rem;list-style:none}
+.chat-grupo summary::before{content:'▸ ';font-size:.6rem}
+.chat-grupo[open] summary::before{content:'▾ '}
+.chat-grupo form{display:flex;flex-direction:column;gap:.3rem;
+  padding:.3rem .2rem}
+.chat-grupo label{font-size:.78rem;color:#cfd6ff;display:flex;
+  gap:.4rem;align-items:center;cursor:pointer}
+.chat-grupo-h{font-size:.72rem;color:#8a93b8;padding:.45rem .7rem;
+  border-bottom:1px solid #2c3a72}
+html.tema-claro .chat-grupo label{color:#444}
+html.tema-claro .chat-grupo-h{border-color:#e2e2e8;color:#999}
 .chat-nuevo{display:flex;gap:.35rem;margin-top:.5rem}
 .chat-nuevo input{flex:1;font-size:.78rem;padding:.4rem .6rem;border-radius:
   8px;border:1px solid #33415f;background:#0d1330;color:#eef1ff}
@@ -4369,10 +4379,34 @@ html.tema-claro .chat-form input,html.tema-claro .chat-nuevo input{
 </style>"""
 
 
+def _dm_id(*miembros) -> str:
+    """Id del canal directo entre un grupo de usuarios — orden
+    estable, mismo id para cualquiera que lo cree."""
+    return "dm:" + "|".join(sorted(miembros))
+
+
+def _dm_par(canal: str):
+    """Tupla de participantes si `canal` es un dm válido (2+ miembros),
+    si no None."""
+    if canal.startswith("dm:"):
+        par = tuple(m for m in canal[3:].split("|") if m)
+        if len(par) >= 2:
+            return par
+    return None
+
+
+def _canal_permitido(canal: str, email: str, ids: set) -> bool:
+    """Un dm solo lo ven sus dos participantes; canal normal → debe
+    existir en chats.json."""
+    par = _dm_par(canal)
+    return email in par if par else canal in ids
+
+
 def vista_chat(email: str, canal: str = "general") -> str:
     cfg = json.loads(CONFIG.read_text())
     canales = cargar_canales()
-    if canal not in {c.get("id") for c in canales}:
+    ids = {c.get("id") for c in canales}
+    if not _canal_permitido(canal, email, ids):
         canal = "general"
     msgs = cargar_msgs(canal)
     es_demo = "@demo.local" in (email or "")
@@ -4383,6 +4417,29 @@ def vista_chat(email: str, canal: str = "general") -> str:
         f"class='{'on' if c.get('id') == canal else ''}'>"
  f"{html.escape(c.get('nombre') or c.get('id'))}</a>"
         for c in canales)
+    # directos: un dm por miembro del equipo (vivos, sin demos, sin yo)
+    usuarios = cargar_usuarios()
+    equipo = [u for u in sorted(usuarios, key=_red_nombre)
+              if u and u != email and "@demo.local" not in u
+              and (not usuarios[u].get("expira")
+                   or usuarios[u]["expira"] > time.time())]
+    dms = "".join(
+        f"<a href='/chat?c={quote(_dm_id(email, u))}' "
+        f"class='{'on' if canal == _dm_id(email, u) else ''}'>"
+        f"◦ {html.escape(_red_nombre(u))}</a>"
+        for u in equipo)
+    if dms:
+        items += "<div class='chat-sep'>directos</div>" + dms
+        items += (
+            "<details class='chat-grupo'>"
+            "<summary>＋ mensaje a varios</summary>"
+            "<form method='get' action='/chat'>"
+            + "".join(
+                f"<label><input type='checkbox' name='dm' "
+                f"value='{html.escape(u, quote=True)}'> "
+                f"{html.escape(_red_nombre(u))}</label>"
+                for u in equipo)
+            + "<button class='rb'>abrir chat</button></form></details>")
     # supervisión crea canales nuevos
     nuevo = ("" if es_demo or not sup else
              "<form method='post' action='/chat/canal' class='chat-nuevo'>"
@@ -4423,12 +4480,20 @@ var _ci=document.querySelector('.chat-form input[name=texto]');
 if(_ci)_ci.focus();
 </script>"""
 
+    par = _dm_par(canal)
+    grupo_hdr = ""
+    if par and len(par) > 2:
+        grupo_hdr = ("<div class='chat-grupo-h'>grupo: "
+                     + html.escape(", ".join(
+                         _red_nombre(u) for u in par if u != email))
+                     + "</div>")
     return (_chat_css() + _RED_CSS +
             "<h2 style='font-size:1rem;margin:.2rem 0 .6rem'>Chat de la "
             "redacción</h2>"
             "<div class='chat-wrap'>"
             f"<div class='chat-side'>{items}{nuevo}</div>"
             "<div class='chat-main'>"
+            f"{grupo_hdr}"
             f"<div class='chat-hilo' id='chat-hilo'>{hilo}</div>"
             f"{form}</div></div>" + js)
 
@@ -4467,7 +4532,7 @@ def aplicar_accion_chat(ruta: str, form: dict, email: str) -> str:
     if "@demo.local" in (email or ""):
         return "/chat"
     canal = form.get("canal", ["general"])[0]
-    if canal not in ids:
+    if not _canal_permitido(canal, email, ids):
         canal = "general"
     texto = form.get("texto", [""])[0].strip()[:1000]
     if texto:
@@ -4792,17 +4857,35 @@ def servir_web(puerto: int):
                     self.send_header("Location", "/area")
                     self.end_headers()
                     return
+                # ?dm=a&dm=b → abre el directo/grupo con esos usuarios
+                dm = [u for u in params.get("dm", [])
+                      if u and u != email]
+                if dm:
+                    self.send_response(303)
+                    self.send_header(
+                        "Location",
+                        "/chat?c=" + quote(_dm_id(email, *dm)))
+                    self.end_headers()
+                    return
                 self._html(render_pagina(
                     vista_chat(email, params.get("c", ["general"])[0]),
                     base=base, usuario=email, wide=True,
                     og_title="Chat — @noticias"))
             elif ruta.path == "/chat/hilo":
-                # polling del chat: JSON con burbujas nuevas
+                # polling del chat: JSON con burbujas nuevas; los dm
+                # solo los leen sus participantes
                 if not email:
                     self.send_response(403)
                     self.end_headers()
                     return
-                d = _chat_hilo_html(
+                _c = params.get("c", ["general"])[0]
+                if not _canal_permitido(
+                        _c, email,
+                        {x.get("id") for x in cargar_canales()}):
+                    self.send_response(403)
+                    self.end_headers()
+                    return
+                d = _chat_hilo_html(_c,
                     params.get("c", ["general"])[0],
                     params.get("desde", ["0"])[0], email)
                 body = json.dumps(d, ensure_ascii=False).encode()
