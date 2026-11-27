@@ -526,19 +526,19 @@ PAGINA = """<!DOCTYPE html>
             main absorbe el espacio sobrante */
          display: flex; flex-direction: column;
          min-height: 100vh; min-height: 100dvh; }}
-  nav {{ background: #1a237e; color: #fff; padding: .7rem 1rem .5rem;
+  nav {{ background: #1a237e; color: #fff; padding: .45rem 1rem .3rem;
         position: sticky; top: 0; z-index: 10; }}
   .nav-top {{ display: flex; align-items: center; gap: .8rem; }}
   .nav-user {{ color: #9fa8da; font-size: .85rem; margin-left: auto;
       margin-right: .4rem; }}
-  nav .logo {{ font-weight: 800; font-size: 1.35rem; letter-spacing: .02em;
+  nav .logo {{ font-weight: 800; font-size: 1.15rem; letter-spacing: .02em;
               color: #fff; text-decoration: none; }}
-  .nav-tabs {{ display: flex; gap: .1rem; margin-top: .5rem;
+  .nav-tabs {{ display: flex; gap: .1rem; margin-top: .28rem;
               overflow-x: auto; -webkit-overflow-scrolling: touch;
               scrollbar-width: none; -ms-overflow-style: none; }}
   .nav-tabs::-webkit-scrollbar {{ display: none; }}
-  .nav-tabs a {{ color: #c5cae9; text-decoration: none; font-size: 1rem;
-         padding: .55rem .7rem; border-radius: 6px; white-space: nowrap; }}
+  .nav-tabs a {{ color: #c5cae9; text-decoration: none; font-size: .95rem;
+         padding: .4rem .65rem; border-radius: 6px; white-space: nowrap; }}
   .nav-tabs a:hover, .nav-tabs a:active {{ color: #fff; background: #3949ab; }}
   .nav-tabs a.on {{ color: #fff; background: #3949ab; font-weight: 700; }}
   .tab-badge {{ display: inline-block; min-width: 1.05rem; margin-left: .35rem;
@@ -653,9 +653,9 @@ PAGINA = """<!DOCTYPE html>
       font-size: .9rem; cursor: pointer; min-height: 40px; }}
   .lector .compartir.cargando {{ opacity: .6; pointer-events: none; }}
   select, input[type=text] {{ border: 1px solid #ccc; }}
-  footer {{ text-align: center; padding: 1.5rem 1rem 2rem; }}
-  footer .about {{ color: #c3c9d4; font-weight: 800; font-size: 1.1rem;
-                  text-decoration: none; padding: .4rem .8rem; }}
+  footer {{ text-align: center; padding: .7rem 1rem .9rem; }}
+  footer .about {{ color: #c3c9d4; font-weight: 800; font-size: .95rem;
+                  text-decoration: none; padding: .25rem .7rem; }}
   footer .about:active {{ color: #1a237e; }}
   .badge {{ display: inline-block; padding: .2rem .6rem; border-radius: 12px;
            color: #fff; font-size: .75rem; font-weight: 700;
@@ -2116,14 +2116,15 @@ _RED_CSS = """
    la página NO scrollea vertical, cada columna scrollea sus posts
    por dentro (estilo TweetDeck). Las columnas se reordenan arrastrando */
 .red-board{display:flex;gap:14px;overflow-x:auto;align-items:stretch;
-  height:calc(100vh - 185px);padding-bottom:6px;scrollbar-width:thin;
+  height:calc(100vh - 145px);height:calc(100dvh - 145px);
+  padding-bottom:6px;scrollbar-width:thin;
   scrollbar-color:#2c3a72 transparent}
 .red-board::-webkit-scrollbar{height:6px}
 .red-board::-webkit-scrollbar-thumb{background:#2c3a72;
   border-radius:3px}
 /* barra de desplazamiento horizontal propia, encima de los
    encabezados — sincronizada con el scroll del board */
-.red-xbar{position:relative;height:10px;margin:2px 2px 8px;
+.red-xbar{position:relative;height:8px;margin:2px 2px 6px;
   border-radius:6px;background:rgba(255,255,255,.05);
   border:1px solid #2c3a72;cursor:pointer;flex:none}
 .red-xbar .red-xthumb{position:absolute;top:1px;bottom:1px;left:0;
@@ -2174,7 +2175,7 @@ html.tema-claro .red-tip{background:#fff;color:#333;
 .red-col .posts::-webkit-scrollbar{width:8px}
 .red-col .posts::-webkit-scrollbar-thumb{background:#2c3a72;
   border-radius:4px}
-.red-tabs{display:flex;gap:.4rem;margin:.4rem 0 .8rem;flex-wrap:wrap}
+.red-tabs{display:flex;gap:.4rem;margin:.25rem 0 .5rem;flex-wrap:wrap}
 .red-tabs a{font-size:.75rem;padding:3px 10px;border-radius:12px;
   border:1px solid #33415f;text-decoration:none;color:#aeb8e8;
   background:rgba(255,255,255,.04)}
@@ -2218,9 +2219,9 @@ html.tema-claro .red-form input[type=file]::file-selector-button{
 /* barra de acciones del tablero — botones grandes con presencia;
    .rtb.acc marca la acción principal (asignar) */
 .red-bar{display:flex;gap:.45rem;align-items:center;flex-wrap:wrap;
-  margin:.15rem 0 .8rem}
+  margin:.1rem 0 .45rem}
 .rtb{display:inline-flex;align-items:center;justify-content:center;
-  gap:6px;height:34px;padding:0 16px;font-size:.82rem;font-weight:600;
+  gap:6px;height:30px;padding:0 12px;font-size:.78rem;font-weight:600;
   letter-spacing:.01em;border-radius:10px;border:1px solid #4a5aa0;
   background:linear-gradient(180deg,rgba(120,140,255,.16),
   rgba(120,140,255,.05));color:#e6eaff;cursor:pointer;line-height:1;
@@ -2701,7 +2702,7 @@ def vista_redaccion(email: str) -> str:
             "<a class='rtb' href='/bitacora' "
             "title='Eventos / seguimientos'>≡ eventos</a>")
     return (_RED_CSS +
-            f"<div class='meta' style='margin:.2rem 0 .7rem;font-size:.82rem'>"
+            f"<div class='meta' style='margin:.1rem 0 .45rem;font-size:.75rem'>"
             f"{len(areas)} medios · {len(posts)} publicaciones · "
             f"{nuevas_total} nuevas desde tu última visita · última "
             f"{fmt_fecha(ultimo) if ultimo else '—'} · arrastra ⠿ para "
