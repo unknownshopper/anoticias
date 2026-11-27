@@ -2343,10 +2343,11 @@ html.tema-claro .red-form input[type=file]::file-selector-button{
   .red-col.closed:hover{background:rgba(58,73,171,.35)}
 }
 @media (max-width:760px){
-  /* móvil: tabs por área + swipe — una columna visible a la vez,
-     el selector queda pegado bajo el nav */
+  /* móvil: dropdown por área + swipe — una columna visible a la vez;
+     la barra de botones (inicio/compartir/asignar/eventos/plegar)
+     es operación de escritorio, en móvil estorba */
   .red-xbar{display:none}
-  #red-tgl,#bit-tgl{display:none}
+  .red-bar{display:none}
   /* inputs ≥16px: iOS NO hace zoom al enfocar (con .85rem sí) */
   .red-form input[type=text],.red-form textarea,.red-form select{
     font-size:1rem;padding:.65rem}
@@ -2357,24 +2358,16 @@ html.tema-claro .red-form input[type=file]::file-selector-button{
   /* el checkbox URGENTE y el botón publicar crecen al pulgar */
   .red-form label{font-size:.95rem !important}
   .red-form button{min-height:44px;font-size:.95rem !important}
-  /* barra de tabs: scroll horizontal, pill activa resaltada */
-  .red-tabs-m{display:flex;gap:.4rem;overflow-x:auto;
+  /* selector de área: dropdown compacto pegado bajo el nav */
+  .red-tabs-m{display:block;width:100%;
     position:sticky;top:var(--navh,0px);z-index:7;
-    padding:.5rem .2rem;margin:0 -0.5rem .6rem;
-    background:rgba(10,14,38,.92);backdrop-filter:blur(10px);
-    -webkit-overflow-scrolling:touch;scrollbar-width:none}
-  .red-tabs-m::-webkit-scrollbar{display:none}
-  .red-tabs-m button{flex:none;padding:.5rem .95rem;border-radius:18px;
-    border:1px solid #3a4a80;background:rgba(255,255,255,.05);
-    color:#9aa3c7;font-size:.8rem;font-weight:600;font-family:inherit;
-    white-space:nowrap}
-  .red-tabs-m button.on{background:#1a237e;color:#fff;
-    border-color:#7c4dff}
-  html.tema-claro .red-tabs-m{background:rgba(246,247,249,.92)}
-  html.tema-claro .red-tabs-m button{border-color:#d5d9ec;
-    color:#555;background:#fff}
-  html.tema-claro .red-tabs-m button.on{background:#1a237e;
-    color:#fff;border-color:#1a237e}
+    padding:.6rem .9rem;margin:0 0 .6rem;border-radius:12px;
+    border:1px solid #3a4a80;background:rgba(15,20,52,.95);
+    color:#eef1ff;font-size:.95rem;font-weight:600;
+    font-family:inherit;backdrop-filter:blur(10px);
+    appearance:auto}
+  html.tema-claro .red-tabs-m{background:rgba(246,247,249,.95);
+    color:#1a237e;border-color:#d5d9ec}
   /* una sola columna visible (la del tab activo) */
   .red-board{display:block;height:auto;overflow:visible}
   .red-col{display:none;height:auto;margin-bottom:10px;
@@ -2521,6 +2514,9 @@ html.tema-claro .rel-m{color:#888}
 .asis-quien{font-size:.62rem;font-weight:700;letter-spacing:.08em;
   text-transform:uppercase;color:#8a93b8;margin-bottom:.2rem}
 .asis-sugs{display:flex;gap:.4rem;flex-wrap:wrap}
+/* dropdown de área (móvil): oculto en escritorio aunque el JS lo
+   inserte — solo cobra visibilidad dentro del media query */
+.red-tabs-m{display:none}
 /* estrellita IA en la meta de la tarjeta */
 .rb-ia{display:inline-flex;align-items:center;justify-content:center;
   width:16px;height:16px;border-radius:50%;margin-left:.35rem;
@@ -2564,35 +2560,42 @@ th.addEventListener('pointermove',function(e){
 th.addEventListener('pointerup',function(){drag=false});
 th.addEventListener('pointercancel',function(){drag=false});
 })();
-// móvil: tabs por columna + swipe lateral (redacción y bitácora)
-if(matchMedia('(max-width:760px)').matches&&board){
+// móvil: dropdown por columna + swipe lateral (redacción y bitácora);
+// el <select> se inserta siempre pero el CSS lo oculta en desktop —
+// así sobrevive a un resize que cruce el breakpoint
+var board=document.querySelector('.red-board');
+if(board){
 var cols=[].slice.call(board.querySelectorAll('.red-col'));
-var tabs=document.createElement('div');tabs.className='red-tabs-m';
+var sel=document.createElement('select');
+sel.className='red-tabs-m';sel.setAttribute('aria-label','Área');
 cols.forEach(function(c,i){
-var b=document.createElement('button');
+var o=document.createElement('option');
 var nom=c.querySelector('.red-nom');
 var n=c.querySelector('.red-n');
-b.textContent=(nom?nom.textContent.trim():'')+(n?' '+n.textContent.trim():'');
-b.addEventListener('click',function(){_actTab(i)});
-tabs.appendChild(b);});
-board.parentNode.insertBefore(tabs,board);
+o.textContent=(nom?nom.textContent.trim():'')+(n?' '+n.textContent.trim():'');
+sel.appendChild(o);});
+board.parentNode.insertBefore(sel,board);
+var _mq=matchMedia('(max-width:760px)');
 function _actTab(i){
 cols.forEach(function(c,j){c.classList.toggle('open',j===i)});
-[].slice.call(tabs.children).forEach(function(b,j){
-b.classList.toggle('on',j===i)});
-var act=tabs.children[i];
-if(act)act.scrollIntoView({inline:'center',block:'nearest'});
+sel.selectedIndex=i;
 window.scrollTo(0,0);}
-if(cols.length)_actTab(0);
+sel.addEventListener('change',function(){_actTab(sel.selectedIndex)});
+function _mqApply(){
+if(_mq.matches){_actTab(sel.selectedIndex<0?0:sel.selectedIndex)}
+else{cols.forEach(function(c){c.classList.remove('open')})}}
+_mqApply();
+if(_mq.addEventListener)_mq.addEventListener('change',_mqApply);
 var _swx=0,_swy=0;
 board.addEventListener('touchstart',function(e){
 _swx=e.touches[0].clientX;_swy=e.touches[0].clientY;},{passive:true});
 board.addEventListener('touchend',function(e){
+if(!_mq.matches)return;
 var dx=e.changedTouches[0].clientX-_swx;
 var dy=e.changedTouches[0].clientY-_swy;
 if(Math.abs(dx)<60||Math.abs(dx)<Math.abs(dy)*1.5)return;
-var cur=[].indexOf.call(tabs.children,tabs.querySelector('.on'));
-_actTab(Math.min(Math.max(cur+(dx<0?1:-1),0),cols.length-1));
+_actTab(Math.min(Math.max(sel.selectedIndex+(dx<0?1:-1),0),
+cols.length-1));
 },{passive:true});}
 </script>"""
 
