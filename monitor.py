@@ -521,7 +521,11 @@ PAGINA = """<!DOCTYPE html>
 <style>
   * {{ box-sizing: border-box; }}
   body {{ font-family: system-ui, sans-serif; margin: 0; background: #f6f7f9;
-         font-size: 17px; line-height: 1.45; }}
+         font-size: 17px; line-height: 1.45;
+         /* footer siempre abajo: columna a lo alto del viewport y
+            main absorbe el espacio sobrante */
+         display: flex; flex-direction: column;
+         min-height: 100vh; min-height: 100dvh; }}
   nav {{ background: #1a237e; color: #fff; padding: .7rem 1rem .5rem;
         position: sticky; top: 0; z-index: 10; }}
   .nav-top {{ display: flex; align-items: center; gap: .8rem; }}
@@ -547,7 +551,8 @@ PAGINA = """<!DOCTYPE html>
             max-width: 320px; }}
   nav input {{ padding: .55rem .7rem; border-radius: 6px; border: none;
               font-size: 1rem; flex: 1; min-width: 0; }}
-  main {{ max-width: 900px; margin: 0 auto; padding: 1rem; }}
+  main {{ max-width: 900px; margin: 0 auto; padding: 1rem;
+         flex: 1; width: 100%; box-sizing: border-box; }}
   main.wide {{ max-width: none; padding: 1rem 1.2rem; }}
 
   /* Tarjeta = área de toque completa (dedos, no mouse) */
@@ -3397,12 +3402,14 @@ _RED_REP_CACHE = {}   # horas -> (ts_epoch, texto) — el LLM tarda;
                       # 10 min de caché por rango evita regenerar
 
 
-def reporte_redaccion(cfg: dict, horas: int) -> str:
+def reporte_redaccion(cfg: dict, horas: int,
+                      forzar: bool = False) -> str:
     """Reporte IA de las publicaciones de las últimas `horas` horas.
-    Usa _llm (Gemini free tier; si no hay key o falla, Ollama local)."""
+    Usa _llm (Gemini free tier; si no hay key o falla, Ollama local).
+    `forzar` salta el caché de 10 min (botón regenerar)."""
     ahora = time.time()
     hit = _RED_REP_CACHE.get(horas)
-    if hit and ahora - hit[0] < 600:
+    if hit and not forzar and ahora - hit[0] < 600:
         return hit[1]
     corte = (datetime.now() - timedelta(hours=horas))\
         .isoformat(timespec="seconds")
@@ -3440,24 +3447,69 @@ def reporte_redaccion(cfg: dict, horas: int) -> str:
     return txt
 
 
-def vista_reporte_redaccion(email: str, horas: int = 6) -> str:
-    """Tab Reporte: rango 1/3/6/12/24 h → resumen IA de lo publicado.
-    No navega a otro lado: genera (o sirve cache) en la misma vista."""
+def vista_reporte_redaccion(email: str, horas: int = 0,
+                            forzar: bool = False) -> str:
+    """Tab Reporte: elige rango (1/3/6/12/24 h) → Generar → resumen
+    IA de lo publicado. Sin `h` no llama al LLM: solo el selector.
+    `forzar` regenera saltando el caché de 10 min."""
     cfg = json.loads(CONFIG.read_text())
-    horas = horas if horas in (1, 3, 6, 12, 24) else 6
+    valido = horas in (1, 3, 6, 12, 24)
     chips = "".join(
-        f"<a href='/redaccion/reporte?h={h}' "
-        f"class='{'on' if h == horas else ''}'>{h} h</a>"
+        f"<a href='#' data-h='{h}' "
+        f"class='rep-chip{' on' if h == horas else ''}'>{h} h</a>"
         for h in (1, 3, 6, 12, 24))
-    txt = reporte_redaccion(cfg, horas)
-    return (_RED_CSS
-            + f"<div class='red-tabs'>{chips}"
-              f"<a href='/redaccion'>← tablero</a></div>"
-            + f"<h2 style='font-size:1rem;margin:.2rem 0 .6rem'>"
-              f"Reporte de las últimas {horas} horas</h2>"
+    if valido:
+        txt = reporte_redaccion(cfg, horas, forzar)
+        cuerpo = (
+            f"<h2 style='font-size:1rem;margin:.2rem 0 .6rem'>"
+            f"Reporte de las últimas {horas} horas</h2>"
             + "<div class='red-form' style='max-width:none'>"
             + f"<div style='white-space:pre-wrap;font-size:.9rem;"
-              f"line-height:1.55'>{html.escape(txt)}</div></div>")
+              f"line-height:1.55'>{html.escape(txt)}</div></div>"
+            + f"<a href='/redaccion/reporte?h={horas}&f=1' "
+              f"class='rtb' id='rep-regen' "
+              f"style='display:inline-block;margin-top:.5rem;"
+              f"text-decoration:none'>↻ regenerar</a>")
+    else:
+        cuerpo = ("<p class='meta' style='margin:.8rem 0'>Elige un "
+                  "rango arriba y toca <b>Generar reporte</b> — el "
+                  "resumen lo redacta la IA con base en lo publicado "
+                  "en ese periodo.</p>")
+    return (_RED_CSS
+            + "<div class='red-tabs' id='rep-rangos'>"
+            + chips
+            + "<a href='/redaccion'>← tablero</a></div>"
+            + "<button class='rtb acc' id='rep-gen' "
+              "style='width:100%;padding:.8rem;font-size:.95rem;"
+              "margin-top:.4rem'>➤ Generar reporte</button>"
+            + "<p class='meta' id='rep-load' hidden "
+              "style='margin:.6rem 0'>⏳ Generando reporte — "
+              "la IA puede tardar hasta un minuto…</p>"
+            + cuerpo
+            + """<script>
+(function(){
+var sel=0;
+var chips=document.querySelectorAll('#rep-rangos .rep-chip');
+chips.forEach(function(c){
+c.addEventListener('click',function(e){
+e.preventDefault();
+chips.forEach(function(o){o.classList.remove('on')});
+c.classList.add('on');sel=parseInt(c.dataset.h);});});
+var gen=document.getElementById('rep-gen');
+var load=document.getElementById('rep-load');
+function ir(h){
+if(gen){gen.disabled=true;gen.textContent='⏳ Generando…'}
+if(load)load.hidden=false;
+location.href='/redaccion/reporte?h='+h;}
+if(gen)gen.addEventListener('click',function(){
+if(sel)ir(sel);});
+var regen=document.getElementById('rep-regen');
+if(regen)regen.addEventListener('click',function(e){
+e.preventDefault();
+location.href=regen.getAttribute('href');
+if(load)load.hidden=false;});
+})();
+</script>""")
 
 
 _PRIO_COLOR = {"alta": "#b03a2e", "media": "#b8860b", "baja": "#2e7d32"}
@@ -4702,12 +4754,13 @@ def servir_web(puerto: int):
                     self.end_headers()
                     return
                 try:
-                    h = int(params.get("h", ["6"])[0])
+                    h = int(params.get("h", ["0"])[0])
                 except (ValueError, IndexError):
-                    h = 6
+                    h = 0
                 self._html(render_pagina(
-                    vista_reporte_redaccion(email, h), base=base,
-                    usuario=email, wide=True,
+                    vista_reporte_redaccion(
+                        email, h, params.get("f") == ["1"]),
+                    base=base, usuario=email, wide=True,
                     og_title="Reporte — @noticias"))
             elif ruta.path == "/bitacora":
                 cfg_b = json.loads(CONFIG.read_text())
