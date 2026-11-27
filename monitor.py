@@ -526,14 +526,14 @@ PAGINA = """<!DOCTYPE html>
             main absorbe el espacio sobrante */
          display: flex; flex-direction: column;
          min-height: 100vh; min-height: 100dvh; }}
-  nav {{ background: #1a237e; color: #fff; padding: .45rem 1rem .3rem;
-        position: sticky; top: 0; z-index: 10; }}
-  .nav-top {{ display: flex; align-items: center; gap: .8rem; }}
-  .nav-user {{ color: #9fa8da; font-size: .85rem; margin-left: auto;
-      margin-right: .4rem; }}
+  nav {{ background: #1a237e; color: #fff; padding: .45rem 1rem;
+        position: sticky; top: 0; z-index: 10;
+        display: flex; align-items: center; gap: .7rem; }}
+  .nav-user {{ color: #9fa8da; font-size: .85rem;
+      margin-left: auto; white-space: nowrap; }}
   nav .logo {{ font-weight: 800; font-size: 1.15rem; letter-spacing: .02em;
               color: #fff; text-decoration: none; }}
-  .nav-tabs {{ display: flex; gap: .1rem; margin-top: .28rem;
+  .nav-tabs {{ display: flex; gap: .1rem; flex: 1; min-width: 0;
               overflow-x: auto; -webkit-overflow-scrolling: touch;
               scrollbar-width: none; -ms-overflow-style: none; }}
   .nav-tabs::-webkit-scrollbar {{ display: none; }}
@@ -547,6 +547,10 @@ PAGINA = """<!DOCTYPE html>
   .salir-top {{ color: #7986cb; text-decoration: none; font-size: .9rem;
       padding: .5rem .2rem .5rem .6rem; white-space: nowrap; }}
   .salir-top:active {{ color: #fff; }}
+  @media (max-width:760px){{
+    .nav-user {{ display: none; }}
+    nav {{ gap: .4rem; padding: .4rem .7rem; }}
+  }}
   nav form {{ margin-left: auto; display: flex; gap: .4rem; flex: 1 1 200px;
             max-width: 320px; }}
   nav input {{ padding: .55rem .7rem; border-radius: 6px; border: none;
@@ -892,17 +896,15 @@ PAGINA = """<!DOCTYPE html>
     color: #1a237e; }}
 </style></head><body>
 <nav>
-  <div class="nav-top">
-    <a class="logo" href="/">@noticias</a>
-    <span class="nav-user" title="{usuario}">{usuario_html}</span>
-    <button id="tema-toggle" class="tema-btn" title="Cambiar tema">◐</button>
-    <a href="/salir" class="salir-top" title="Cerrar sesión">salir</a>
-  </div>
+  <a class="logo" href="/">@noticias</a>
   <div class="nav-tabs">
     {tabs_base}
     {tabs_reg}
     {admin_tabs}
   </div>
+  <span class="nav-user" title="{usuario}">{usuario_html}</span>
+  <button id="tema-toggle" class="tema-btn" title="Cambiar tema">◐</button>
+  <a href="/salir" class="salir-top" title="Cerrar sesión">salir</a>
 </nav>
 <main{main_cls}>
 {contenido}
@@ -2116,7 +2118,7 @@ _RED_CSS = """
    la página NO scrollea vertical, cada columna scrollea sus posts
    por dentro (estilo TweetDeck). Las columnas se reordenan arrastrando */
 .red-board{display:flex;gap:14px;overflow-x:auto;align-items:stretch;
-  height:calc(100vh - 145px);height:calc(100dvh - 145px);
+  height:calc(100vh - 120px);height:calc(100dvh - 120px);
   padding-bottom:6px;scrollbar-width:thin;
   scrollbar-color:#2c3a72 transparent}
 .red-board::-webkit-scrollbar{height:6px}
@@ -2702,17 +2704,17 @@ def vista_redaccion(email: str) -> str:
             "<a class='rtb' href='/bitacora' "
             "title='Eventos / seguimientos'>≡ eventos</a>")
     return (_RED_CSS +
-            f"<div class='meta' style='margin:.1rem 0 .45rem;font-size:.75rem'>"
-            f"{len(areas)} medios · {len(posts)} publicaciones · "
-            f"{nuevas_total} nuevas desde tu última visita · última "
-            f"{fmt_fecha(ultimo) if ultimo else '—'} · arrastra ⠿ para "
-            f"reordenar</div>"
             "<div class='red-bar'>"
             "<button class='rtb' id='red-tgl'>⇕ plegar todo</button>"
             "<button class='rtb' id='red-inicio' "
             "title='Volver al inicio — columnas a la izquierda y "
             "publicaciones arriba'>↺ inicio</button>"
-            + sel_bar + "</div>"
+            + sel_bar
+            + f"<span class='meta' style='margin-left:auto;"
+              f"font-size:.72rem'>{len(areas)} medios · "
+              f"{len(posts)} publicaciones · {nuevas_total} nuevas · "
+              f"última {fmt_fecha(ultimo) if ultimo else '—'} · "
+              f"arrastra ⠿</span></div>"
             + _board_wrap("".join(cols))
             + "<script>"
             "var _drag=null;"
