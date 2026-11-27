@@ -4039,6 +4039,15 @@ _STOP_ASIS = {
     "publicación","redacción","redaccion","hay","tienen","tener"}
 
 
+def _agujas_buscar(q: str) -> list:
+    """Parte la consulta en agujas: frases 'entre comillas' son substring
+    exacto; palabras sueltas hacen AND en cualquier orden.
+    'german "garcia serrano" tabasco' → ['german','garcia serrano','tabasco']"""
+    return [normalizar(m.group(1) or m.group(2))
+            for m in re.finditer(r'"([^"]+)"|(\S+)', q)
+            if (m.group(1) or m.group(2)).strip()]
+
+
 def _asistente_responder(pregunta: str, cfg: dict):
     """Devuelve (respuesta_texto, notas_contexto). Recuperación por
     palabra clave sobre titulo/resumen/texto/fuente — sin embeddings,
