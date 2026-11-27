@@ -2576,13 +2576,19 @@ o.textContent=(nom?nom.textContent.trim():'')+(n?' '+n.textContent.trim():'');
 sel.appendChild(o);});
 board.parentNode.insertBefore(sel,board);
 var _mq=matchMedia('(max-width:760px)');
+var _tabInit=false;
+function _primerCol(){
+for(var i=0;i<cols.length;i++){
+if(cols[i].querySelectorAll('.posts>*').length)return i;}
+return 0;}
 function _actTab(i){
 cols.forEach(function(c,j){c.classList.toggle('open',j===i)});
 sel.selectedIndex=i;
 window.scrollTo(0,0);}
 sel.addEventListener('change',function(){_actTab(sel.selectedIndex)});
 function _mqApply(){
-if(_mq.matches){_actTab(sel.selectedIndex<0?0:sel.selectedIndex)}
+if(_mq.matches){_actTab(_tabInit?sel.selectedIndex:_primerCol());
+_tabInit=true}
 else{cols.forEach(function(c){c.classList.remove('open')})}}
 _mqApply();
 if(_mq.addEventListener)_mq.addEventListener('change',_mqApply);
