@@ -2343,9 +2343,9 @@ html.tema-claro .red-form input[type=file]::file-selector-button{
   .red-col.closed:hover{background:rgba(58,73,171,.35)}
 }
 @media (max-width:760px){
-  /* móvil: dropdown por área + swipe — una columna visible a la vez;
-     la barra de botones (inicio/compartir/asignar/eventos/plegar)
-     es operación de escritorio, en móvil estorba */
+  /* móvil: acordeón vertical — todas las categorías apiladas como
+     tarjetas cerradas; al tocar el encabezado se despliega esa
+     columna (una abierta a la vez) y se scrollea vertical */
   .red-xbar{display:none}
   .red-bar{display:none}
   /* inputs ≥16px: iOS NO hace zoom al enfocar (con .85rem sí) */
@@ -2358,31 +2358,25 @@ html.tema-claro .red-form input[type=file]::file-selector-button{
   /* el checkbox URGENTE y el botón publicar crecen al pulgar */
   .red-form label{font-size:.95rem !important}
   .red-form button{min-height:44px;font-size:.95rem !important}
-  /* selector de área: dropdown compacto pegado bajo el nav */
-  .red-tabs-m{display:block;width:100%;
-    position:sticky;top:var(--navh,0px);z-index:7;
-    padding:.6rem .9rem;margin:0 0 .6rem;border-radius:12px;
-    border:1px solid #3a4a80;background:rgba(15,20,52,.95);
-    color:#eef1ff;font-size:.95rem;font-weight:600;
-    font-family:inherit;backdrop-filter:blur(10px);
-    appearance:auto}
-  html.tema-claro .red-tabs-m{background:rgba(246,247,249,.95);
-    color:#1a237e;border-color:#d5d9ec}
-  /* una sola columna visible (la del tab activo) */
+  /* overflow:visible — el overflow-x:auto de escritorio convierte al
+     board en scroll container y rompe el sticky del h2 de columna */
   .red-board{display:block;height:auto;overflow:visible}
-  .red-col{display:none;height:auto;margin-bottom:10px;
+  .red-col{display:block;height:auto;flex:none;margin-bottom:10px;
     background:rgba(15,20,52,.72);border-color:#2c3a72}
-  .red-col.open{display:block}
-  .red-col .posts{display:block;overflow:visible}
-  /* encabezado de columna: barra de info pegada bajo los tabs —
-     ya no plega (los tabs mandan) */
-  .red-col h2{color:#eef1ff;user-select:none;
-    position:sticky;top:calc(var(--navh,0px) + 46px);z-index:6;
-    margin:-10px -10px .6rem;padding:12px 10px;
-    background:rgba(15,20,52,.94);backdrop-filter:blur(10px);
-    border-bottom:1px solid #2c3a72;border-radius:12px 12px 0 0}
+  .red-col .posts{display:none;overflow:visible;flex:none}
+  .red-col.open .posts{display:block}
+  /* cerrada: el encabezado ES la tarjeta de la categoría */
+  .red-col h2{color:#eef1ff;cursor:pointer;user-select:none;
+    margin:-10px -10px 0;padding:14px 12px;border-radius:12px}
+  /* abierta: encabezado sticky bajo el nav para poder plegarla
+     sin volver arriba */
+  .red-col.open h2{position:sticky;top:var(--navh,0px);z-index:6;
+    margin-bottom:.6rem;background:rgba(15,20,52,.94);
+    backdrop-filter:blur(10px);border-bottom:1px solid #2c3a72;
+    border-radius:12px 12px 0 0}
   .red-col h2::before{content:''}
-  .red-col h2::after{content:''}
+  .red-col h2::after{content:'▸';float:right;color:#8a93b8}
+  .red-col.open h2::after{content:'▾'}
   html.tema-claro .red-col h2{background:#f4f4f6}
   main.wide{padding:.6rem .5rem}
 }
@@ -2514,9 +2508,6 @@ html.tema-claro .rel-m{color:#888}
 .asis-quien{font-size:.62rem;font-weight:700;letter-spacing:.08em;
   text-transform:uppercase;color:#8a93b8;margin-bottom:.2rem}
 .asis-sugs{display:flex;gap:.4rem;flex-wrap:wrap}
-/* dropdown de área (móvil): oculto en escritorio aunque el JS lo
-   inserte — solo cobra visibilidad dentro del media query */
-.red-tabs-m{display:none}
 /* estrellita IA en la meta de la tarjeta */
 .rb-ia{display:inline-flex;align-items:center;justify-content:center;
   width:16px;height:16px;border-radius:50%;margin-left:.35rem;
@@ -2560,49 +2551,11 @@ th.addEventListener('pointermove',function(e){
 th.addEventListener('pointerup',function(){drag=false});
 th.addEventListener('pointercancel',function(){drag=false});
 })();
-// móvil: dropdown por columna + swipe lateral (redacción y bitácora);
-// el <select> se inserta siempre pero el CSS lo oculta en desktop —
-// así sobrevive a un resize que cruce el breakpoint
-var board=document.querySelector('.red-board');
-if(board){
-var cols=[].slice.call(board.querySelectorAll('.red-col'));
-var sel=document.createElement('select');
-sel.className='red-tabs-m';sel.setAttribute('aria-label','Área');
-cols.forEach(function(c,i){
-var o=document.createElement('option');
-var nom=c.querySelector('.red-nom');
-var n=c.querySelector('.red-n');
-o.textContent=(nom?nom.textContent.trim():'')+(n?' '+n.textContent.trim():'');
-sel.appendChild(o);});
-board.parentNode.insertBefore(sel,board);
-var _mq=matchMedia('(max-width:760px)');
-var _tabInit=false;
-function _primerCol(){
-for(var i=0;i<cols.length;i++){
-if(cols[i].querySelectorAll('.posts>*').length)return i;}
-return 0;}
-function _actTab(i){
-cols.forEach(function(c,j){c.classList.toggle('open',j===i)});
-sel.selectedIndex=i;
-window.scrollTo(0,0);}
-sel.addEventListener('change',function(){_actTab(sel.selectedIndex)});
-function _mqApply(){
-if(_mq.matches){_actTab(_tabInit?sel.selectedIndex:_primerCol());
-_tabInit=true}
-else{cols.forEach(function(c){c.classList.remove('open')})}}
-_mqApply();
-if(_mq.addEventListener)_mq.addEventListener('change',_mqApply);
-var _swx=0,_swy=0;
-board.addEventListener('touchstart',function(e){
-_swx=e.touches[0].clientX;_swy=e.touches[0].clientY;},{passive:true});
-board.addEventListener('touchend',function(e){
-if(!_mq.matches)return;
-var dx=e.changedTouches[0].clientX-_swx;
-var dy=e.changedTouches[0].clientY-_swy;
-if(Math.abs(dx)<60||Math.abs(dx)<Math.abs(dy)*1.5)return;
-_actTab(Math.min(Math.max(sel.selectedIndex+(dx<0?1:-1),0),
-cols.length-1));
-},{passive:true});}
+/* móvil: la clase .closed (riel angosto) es un estado de escritorio —
+   en el acordeón vertical estorba, se limpia al cargar */
+if(matchMedia('(max-width:760px)').matches){
+document.querySelectorAll('.red-col.closed').forEach(
+function(c){c.classList.remove('closed')});}
 </script>"""
 
 
@@ -2811,8 +2764,13 @@ def vista_redaccion(email: str) -> str:
             "document.querySelectorAll('.red-col').forEach("
             "function(c){var h=c.querySelector('h2');if(!h)return;"
             "h.addEventListener('click',function(){"
-            "if(!matchMedia('(max-width:760px)').matches){"
-            "c.classList.toggle('closed');_guardarColapsadas()}});});"
+            "if(matchMedia('(max-width:760px)').matches){"
+            "var abierta=c.classList.contains('open');"
+            "document.querySelectorAll('.red-col.open').forEach("
+            "function(o){o.classList.remove('open')});"
+            "if(!abierta){c.classList.remove('closed');"
+            "c.classList.add('open')}}"
+            "else{c.classList.toggle('closed');_guardarColapsadas()}});});"
             # selección múltiple: checkbox por tarjeta → compartir
             # (copiar enlaces) y asignar en lote
             "function _selIds(){return [].slice.call("
@@ -3724,8 +3682,13 @@ def vista_bitacora(email: str) -> str:
         "document.querySelectorAll('.red-col').forEach(function(c){"
         "var h=c.querySelector('h2');if(!h)return;"
         "h.addEventListener('click',function(){"
-        "if(!matchMedia('(max-width:760px)').matches){"
-        "c.classList.toggle('closed')}})});"
+        "if(matchMedia('(max-width:760px)').matches){"
+        "var abierta=c.classList.contains('open');"
+        "document.querySelectorAll('.red-col.open').forEach("
+        "function(o){o.classList.remove('open')});"
+        "if(!abierta){c.classList.remove('closed');"
+        "c.classList.add('open')}}"
+        "else{c.classList.toggle('closed')}})});"
         "_bitSync();</script>")
     return (_RED_CSS
             + "<div class='red-tabs'><a href='/redaccion'>← tablero</a>"
